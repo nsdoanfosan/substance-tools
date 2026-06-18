@@ -1,4 +1,4 @@
-import bpy, glob, re, subprocess, os, traceback
+import bpy, glob, re, subprocess, os, time, traceback
 import colorsys
 import hashlib
 import json
@@ -22,6 +22,8 @@ LOW_COLLECTION = 'low'
 HIGH_COLLECTION = 'high'
 PAINTER_REQUEST = '.substance_tools_request.json'
 PENDING_REQUEST = 'pending_request.json'
+PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
+PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
 
 
 def clean_name(value):
@@ -117,6 +119,19 @@ def write_json(path, value):
   os.replace(temporary_path, path)
 
 
+def load_or_reload_image(path):
+  path = Path(path).resolve()
+  for image in bpy.data.images:
+    image_path = bpy.path.abspath(image.filepath_raw or image.filepath)
+    if image_path and Path(image_path).resolve() == path:
+      image.reload()
+      image.name = path.stem
+      return image
+  image = bpy.data.images.load(str(path), check_existing=True)
+  image.name = path.stem
+  return image
+
+
 def collection_meshes(collection):
   return sorted(
     [obj for obj in collection.all_objects if obj.type == 'MESH'],
@@ -135,6 +150,203 @@ def stable_color(value):
   lightness = 0.42 + digest[3] / 255.0 * 0.18
   red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
   return (red, green, blue, 1.0)
+
+
+def socket_contains_image_texture(socket, visited=None):
+  if socket is None or not socket.is_linked:
+    return False
+  if visited is None:
+    visited = set()
+  for link in socket.links:
+    node = link.from_node
+    if node in visited:
+      continue
+    visited.add(node)
+    if node.type == 'TEX_IMAGE' and node.image is not None:
+      return True
+    for input_socket in node.inputs:
+      if socket_contains_image_texture(input_socket, visited):
+        return True
+  return False
+
+
+def material_has_base_color_texture(material):
+  if material is None or not material.use_nodes or material.node_tree is None:
+    return False
+  for node in material.node_tree.nodes:
+    if node.type != 'BSDF_PRINCIPLED':
+      continue
+    base_color = node.inputs.get('Base Color')
+    if socket_contains_image_texture(base_color):
+      return True
+  return False
+
+
+def high_has_base_color_textures(high_objects):
+  return any(
+    material_has_base_color_texture(slot.material)
+    for obj in high_objects
+    for slot in obj.material_slots
+    if slot.material
+  )
+
+
+def low_texture_set_names(low_objects):
+  return sorted({
+    stripped_material_name(slot.material.name)
+    for obj in low_objects
+    for slot in obj.material_slots
+    if slot.material
+  })
+
+
+def base_color_bake_name(texture_set):
+  return f'T_{clean_name(texture_set)}_Color_baking'
+
+
+def connect_base_color_bake_to_low_materials(low_objects, image):
+  connected = 0
+  materials = {
+    slot.material
+    for obj in low_objects
+    for slot in obj.material_slots
+    if slot.material
+  }
+  for material in materials:
+    material.use_nodes = True
+    node_tree = material.node_tree
+    if node_tree is None:
+      continue
+    image_node = node_tree.nodes.get(image.name)
+    if image_node is None or image_node.type != 'TEX_IMAGE':
+      image_node = node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = image.name
+    image_node.label = 'Baked High Base Color'
+    image_node.image = image
+    image_node.interpolation = 'Linear'
+    for principled in (
+      node for node in node_tree.nodes
+      if node.type == 'BSDF_PRINCIPLED'
+    ):
+      base_color = principled.inputs.get('Base Color')
+      if base_color is None:
+        continue
+      node_tree.links.new(image_node.outputs['Color'], base_color)
+      connected += 1
+  return connected
+
+
+def set_material_base_color_image(material, image):
+  material.use_nodes = True
+  node_tree = material.node_tree
+  if node_tree is None:
+    return 0
+  image_node = node_tree.nodes.get(image.name)
+  if image_node is None or image_node.type != 'TEX_IMAGE':
+    image_node = node_tree.nodes.new('ShaderNodeTexImage')
+    image_node.name = image.name
+  image_node.label = image.name
+  image_node.image = image
+  connected = 0
+  for principled in (
+    node for node in node_tree.nodes
+    if node.type == 'BSDF_PRINCIPLED'
+  ):
+    base_color = principled.inputs.get('Base Color')
+    if base_color is not None:
+      node_tree.links.new(image_node.outputs['Color'], base_color)
+      connected += 1
+  return connected
+
+
+def apply_painter_textures_to_low(low_objects, texture_dir):
+  texture_dir = Path(texture_dir)
+  applied = 0
+  materials = {
+    slot.material
+    for obj in low_objects
+    for slot in obj.material_slots
+    if slot.material
+  }
+  for material in materials:
+    texture_set = clean_name(stripped_material_name(material.name))
+    paths = {
+      role: texture_dir / f'T_{texture_set}_{role}.png'
+      for role in ('Color', 'Extra', 'Normal', 'Emissive', 'Height')
+    }
+    images = {
+      role: load_or_reload_image(path)
+      for role, path in paths.items()
+      if path.is_file()
+    }
+    if not images:
+      continue
+    material.use_nodes = True
+    node_tree = material.node_tree
+    if node_tree is None:
+      continue
+    principled_nodes = [
+      node for node in node_tree.nodes
+      if node.type == 'BSDF_PRINCIPLED'
+    ]
+    if images.get('Color') is not None:
+      applied += set_material_base_color_image(material, images['Color'])
+    if images.get('Normal') is not None:
+      normal_image = images['Normal']
+      normal_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(normal_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = normal_image.name
+      image_node.image = normal_image
+      normal_node = node_tree.nodes.get('Painter Normal') or node_tree.nodes.new('ShaderNodeNormalMap')
+      normal_node.name = 'Painter Normal'
+      node_tree.links.new(image_node.outputs['Color'], normal_node.inputs['Color'])
+      for principled in principled_nodes:
+        node_tree.links.new(normal_node.outputs['Normal'], principled.inputs['Normal'])
+    if images.get('Extra') is not None:
+      extra_image = images['Extra']
+      extra_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(extra_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = extra_image.name
+      image_node.image = extra_image
+      separate = node_tree.nodes.get('Painter Extra Channels') or node_tree.nodes.new('ShaderNodeSeparateColor')
+      separate.name = 'Painter Extra Channels'
+      node_tree.links.new(image_node.outputs['Color'], separate.inputs['Color'])
+      for principled in principled_nodes:
+        node_tree.links.new(separate.outputs['Green'], principled.inputs['Roughness'])
+        node_tree.links.new(separate.outputs['Blue'], principled.inputs['Metallic'])
+    if images.get('Emissive') is not None:
+      emissive_image = images['Emissive']
+      image_node = node_tree.nodes.get(emissive_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = emissive_image.name
+      image_node.image = emissive_image
+      for principled in principled_nodes:
+        emission = principled.inputs.get('Emission Color') or principled.inputs.get('Emission')
+        if emission is not None:
+          node_tree.links.new(image_node.outputs['Color'], emission)
+    if images.get('Height') is not None:
+      height_image = images['Height']
+      height_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(height_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = height_image.name
+      image_node.image = height_image
+      image_node.label = 'Painter Height'
+  return applied
+
+
+def canonicalize_painter_export_files(result):
+  canonical_paths = []
+  for files in result.get('textures', {}).values():
+    for file_value in files:
+      source = Path(file_value)
+      if not source.is_file():
+        continue
+      stem = source.stem
+      canonical_stem = stem if stem.startswith('T_') else f'T_{stem}'
+      target = source.with_name(f'{canonical_stem}{source.suffix.lower()}')
+      if source.resolve() != target.resolve():
+        os.replace(source, target)
+      canonical_paths.append(str(target.resolve()))
+  return canonical_paths
 
 
 def add_high_id_colors(mesh, object_name):
@@ -267,6 +479,159 @@ def export_objects_to_fbx(source_objects, filepath, strip_material_prefix=False,
       bpy.context.view_layer.objects.active = previous_active
 
 
+def bake_high_base_color_to_low(
+  low_objects,
+  high_objects,
+  texture_dir,
+  resolution,
+  match='BY_MESH_NAME',
+  fixed_output_name=None,
+):
+  if not high_objects or not high_has_base_color_textures(high_objects):
+    return {}
+
+  texture_dir.mkdir(parents=True, exist_ok=True)
+  temporary_collection = bpy.data.collections.new('__SubstanceToolsBaseColorBake')
+  bpy.context.scene.collection.children.link(temporary_collection)
+  low_duplicates = []
+  high_duplicates = []
+  temporary_materials = []
+  bake_images = {}
+  baked_texture_sets = set()
+  previous_selection = list(bpy.context.selected_objects)
+  previous_active = bpy.context.view_layer.objects.active
+  previous_engine = bpy.context.scene.render.engine
+  bake = bpy.context.scene.render.bake
+  previous_bake = {
+    'use_selected_to_active': bake.use_selected_to_active,
+    'use_clear': bake.use_clear,
+    'margin': bake.margin,
+    'cage_extrusion': bake.cage_extrusion,
+    'max_ray_distance': bake.max_ray_distance,
+  }
+  try:
+    low_duplicates, _, _ = duplicate_for_export(low_objects, temporary_collection)
+    high_duplicates, _, _ = duplicate_for_export(high_objects, temporary_collection)
+
+    material_images = {}
+    for source, duplicate in zip(low_objects, low_duplicates):
+      if not duplicate.data.uv_layers:
+        raise RuntimeError(f"Low-poly mesh has no UV map: {source.name}")
+      for index, material in enumerate(list(duplicate.data.materials)):
+        if material is None:
+          continue
+        copied = material.copy()
+        copied.use_nodes = True
+        if copied.node_tree is None:
+          copied.use_nodes = True
+        texture_set = stripped_material_name(material.name)
+        image = material_images.get(texture_set)
+        if image is None:
+          image_path = (
+            texture_dir / fixed_output_name
+            if fixed_output_name
+            else texture_dir / f'T_{clean_name(texture_set)}_Color.png'
+          )
+          image_name = (
+            Path(fixed_output_name).stem
+            if fixed_output_name
+            else f'__SubstanceTools_{texture_set}_Color'
+          )
+          image = bpy.data.images.get(image_name) if fixed_output_name else None
+          if image is None:
+            image = bpy.data.images.new(
+              image_name,
+              width=resolution,
+              height=resolution,
+              alpha=False,
+              float_buffer=False,
+            )
+          elif image.size[:] != [resolution, resolution]:
+            image.scale(resolution, resolution)
+          image.generated_color = (0.0, 0.0, 0.0, 1.0)
+          image.filepath_raw = str(image_path)
+          image.file_format = 'PNG'
+          material_images[texture_set] = image
+          bake_images[texture_set] = image_path
+        image_node = copied.node_tree.nodes.new('ShaderNodeTexImage')
+        image_node.name = '__SubstanceToolsBakeTarget'
+        image_node.image = image
+        copied.node_tree.nodes.active = image_node
+        for node in copied.node_tree.nodes:
+          node.select = node == image_node
+        duplicate.data.materials[index] = copied
+        temporary_materials.append(copied)
+
+    bpy.context.scene.render.engine = 'CYCLES'
+    bake.use_selected_to_active = True
+    bake.use_clear = False
+    bake.margin = max(8, min(64, resolution // 128))
+    bounds = [obj.dimensions.length for obj in low_duplicates + high_duplicates]
+    bake.cage_extrusion = max(bounds, default=1.0) * 0.01
+    bake.max_ray_distance = 0.0
+
+    high_by_base = defaultdict(list)
+    for source, duplicate in zip(high_objects, high_duplicates):
+      high_by_base[match_base(source.name, 'high').lower()].append(duplicate)
+
+    for source, low_duplicate in zip(low_objects, low_duplicates):
+      sources = (
+        high_by_base.get(match_base(source.name, 'low').lower(), [])
+        if match == 'BY_MESH_NAME'
+        else high_duplicates
+      )
+      if not sources:
+        continue
+      bpy.ops.object.select_all(action='DESELECT')
+      for high_duplicate in sources:
+        high_duplicate.select_set(True)
+      low_duplicate.select_set(True)
+      bpy.context.view_layer.objects.active = low_duplicate
+      bpy.ops.object.bake(
+        type='DIFFUSE',
+        pass_filter={'COLOR'},
+        use_selected_to_active=True,
+      )
+      baked_texture_sets.update(
+        stripped_material_name(material.name)
+        for material in source.data.materials
+        if material
+      )
+
+    for texture_set in baked_texture_sets:
+      image_path = bake_images[texture_set]
+      image = material_images[texture_set]
+      image.save()
+      if not image_path.is_file():
+        raise RuntimeError(f'Base Color bake was not written: {image_path}')
+    return {
+      name: str(bake_images[name].resolve())
+      for name in sorted(baked_texture_sets)
+    }
+  finally:
+    bpy.context.scene.render.engine = previous_engine
+    for key, value in previous_bake.items():
+      setattr(bake, key, value)
+    bpy.ops.object.select_all(action='DESELECT')
+    for duplicate in low_duplicates + high_duplicates:
+      mesh = duplicate.data
+      bpy.data.objects.remove(duplicate, do_unlink=True)
+      if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+    for material in temporary_materials:
+      if material.users == 0:
+        bpy.data.materials.remove(material)
+    for image in list(material_images.values()) if 'material_images' in locals() else []:
+      if not fixed_output_name and image.users == 0:
+        bpy.data.images.remove(image)
+    bpy.data.collections.remove(temporary_collection)
+    for obj in previous_selection:
+      if obj.name in bpy.context.view_layer.objects:
+        obj.select_set(True)
+    if previous_active and previous_active.name in bpy.context.view_layer.objects:
+      bpy.context.view_layer.objects.active = previous_active
+
+
 def file_hash(path):
   digest = hashlib.sha256()
   with path.open('rb') as stream:
@@ -315,12 +680,12 @@ def detect_substance_painter_path():
           f'{letter}:\\Program Files (x86)\\Adobe\\Adobe Substance 3D Painter\\Adobe Substance 3D Painter.exe',
 
           # Steam without 3D
-          f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance Painter\\Adobe Substance 3D Painter.exe'
-          f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance Painter\\Adobe Substance 3D Painter.exe'
+          f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance Painter\\Adobe Substance 3D Painter.exe',
+          f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance Painter\\Adobe Substance 3D Painter.exe',
 
           # Steam with 3D
-          f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance 3D Painter\\Adobe Substance 3D Painter.exe'
-          f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance 3D Painter\\Adobe Substance 3D Painter.exe'
+          f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance 3D Painter\\Adobe Substance 3D Painter.exe',
+          f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance 3D Painter\\Adobe Substance 3D Painter.exe',
       ])
       # Windows with year
       for year in range(2020, 2026):
@@ -330,12 +695,12 @@ def detect_substance_painter_path():
             f'{letter}:\\Program Files (x86)\\Adobe\\Adobe Substance 3D Painter {year}\\Adobe Substance 3D Painter.exe',
 
             # Steam without 3D
-            f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance Painter {year}\\Adobe Substance 3D Painter.exe'
-            f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance Painter {year}\\Adobe Substance 3D Painter.exe'
+            f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance Painter {year}\\Adobe Substance 3D Painter.exe',
+            f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance Painter {year}\\Adobe Substance 3D Painter.exe',
 
             # Steam with 3D
-            f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance 3D Painter {year}\\Adobe Substance 3D Painter.exe'
-            f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance 3D Painter {year}\\Adobe Substance 3D Painter.exe'
+            f'{letter}:\\Program Files\\Steam\\steamapps\\common\\Substance 3D Painter {year}\\Adobe Substance 3D Painter.exe',
+            f'{letter}:\\Program Files (x86)\\Steam\\steamapps\\common\\Substance 3D Painter {year}\\Adobe Substance 3D Painter.exe',
         ])
 
   # Check each path for the current operating system and return the first one that exists
@@ -349,6 +714,32 @@ def detect_substance_painter_path():
 
   # If none of the paths exist, return an empty string
   return ''
+
+
+def painter_is_running(painter_path):
+  executable_name = Path(painter_path).name
+  try:
+    if os.name == 'nt':
+      result = subprocess.run(
+        ['tasklist', '/FI', f'IMAGENAME eq {executable_name}', '/FO', 'CSV', '/NH'],
+        capture_output=True,
+        text=True,
+        encoding='mbcs',
+        errors='replace',
+        check=False,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+      )
+      output = result.stdout or ''
+      return result.returncode == 0 and executable_name.lower() in output.lower()
+    result = subprocess.run(
+      ['pgrep', '-f', str(Path(painter_path).resolve())],
+      capture_output=True,
+      check=False,
+    )
+    return result.returncode == 0
+  except OSError:
+    return False
+
 
 def material_needs_setup(material):
   if material.node_tree is None:
@@ -495,15 +886,45 @@ class ExportToSubstancePainterOperator(bpy.types.Operator):
 class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
   """Export Baking/low and Baking/high, then create or update the Painter project"""
   bl_idname = 'st.export_baking_to_substance_painter'
-  bl_label = 'Bake in Substance Painter'
+  bl_label = 'Send Baking Meshes to Substance Painter'
   bl_options = {'REGISTER'}
 
-  run_painter: bpy.props.BoolProperty(name='Run Substance Painter', default=True)
+  action: bpy.props.EnumProperty(
+    name='Action',
+    items=[
+      ('CREATE', 'Create in Painter', 'Create a new Painter project'),
+      ('OPEN', 'Open Painter Project', 'Open the existing Painter project'),
+      ('UPDATE', 'Update Painter', 'Update an existing Painter project'),
+    ],
+    default='CREATE',
+    options={'HIDDEN'},
+  )
 
   def execute(self, context):
     if not bpy.data.filepath:
       self.report({'ERROR'}, 'Save the .blend file before exporting')
       return {'CANCELLED'}
+
+    paths = baking_paths()
+    spp_existed = paths['spp'].exists()
+    if self.action == 'OPEN':
+      if not spp_existed:
+        self.report({'ERROR'}, 'Painter project does not exist')
+        return {'CANCELLED'}
+      painter_path = get_preferences(context)['painter_path']
+      if not painter_path or not Path(painter_path).is_file():
+        self.report({'ERROR'}, 'Set a valid Substance Painter executable')
+        return {'CANCELLED'}
+      if painter_is_running(painter_path):
+        self.report({'INFO'}, 'Substance Painter is already running')
+        return {'FINISHED'}
+      try:
+        subprocess.Popen([painter_path, str(paths['spp'])])
+      except Exception as error:
+        self.report({'ERROR'}, f'Could not open Painter project: {error}')
+        return {'CANCELLED'}
+      self.report({'INFO'}, f'Opening Painter project: {paths["spp"].name}')
+      return {'FINISHED'}
 
     _, low_collection, high_collection = ensure_baking_collections(context.scene)
     low_objects = collection_meshes(low_collection)
@@ -537,7 +958,19 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     props = context.scene.substance_tools_baking
-    paths = baking_paths()
+    if self.action == 'CREATE' and spp_existed:
+      self.report(
+        {'ERROR'},
+        'Painter project already exists; use Update Painter instead',
+      )
+      return {'CANCELLED'}
+    if self.action == 'UPDATE' and not spp_existed:
+      self.report(
+        {'ERROR'},
+        'Painter project does not exist; use Create in Painter first',
+      )
+      return {'CANCELLED'}
+
     for directory in (paths['low_dir'], paths['high_dir'], paths['texture_dir']):
       directory.mkdir(parents=True, exist_ok=True)
 
@@ -558,8 +991,19 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         high_hash = file_hash(paths['high_fbx'])
       elif paths['high_fbx'].exists():
         paths['high_fbx'].unlink()
+      texture_sets = low_texture_set_names(low_objects)
+      baked_base_color = (
+        paths['texture_dir'] / f'{base_color_bake_name(texture_sets[0])}.png'
+        if len(texture_sets) == 1
+        else None
+      )
+      base_color_maps = (
+        {texture_sets[0]: str(baked_base_color.resolve())}
+        if baked_base_color is not None and baked_base_color.is_file()
+        else {}
+      )
     except Exception as error:
-      self.report({'ERROR'}, f'FBX export failed: {error}')
+      self.report({'ERROR'}, f'Export or Base Color bake failed: {error}')
       traceback.print_exc()
       return {'CANCELLED'}
 
@@ -576,9 +1020,17 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     settings_hash = hashlib.sha256(
       json.dumps(settings, sort_keys=True).encode('utf-8')
     ).hexdigest()
-    spp_existed = paths['spp'].exists()
+    base_color_hashes = {
+      texture_set: file_hash(Path(image_path))
+      for texture_set, image_path in base_color_maps.items()
+    }
+    base_color_hash = hashlib.sha256(
+      json.dumps(base_color_hashes, sort_keys=True).encode('utf-8')
+    ).hexdigest()
     request = {
       'version': 1,
+      'request_id': str(time.time_ns()),
+      'action': self.action,
       'blend_file': str(Path(bpy.data.filepath).resolve()),
       'low_fbx': str(paths['low_fbx'].resolve()),
       'high_fbx': str(paths['high_fbx'].resolve()) if high_objects else '',
@@ -588,9 +1040,14 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'high_hash': high_hash,
       'settings_hash': settings_hash,
       'pipeline_hash': hashlib.sha256(
-        f"{file_hash(paths['low_fbx'])}:{high_hash}:{settings_hash}".encode('utf-8')
+        (
+          f"{file_hash(paths['low_fbx'])}:{high_hash}:"
+          f"{settings_hash}:{base_color_hash}"
+        ).encode('utf-8')
       ).hexdigest(),
       'spp_existed': spp_existed,
+      'base_color_maps': base_color_maps,
+      'base_color_hashes': base_color_hashes,
       'settings': settings,
     }
     request_paths = (
@@ -610,19 +1067,13 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
           message.append('High without Low: ' + ', '.join(unmatched_high))
         self.report({'WARNING'}, ' | '.join(message))
 
-    if not self.run_painter:
-      self.report({'INFO'}, 'Low/High FBX and Painter request exported')
-      return {'FINISHED'}
-
     painter_path = get_preferences(context)['painter_path']
     if not painter_path or not Path(painter_path).is_file():
       self.report({'ERROR'}, 'Set a valid Substance Painter executable in add-on preferences')
       return {'CANCELLED'}
 
     try:
-      if spp_existed:
-        command = [painter_path, str(paths['spp'])]
-      else:
+      if self.action == 'CREATE':
         template_path = unreal_template_path(painter_path)
         if not template_path.is_file():
           self.report(
@@ -637,13 +1088,261 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         # The Painter startup plugin consumes the pending request and creates
         # the project through project.create(template_file_path=...).
         command = [painter_path]
-      subprocess.Popen(command)
+        subprocess.Popen(command)
+      elif not painter_is_running(painter_path):
+        subprocess.Popen([painter_path, str(paths['spp'])])
     except Exception as error:
       self.report({'ERROR'}, f'Error opening Substance Painter: {error}')
       return {'CANCELLED'}
 
-    self.report({'INFO'}, 'Exported Baking collections and sent the request to Painter')
+    if self.action == 'CREATE':
+      self.report({'INFO'}, 'Creating a new Painter project')
+    else:
+      self.report(
+        {'INFO'},
+        'Painter update requested; the open project will reimport once',
+      )
     return {'FINISHED'}
+
+
+class BakeBaseColorToLowOperator(bpy.types.Operator):
+  """Bake High-poly Base Color to the Low-poly UVs"""
+  bl_idname = 'st.bake_base_color_to_low'
+  bl_label = 'Bake Base Color'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    if not bpy.data.filepath:
+      self.report({'ERROR'}, 'Save the .blend file before baking')
+      return {'CANCELLED'}
+
+    _, low_collection, high_collection = ensure_baking_collections(context.scene)
+    low_objects = collection_meshes(low_collection)
+    high_objects = collection_meshes(high_collection)
+    if not low_objects:
+      self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
+      return {'CANCELLED'}
+    if not high_objects:
+      self.report({'ERROR'}, "The 'Baking/high' collection has no mesh objects")
+      return {'CANCELLED'}
+
+    texture_sets = low_texture_set_names(low_objects)
+    if len(texture_sets) != 1:
+      self.report(
+        {'ERROR'},
+        'Bake Base Color currently requires exactly one Low-poly Texture Set',
+      )
+      return {'CANCELLED'}
+    if not high_has_base_color_textures(high_objects):
+      self.report(
+        {'ERROR'},
+        'No image texture was found upstream of High-poly Principled Base Color',
+      )
+      return {'CANCELLED'}
+
+    props = context.scene.substance_tools_baking
+    paths = baking_paths()
+    bake_name = base_color_bake_name(texture_sets[0])
+    bake_filename = f'{bake_name}.png'
+    try:
+      result = bake_high_base_color_to_low(
+        low_objects,
+        high_objects,
+        paths['texture_dir'],
+        int(props.resolution),
+        props.match,
+        bake_filename,
+      )
+    except Exception as error:
+      self.report({'ERROR'}, f'Base Color bake failed: {error}')
+      traceback.print_exc()
+      return {'CANCELLED'}
+
+    if not result:
+      self.report({'ERROR'}, 'No matching High/Low pair was baked')
+      return {'CANCELLED'}
+
+    baked_image = bpy.data.images.get(bake_name)
+    if baked_image is None:
+      self.report({'ERROR'}, f"The baked Blender image '{bake_name}' was not found")
+      return {'CANCELLED'}
+    final_color_path = (
+      paths['texture_dir'] / f'T_{clean_name(texture_sets[0])}_Color.png'
+    )
+    should_connect = (
+      not final_color_path.is_file()
+      or props.base_color_source == 'BAKING'
+    )
+    connected = (
+      connect_base_color_bake_to_low_materials(low_objects, baked_image)
+      if should_connect
+      else 0
+    )
+    if should_connect:
+      props.base_color_source = 'BAKING'
+    if not connected:
+      self.report(
+        {'INFO'},
+        'Base Color bake updated; existing Painter Base Color connection was preserved',
+      )
+      return {'FINISHED'}
+
+    self.report(
+      {'INFO'},
+      (
+        f"Base Color baked to {paths['texture_dir'] / bake_filename} "
+        f"and connected to {connected} Low material shader(s)"
+      ),
+    )
+    return {'FINISHED'}
+
+
+class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
+  """Export with Painter Unreal_V2, then connect the results to Low materials"""
+  bl_idname = 'st.export_painter_textures_and_apply'
+  bl_label = 'Export Painter Textures & Apply'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  _timer = None
+  _request_id = ''
+
+  def execute(self, context):
+    if not bpy.data.filepath:
+      self.report({'ERROR'}, 'Save the .blend file first')
+      return {'CANCELLED'}
+    paths = baking_paths()
+    if not paths['spp'].is_file():
+      self.report({'ERROR'}, 'Create the Painter project first')
+      return {'CANCELLED'}
+    _, low_collection, _ = ensure_baking_collections(context.scene)
+    if not collection_meshes(low_collection):
+      self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
+      return {'CANCELLED'}
+
+    self._request_id = str(time.time_ns())
+    request_path = paths['texture_dir'] / PAINTER_EXPORT_REQUEST
+    result_path = paths['texture_dir'] / PAINTER_EXPORT_RESULT
+    if result_path.is_file():
+      result_path.unlink()
+    write_json(request_path, {
+      'request_id': self._request_id,
+      'spp': str(paths['spp'].resolve()),
+      'texture_dir': str(paths['texture_dir'].resolve()),
+      'preset': 'Unreal_V2',
+    })
+
+    painter_path = get_preferences(context)['painter_path']
+    if not painter_path or not Path(painter_path).is_file():
+      self.report({'ERROR'}, 'Set a valid Substance Painter executable')
+      return {'CANCELLED'}
+    if not painter_is_running(painter_path):
+      subprocess.Popen([painter_path, str(paths['spp'])])
+
+    self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+    context.window_manager.modal_handler_add(self)
+    self.report({'INFO'}, 'Painter texture export requested')
+    return {'RUNNING_MODAL'}
+
+  def modal(self, context, event):
+    if event.type != 'TIMER':
+      return {'PASS_THROUGH'}
+    result_path = baking_paths()['texture_dir'] / PAINTER_EXPORT_RESULT
+    if not result_path.is_file():
+      return {'PASS_THROUGH'}
+    try:
+      result = json.loads(result_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+      return {'PASS_THROUGH'}
+    if result.get('request_id') != self._request_id:
+      return {'PASS_THROUGH'}
+    context.window_manager.event_timer_remove(self._timer)
+    self._timer = None
+    if result.get('status') != 'SUCCESS':
+      self.report({'ERROR'}, result.get('message', 'Painter texture export failed'))
+      return {'CANCELLED'}
+
+    canonicalize_painter_export_files(result)
+    _, low_collection, _ = ensure_baking_collections(context.scene)
+    low_objects = collection_meshes(low_collection)
+    applied = apply_painter_textures_to_low(
+      low_objects,
+      baking_paths()['texture_dir'],
+    )
+    context.scene.substance_tools_baking.base_color_source = 'PAINTER'
+    if applied == 0:
+      # Apply looks files up as T_<material-without-M_>_<role>.png. If Painter's
+      # Texture Set names no longer match the Blender material names (e.g. the
+      # material was renamed after the Painter project was created and never
+      # reimported), nothing matches. Surface that clearly instead of a silent "0".
+      painter_sets = sorted({key.split('/')[0] for key in result.get('textures', {}) if key})
+      expected = sorted({
+        clean_name(stripped_material_name(slot.material.name))
+        for obj in low_objects
+        for slot in obj.material_slots
+        if slot.material
+      })
+      print(f'[Substance Tools] apply 0개 (이름 불일치 가능): Painter={painter_sets}, 기대={expected}')
+      self.report(
+        {'WARNING'},
+        '텍스처를 0개 적용했습니다 — Painter Texture Set 이름과 Blender 머티리얼 이름이 '
+        f'어긋났을 수 있습니다. Painter={painter_sets} vs 머티리얼(M_ 제외)={expected}. '
+        "substance-tools 패널의 'Update Painter'로 low를 리임포트해 이름을 맞춘 뒤 다시 "
+        '실행하세요. (머티리얼 이름 변경은 Painter 왕복을 모두 끝낸 뒤에 하세요) '
+        '(applied 0 textures: Painter Texture Set names may differ from material names)',
+      )
+      return {'FINISHED'}
+    self.report(
+      {'INFO'},
+      f'완료 (done): Painter 텍스처를 Base Color 셰이더 {applied}개에 적용 '
+      f'(exported & applied to {applied} shader(s))',
+    )
+    return {'FINISHED'}
+
+  def cancel(self, context):
+    if self._timer is not None:
+      context.window_manager.event_timer_remove(self._timer)
+      self._timer = None
+
+
+class ToggleBaseColorSourceOperator(bpy.types.Operator):
+  """Switch Low materials between Painter and baked High Base Color"""
+  bl_idname = 'st.toggle_base_color_source'
+  bl_label = 'Switch Base Color Source'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    _, low_collection, _ = ensure_baking_collections(context.scene)
+    low_objects = collection_meshes(low_collection)
+    texture_sets = low_texture_set_names(low_objects)
+    if len(texture_sets) != 1:
+      self.report({'ERROR'}, 'Base Color switching requires one Low Texture Set')
+      return {'CANCELLED'}
+    props = context.scene.substance_tools_baking
+    target = 'BAKING' if props.base_color_source == 'PAINTER' else 'PAINTER'
+    texture_set = clean_name(texture_sets[0])
+    filename = (
+      f'{base_color_bake_name(texture_set)}.png'
+      if target == 'BAKING'
+      else f'T_{texture_set}_Color.png'
+    )
+    path = baking_paths()['texture_dir'] / filename
+    if not path.is_file():
+      self.report({'ERROR'}, f'Texture does not exist: {path.name}')
+      return {'CANCELLED'}
+    image = load_or_reload_image(path)
+    connected = sum(
+      set_material_base_color_image(material, image)
+      for material in {
+        slot.material
+        for obj in low_objects
+        for slot in obj.material_slots
+        if slot.material
+      }
+    )
+    props.base_color_source = target
+    self.report({'INFO'}, f'Base Color source: {target.title()} ({connected} shader(s))')
+    return {'FINISHED'}
+
 
 class LoadSubstancePainterTexturesOperator(bpy.types.Operator):
   """Load Substance Painter Textures"""
@@ -787,6 +1486,14 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
     ],
     default='FACE_SETS',
   )
+  base_color_source: bpy.props.EnumProperty(
+    name='Base Color Source',
+    items=[
+      ('PAINTER', 'Painter', 'Use the final Base Color exported by Painter'),
+      ('BAKING', 'Baking', 'Use the High-to-Low baked Base Color'),
+    ],
+    default='BAKING',
+  )
 
 class SubstanceToolsPanel(bpy.types.Panel):
   """Substance Tools Panel"""
@@ -805,17 +1512,43 @@ class SubstanceToolsPanel(bpy.types.Panel):
     baking_box.prop(baking, 'resolution')
     baking_box.prop(baking, 'match')
     baking_box.prop(baking, 'id_source')
-    row = baking_box.row(align=True)
-    row.operator(
+    baking_box.operator(
+      'st.bake_base_color_to_low',
+      text='Bake Base Color',
+      icon='IMAGE_DATA',
+    )
+    painter_project_exists = baking_paths()['spp'].is_file() if bpy.data.filepath else False
+    primary_action = baking_box.operator(
       'st.export_baking_to_substance_painter',
-      text='Export',
-      icon='EXPORT',
-    ).run_painter = False
-    row.operator(
-      'st.export_baking_to_substance_painter',
-      text='Bake in Painter',
+      text='Open Painter Project' if painter_project_exists else 'Create in Painter',
       icon='WINDOW',
-    ).run_painter = True
+    )
+    primary_action.action = 'OPEN' if painter_project_exists else 'CREATE'
+    update_row = baking_box.row()
+    update_row.enabled = painter_project_exists
+    update_row.operator(
+      'st.export_baking_to_substance_painter',
+      text='Update Painter',
+      icon='FILE_REFRESH',
+    ).action = 'UPDATE'
+    export_row = baking_box.row()
+    export_row.enabled = painter_project_exists
+    export_row.operator(
+      'st.export_painter_textures_and_apply',
+      text='Export Painter Textures & Apply',
+      icon='TEXTURE',
+    )
+    baking_box.label(text=f'Base Color Source: {baking.base_color_source.title()}')
+    switch_label = (
+      'Use Baked Base Color'
+      if baking.base_color_source == 'PAINTER'
+      else 'Use Painter Base Color'
+    )
+    baking_box.operator(
+      'st.toggle_base_color_source',
+      text=switch_label,
+      icon='FILE_REFRESH',
+    )
 
     paths = get_paths(context)
     fbx = paths['fbx']
@@ -861,6 +1594,9 @@ classes = (
   SubstanceToolsBakingSettings,
   ExportToSubstancePainterOperator,
   ExportBakingToSubstancePainterOperator,
+  BakeBaseColorToLowOperator,
+  ExportPainterTexturesAndApplyOperator,
+  ToggleBaseColorSourceOperator,
   LoadSubstancePainterTexturesOperator,
 
   SubstanceToolsPanel,

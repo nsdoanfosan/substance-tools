@@ -25,7 +25,7 @@ Baking
 `- high
 ```
 
-`Bake in Painter` exports evaluated meshes without changing the Blender source:
+`Create in Painter` exports evaluated meshes without changing the Blender source:
 
 - `low/<blend>_low.fbx`
 - `high/<blend>_high.fbx`
@@ -50,6 +50,31 @@ The companion Painter startup plugin:
 - returns Painter to Painting mode after a successful bake;
 - creates new projects from Painter's bundled `Unreal Engine.spt`, including
   that template's project, viewport, and post-effects defaults.
+
+`Bake Base Color` transfers an image texture connected upstream of the
+High-poly Principled BSDF Base Color to the Low UVs with a Cycles
+Selected-to-Active diffuse-color bake. It uses the existing texture naming
+rule with a `_baking` suffix, for example
+`texture/T_rock_Color_baking.png`, then connects that image to the Low
+materials' Principled BSDF Base Color inputs. Painter imports the same file and
+assigns it to a bottom Fill Layer named `Blender High Base Color`, with only
+Base Color enabled. This button currently requires exactly one Low-poly
+Texture Set.
+
+When no SPP exists, the primary button is `Create in Painter`. Once the SPP
+exists it becomes `Open Painter Project`, while `Update Painter` is available.
+Opening launches the existing SPP when Painter is not running. Updating rewrites the FBX and
+request data; an open Painter project detects the changed request and performs
+one mesh reimport without running mesh-map baking. It then updates the Blender
+Base Color Fill Layer and saves the SPP. If Painter is closed, the existing SPP
+is opened first.
+
+`Export Painter Textures & Apply` asks the open Painter project to export with
+the `Unreal_V2` preset, waits for completion, reloads the exported maps in
+Blender, and connects Color, Normal, packed Extra, Emissive, and Height maps to
+the Low materials. The packed Extra texture uses Green for Roughness and Blue
+for Metallic. `Use Baked Base Color` / `Use Painter Base Color` switches only
+the Low material connection; both source files remain untouched.
 
 Texture export remains manual. Select the existing `Unreal_V2` Painter preset
 and export PNG files into the shared `texture` folder.
