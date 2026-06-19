@@ -401,6 +401,90 @@ def _apply_base_color_layers(request):
     _log(f"Applied Blender High Base Color to {applied} Painter Fill Layer(s)")
 
 
+def _apply_alpha_color_layers(request):
+    alpha_color_maps = request.get("alpha_color_maps", {})
+    if not alpha_color_maps:
+        return
+
+    applied = 0
+    for texture_set in substance_painter.textureset.all_texture_sets():
+        texture_set_name = texture_set.name
+        image_path = alpha_color_maps.get(texture_set_name)
+        if not image_path or not Path(image_path).is_file():
+            continue
+        color_resource = substance_painter.resource.import_project_resource(
+            image_path,
+            substance_painter.resource.Usage.TEXTURE,
+            name=f"{texture_set_name}_BlenderAlphaColor",
+            group="Substance Tools",
+        )
+        mask_resource = substance_painter.resource.import_project_resource(
+            image_path,
+            substance_painter.resource.Usage.ALPHA,
+            name=f"{texture_set_name}_BlenderAlphaMask",
+            group="Substance Tools",
+        )
+        for stack in texture_set.all_stacks():
+            root_nodes = substance_painter.layerstack.get_root_layer_nodes(stack)
+            layer_name = "Blender Alpha Details"
+            fill_layer = next(
+                (
+                    node
+                    for node in root_nodes
+                    if isinstance(node, substance_painter.layerstack.FillLayerNode)
+                    and node.get_name() == layer_name
+                ),
+                None,
+            )
+            if fill_layer is None:
+                fill_layer = substance_painter.layerstack.insert_fill(
+                    substance_painter.layerstack.InsertPosition.from_textureset_stack(
+                        stack
+                    )
+                )
+                fill_layer.set_name(layer_name)
+            fill_layer.active_channels = {
+                substance_painter.textureset.ChannelType.BaseColor
+            }
+            fill_layer.set_projection_mode(
+                substance_painter.layerstack.ProjectionMode.UV
+            )
+            fill_layer.set_source(
+                substance_painter.textureset.ChannelType.BaseColor,
+                color_resource.identifier(),
+            )
+            if not fill_layer.has_mask():
+                fill_layer.add_mask(
+                    substance_painter.layerstack.MaskBackground.Black
+                )
+            mask_fill = next(
+                (
+                    effect
+                    for effect in fill_layer.mask_effects()
+                    if isinstance(
+                        effect,
+                        substance_painter.layerstack.FillEffectNode,
+                    )
+                    and effect.get_name() == "Blender Alpha Mask"
+                ),
+                None,
+            )
+            if mask_fill is None:
+                mask_fill = substance_painter.layerstack.insert_fill(
+                    substance_painter.layerstack.InsertPosition.inside_node(
+                        fill_layer,
+                        substance_painter.layerstack.NodeStack.Mask,
+                    )
+                )
+                mask_fill.set_name("Blender Alpha Mask")
+            mask_fill.set_source(None, mask_resource.identifier())
+            mask_fill.set_projection_mode(
+                substance_painter.layerstack.ProjectionMode.UV
+            )
+            applied += 1
+    _log(f"Applied Blender Alpha Details to {applied} Painter Fill Layer(s)")
+
+
 def _save_successful_request():
     global _processing, _active_request
     request = _active_request
@@ -410,6 +494,7 @@ def _save_successful_request():
     saved = False
     try:
         _apply_base_color_layers(request)
+        _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
         for key in (
             "pipeline_hash",
@@ -417,6 +502,7 @@ def _save_successful_request():
             "high_hash",
             "settings_hash",
             "base_color_hashes",
+            "alpha_color_hashes",
         ):
             metadata.set(key, request.get(key, ""))
 
@@ -449,6 +535,7 @@ def _save_reimported_request():
         return
     try:
         _apply_base_color_layers(request)
+        _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
         for key in (
             "pipeline_hash",
@@ -456,6 +543,7 @@ def _save_reimported_request():
             "high_hash",
             "settings_hash",
             "base_color_hashes",
+            "alpha_color_hashes",
         ):
             metadata.set(key, request.get(key, ""))
         substance_painter.project.save()

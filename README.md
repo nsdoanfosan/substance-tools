@@ -22,7 +22,8 @@ The add-on creates this collection layout automatically:
 ```text
 Baking
 |- low
-`- high
+|- high
+`- alpha
 ```
 
 `Create in Painter` exports evaluated meshes without changing the Blender source:
@@ -30,6 +31,12 @@ Baking
 - `low/<blend>_low.fbx`
 - `high/<blend>_high.fbx`
 - `texture/<blend>_SP.spp`
+
+`Pair Selected Low + High` is the explicit naming step. Select exactly one Low
+and one or more High meshes that are already in their Baking collections. The
+Low becomes `A_low`; one High becomes `A_high`, while several become
+`A_high_01`, `A_high_02`, and so on. Existing Low materials keep their names
+and receive only a missing `M_` prefix. Selecting more than one Low is rejected.
 
 Low FBX material names have the leading `M_` removed so `M_rock` becomes the
 Painter Texture Set `rock`. High-poly Sculpt Face Sets are converted to stable
@@ -50,6 +57,26 @@ The companion Painter startup plugin:
 - returns Painter to Painting mode after a successful bake;
 - creates new projects from Painter's bundled `Unreal Engine.spt`, including
   that template's project, viewport, and post-effects defaults.
+
+`Bake Alpha Details` treats meshes in `Baking/alpha` as editable decals or
+logos. Name them to match their Low mesh, for example `rock_low` and
+`rock_alpha`. If the matching Low mesh has one material, its Painter Texture
+Set is selected automatically. If it has several materials, choose the target
+for each Alpha object in the panel. Reusing the same material name on the Alpha
+object also selects that target automatically.
+
+Each Alpha material must use a Principled BSDF with an image texture connected
+to both Base Color and Alpha. The add-on writes one RGBA texture per target,
+for example `texture/T_rock_body_Color_alpha.png`: RGB contains the decal color
+and A contains its opacity. In Blender this image is mixed over the baked High
+Base Color for preview. The overlay is disabled automatically when the final
+Painter Base Color is selected, because that export already contains the
+Painter layer result.
+
+Painter imports the RGBA image into a top Fill Layer named
+`Blender Alpha Details`, enables only Base Color, adds a black mask, and places
+`Blender Alpha Mask` as a Fill effect inside that mask. Alpha meshes are never
+included in the Painter High FBX or Painter mesh-map bake.
 
 `Bake Base Color` transfers an image texture connected upstream of the
 High-poly Principled BSDF Base Color to the Low UVs with a Cycles
