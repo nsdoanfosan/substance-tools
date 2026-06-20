@@ -76,13 +76,36 @@ the Low materials. The packed Extra texture uses Green for Roughness and Blue
 for Metallic. `Use Baked Base Color` / `Use Painter Base Color` switches only
 the Low material connection; both source files remain untouched.
 
-Texture export remains manual. Select the existing `Unreal_V2` Painter preset
-and export PNG files into the shared `texture` folder.
+If the automated export cannot be used, the fallback is manual Painter export:
+select the existing `Unreal_V2` preset and export PNG files into the same shared
+`texture` folder.
 
 The Painter plugin is installed from
 `painter/startup/substance_tools_unreal_viewport` into:
 
 `Documents/Adobe/Adobe Substance 3D Painter/python/startup/`
+
+## Handoff to Send to Unreal
+
+This fork is paired with
+[`UE Unique Export Names`](https://github.com/nsdoanfosan/ue-unique-export-names-addon)
+for the final Blender-to-Unreal handoff.
+
+After the Painter round trip is complete:
+
+1. Use `Export Painter Textures & Apply` so the `Unreal_V2` maps are present in
+   the shared `texture` folder and connected to the `Baking/low` materials.
+2. Do not rename the Low materials afterward. Painter Texture Set names match
+   Blender material names with the leading `M_` removed.
+3. `UE Unique Export Names` automatically links the `Baking/low` meshes and
+   their complete parent chains into `Export`. No handoff button is required.
+4. Export with Send to Unreal. Enable `Combine > Child meshes` when an Empty and
+   its child meshes should become one Unreal asset.
+
+`UE Unique Export Names` does not copy or rename the Painter Low data. It links
+the existing `Baking/low` hierarchy into `Export` automatically and protects
+its objects, mesh data, materials, images, and texture files from its External
+workflow.
 
 # Usage
 
