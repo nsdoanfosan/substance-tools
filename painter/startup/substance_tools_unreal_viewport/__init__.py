@@ -106,6 +106,30 @@ def _write_json(path, value):
     os.replace(temporary_path, path)
 
 
+def _normalized_resource_name(name):
+    return str(name or "").lower().replace(" ", "").replace("_", "")
+
+
+def _export_preset_url(request):
+    requested_name = request.get("preset", "Unreal_V2")
+    normalized_name = _normalized_resource_name(requested_name)
+    preset = next(
+        (
+            candidate
+            for candidate in substance_painter.export.list_resource_export_presets()
+            if _normalized_resource_name(candidate.resource_id.name) == normalized_name
+        ),
+        None,
+    )
+    if preset is not None:
+        return preset.resource_id.url()
+
+    preset_path = Path(request.get("preset_path", ""))
+    if preset_path.is_file():
+        return f"resource://your_assets/{preset_path.stem}"
+    return f"resource://your_assets/{requested_name}"
+
+
 def _mark_request_failed(request, message):
     request_path = request.get("_request_path")
     if not request_path:
@@ -158,19 +182,7 @@ def _process_export_request():
     _export_processing = True
     result_path = Path(request["texture_dir"]) / EXPORT_RESULT_FILENAME
     try:
-        requested_name = request.get("preset", "Unreal_V2")
-        normalized_name = requested_name.lower().replace(" ", "").replace("_", "")
-        preset = next(
-            (
-                candidate
-                for candidate in substance_painter.export.list_resource_export_presets()
-                if candidate.resource_id.name.lower().replace(" ", "").replace("_", "")
-                == normalized_name
-            ),
-            None,
-        )
-        if preset is None:
-            raise RuntimeError(f"Painter export preset was not found: {requested_name}")
+        preset_url = _export_preset_url(request)
         export_list = []
         for texture_set in substance_painter.textureset.all_texture_sets():
             for stack in texture_set.all_stacks():
@@ -184,7 +196,7 @@ def _process_export_request():
         result = substance_painter.export.export_project_textures({
             "exportShaderParams": False,
             "exportPath": request["texture_dir"],
-            "defaultExportPreset": preset.resource_id.url(),
+            "defaultExportPreset": preset_url,
             "exportList": export_list,
             "exportParameters": [{
                 "parameters": {

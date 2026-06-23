@@ -29,6 +29,7 @@ BAKE_PLAN = '.substance_tools_bake_plan.json'
 PENDING_REQUEST = 'pending_request.json'
 PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
+EXPORT_PRESET_NAME = 'Unreal_V2'
 
 
 def clean_name(value):
@@ -177,6 +178,40 @@ def baking_paths():
     'spp': texture_dir / f'{asset}_SP.spp',
     'bake_plan': texture_dir / BAKE_PLAN,
   }
+
+
+def bundled_export_preset_path(name=EXPORT_PRESET_NAME):
+  return Path(__file__).resolve().parent / 'painter' / 'export-presets' / f'{name}.spexp'
+
+
+def user_export_preset_path(name=EXPORT_PRESET_NAME):
+  return (
+    Path.home()
+    / 'Documents'
+    / 'Adobe'
+    / 'Adobe Substance 3D Painter'
+    / 'assets'
+    / 'export-presets'
+    / f'{name}.spexp'
+  )
+
+
+def ensure_painter_export_preset(name=EXPORT_PRESET_NAME):
+  source_path = bundled_export_preset_path(name)
+  if not source_path.is_file():
+    raise FileNotFoundError(f'Bundled Painter export preset was not found: {source_path}')
+  target_path = user_export_preset_path(name)
+  source_bytes = source_path.read_bytes()
+  try:
+    if target_path.is_file() and target_path.read_bytes() == source_bytes:
+      return target_path
+  except OSError:
+    pass
+  target_path.parent.mkdir(parents=True, exist_ok=True)
+  temporary_path = target_path.with_name(f'.{target_path.name}.tmp')
+  temporary_path.write_bytes(source_bytes)
+  os.replace(temporary_path, target_path)
+  return target_path
 
 
 def pending_request_path():
@@ -2878,6 +2913,11 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if not collection_meshes(low_collection):
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
+    try:
+      preset_path = ensure_painter_export_preset()
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter export preset install failed: {error}')
+      return {'CANCELLED'}
 
     self._request_id = str(time.time_ns())
     request_path = paths['texture_dir'] / PAINTER_EXPORT_REQUEST
@@ -2888,7 +2928,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       'request_id': self._request_id,
       'spp': str(paths['spp'].resolve()),
       'texture_dir': str(paths['texture_dir'].resolve()),
-      'preset': 'Unreal_V2',
+      'preset': EXPORT_PRESET_NAME,
+      'preset_path': str(preset_path.resolve()),
     })
 
     painter_path = get_preferences(context)['painter_path']
