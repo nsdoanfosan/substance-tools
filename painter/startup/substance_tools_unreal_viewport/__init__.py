@@ -77,6 +77,9 @@ def _load_request():
             if project_path and request.get("spp"):
                 if _normalized_path(project_path) != _normalized_path(request["spp"]):
                     continue
+            if request.get("status") == "FAILED":
+                continue
+            request["_request_path"] = str(path)
             return request
         except (OSError, ValueError) as error:
             _log(f"Could not read {path}: {error}")
@@ -101,6 +104,20 @@ def _write_json(path, value):
         encoding="utf-8",
     )
     os.replace(temporary_path, path)
+
+
+def _mark_request_failed(request, message):
+    request_path = request.get("_request_path")
+    if not request_path:
+        return
+    try:
+        saved = dict(request)
+        saved.pop("_request_path", None)
+        saved["status"] = "FAILED"
+        saved["failure"] = message
+        _write_json(Path(request_path), saved)
+    except Exception as error:
+        _log(f"Could not mark request failed: {error}")
 
 
 def _process_export_request():
@@ -258,6 +275,15 @@ def _find_property(properties, *needles):
     return None
 
 
+def _find_property_containing_all(properties, *needles):
+    normalized_needles = tuple(needle.lower().replace(" ", "") for needle in needles)
+    for prop in properties.values():
+        haystack = f"{prop.short_name()} {prop.label()}".lower().replace(" ", "")
+        if all(needle in haystack for needle in normalized_needles):
+            return prop
+    return None
+
+
 def _enum_value_containing(prop, *needles):
     if prop is None:
         return None
@@ -279,6 +305,44 @@ def _mesh_map_usages(names):
     return usages
 
 
+def _metadata_value(metadata, key):
+    value = metadata.get(key)
+    return "" if value is None else value
+
+
+def _request_value(request, key):
+    value = request.get(key, "")
+    return "" if value is None else value
+
+
+def _texture_set_name(texture_set):
+    for attribute in ("name", "display_name"):
+        value = getattr(texture_set, attribute, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        if value:
+            return str(value)
+    return str(texture_set)
+
+
+def _normalized_texture_set_name(name):
+    value = str(name)
+    if value.startswith("M_"):
+        value = value[2:]
+    return "".join(char for char in value.lower() if char.isalnum())
+
+
+def _texture_set_matches(texture_set_name, names):
+    normalized = _normalized_texture_set_name(texture_set_name)
+    return any(
+        normalized == _normalized_texture_set_name(name)
+        for name in names
+    )
+
+
 def _configure_baking(request):
     settings = request["settings"]
     resolution = int(settings.get("resolution", 2048))
@@ -287,18 +351,55 @@ def _configure_baking(request):
         texture_sets,
         substance_painter.textureset.Resolution(resolution, resolution),
     )
+    try:
+        substance_painter.baking.unlink_all_common_parameters()
+    except Exception as error:
+        _log(f"Could not unlink common baking parameters: {error}")
 
     enabled_maps = _mesh_map_usages(settings.get("mesh_maps", []))
+    low_as_high_texture_sets = [str(name) for name in settings.get("low_as_high_texture_sets", [])]
+    rebake_texture_sets = [str(name) for name in request.get("rebake_texture_sets", [])]
+    high_entry_by_texture_set = {
+        str(entry.get("texture_set", "")): entry
+        for entry in request.get("high_entries", [])
+        if entry.get("texture_set")
+    }
     high_path = request.get("high_fbx", "")
-    high_url = (
-        QtCore.QUrl.fromLocalFile(str(Path(high_path).resolve())).toString()
-        if high_path
-        else ""
-    )
 
     for texture_set in texture_sets:
+        texture_set_name = _texture_set_name(texture_set)
+        should_bake = (
+            not rebake_texture_sets
+            or _texture_set_matches(texture_set_name, rebake_texture_sets)
+        )
+        high_entry = next(
+            (
+                entry for name, entry in high_entry_by_texture_set.items()
+                if _texture_set_matches(texture_set_name, [name])
+            ),
+            None,
+        )
+        texture_high_paths = []
+        if high_entry:
+            texture_high_paths = [
+                str(path)
+                for path in high_entry.get("fbxs", [])
+                if path
+            ]
+            if not texture_high_paths and high_entry.get("fbx"):
+                texture_high_paths = [str(high_entry.get("fbx"))]
+        elif high_path:
+            texture_high_paths = [str(high_path)]
+        texture_high_urls = [
+            QtCore.QUrl.fromLocalFile(str(Path(path).resolve())).toString()
+            for path in texture_high_paths
+        ]
+        use_low_as_high = (
+            not bool(texture_high_urls)
+            or _texture_set_matches(texture_set_name, low_as_high_texture_sets)
+        )
         params = substance_painter.baking.BakingParameters.from_texture_set(texture_set)
-        params.set_textureset_enabled(True)
+        params.set_textureset_enabled(should_bake)
         params.set_enabled_bakers(enabled_maps)
         common = params.common()
         changes = {}
@@ -306,10 +407,20 @@ def _configure_baking(request):
         if "OutputSize" in common:
             exponent = int(math.log2(resolution))
             changes[common["OutputSize"]] = (exponent, exponent)
-        if "LowAsHigh" in common:
-            changes[common["LowAsHigh"]] = not bool(high_path)
-        if high_path and "HipolyMesh" in common:
-            changes[common["HipolyMesh"]] = high_url
+        low_as_high = (
+            common.get("LowAsHigh")
+            or _find_property_containing_all(common, "low", "high")
+            or _find_property_containing_all(common, "use", "low", "poly", "high")
+        )
+        high_mesh = common.get("HipolyMesh") or _find_property_containing_all(
+            common,
+            "high",
+            "mesh",
+        )
+        if low_as_high is not None:
+            changes[low_as_high] = use_low_as_high
+        if high_mesh is not None and not use_low_as_high:
+            changes[high_mesh] = "|".join(texture_high_urls)
 
         cage = _find_property(common, "cagemode")
         automatic_cage = _enum_value_containing(cage, "automatic")
@@ -342,6 +453,11 @@ def _configure_baking(request):
             changes[id_source_property] = id_source_value
 
         substance_painter.baking.BakingParameters.set(changes)
+        _log(
+            f"Texture Set '{texture_set_name}': "
+            f"{'REBAKE' if should_bake else 'skip'}, "
+            f"{'Low Poly as High' if use_low_as_high else 'High-to-Low'}"
+        )
 
     _log(
         f"Configured {len(texture_sets)} Texture Set(s), "
@@ -548,7 +664,10 @@ def _save_reimported_request():
             metadata.set(key, request.get(key, ""))
         substance_painter.project.save()
         substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
-        _log("Low-poly mesh reimported without mesh-map baking; project saved")
+        if request.get("_low_reloaded"):
+            _log("Low-poly mesh reimported without mesh-map baking; project saved")
+        else:
+            _log("Painter update applied without mesh-map baking; project saved")
     except Exception as error:
         _log(f"Low-poly mesh was reimported, but the update could not be saved: {error}")
     _active_request = None
@@ -564,7 +683,10 @@ def _on_baking_ended(event):
         substance_painter.project.execute_when_not_busy(_save_successful_request)
     else:
         global _processing, _active_request
-        _log(f"Baking did not complete successfully: {event.status}")
+        message = f"Baking did not complete successfully: {event.status}"
+        _log(message)
+        if _active_request is not None:
+            _mark_request_failed(_active_request, message)
         _active_request = None
         _processing = False
 
@@ -580,7 +702,9 @@ def _start_bake(request):
         _log("Automatic mesh-map baking started")
     except Exception as error:
         global _processing, _active_request
-        _log(f"Could not start automatic baking: {error}")
+        message = f"Could not start automatic baking: {error}"
+        _log(message)
+        _mark_request_failed(request, message)
         _active_request = None
         _processing = False
 
@@ -588,12 +712,19 @@ def _start_bake(request):
 def _after_reload(status):
     if status != substance_painter.project.ReloadMeshStatus.SUCCESS:
         global _processing, _active_request
-        _log("Low-poly mesh reload failed; bake was not started")
+        message = "Low-poly mesh reload failed; bake was not started"
+        _log(message)
+        if _active_request is not None:
+            _mark_request_failed(_active_request, message)
         _active_request = None
         _processing = False
         return
     _log("Low-poly mesh reloaded")
-    if _active_request.get("action") == "UPDATE":
+    _active_request["_low_reloaded"] = True
+    if _active_request.get("_needs_bake"):
+        _log("Bake-relevant data changed; baking after low-poly mesh reload")
+        _start_bake(_active_request)
+    elif _active_request.get("action") == "UPDATE":
         substance_painter.project.execute_when_not_busy(_save_reimported_request)
     else:
         _start_bake(_active_request)
@@ -614,6 +745,33 @@ def _on_project_ready(_event=None):
         return
 
     metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
+    low_changed = (
+        bool(request.get("low_changed"))
+        if "low_changed" in request
+        else _metadata_value(metadata, "low_hash") != _request_value(request, "low_hash")
+    )
+    changed_high_texture_sets = [
+        str(name) for name in request.get("changed_high_texture_sets", [])
+    ]
+    high_changed = (
+        bool(changed_high_texture_sets)
+        if "changed_high_texture_sets" in request
+        else _metadata_value(metadata, "high_hash")
+        != _request_value(request, "high_hash")
+    )
+    settings_changed = (
+        bool(request.get("settings_changed"))
+        if "settings_changed" in request
+        else _metadata_value(metadata, "settings_hash")
+        != _request_value(request, "settings_hash")
+    )
+    rebake_texture_sets = [str(name) for name in request.get("rebake_texture_sets", [])]
+    explicit_bake_plan = "rebake_texture_sets" in request
+    needs_bake = bool(rebake_texture_sets) if explicit_bake_plan else (
+        high_changed or settings_changed
+    )
+    base_color_changed = bool(request.get("base_color_changed"))
+    alpha_color_changed = bool(request.get("alpha_color_changed"))
     if (
         request.get("action") != "UPDATE"
         and metadata.get("pipeline_hash") == request.get("pipeline_hash")
@@ -621,19 +779,31 @@ def _on_project_ready(_event=None):
         _log("Mesh and bake settings are unchanged; reimport and baking skipped")
         _last_polled_pipeline_hash = request_marker
         return
+    if (
+        request.get("action") == "UPDATE"
+        and explicit_bake_plan
+        and not low_changed
+        and not needs_bake
+        and not base_color_changed
+        and not alpha_color_changed
+    ):
+        _log("No Painter work required; update request skipped")
+        _last_polled_pipeline_hash = request_marker
+        return
 
     _processing = True
     _active_request = request
+    _active_request["_needs_bake"] = needs_bake
+    _active_request["_low_reloaded"] = False
     _last_polled_pipeline_hash = request_marker
-    must_reload = request.get("action") == "UPDATE" or (
-        bool(request.get("spp_existed"))
-        and metadata.get("low_hash") != request.get("low_hash")
+    must_reload = low_changed and (
+        request.get("action") == "UPDATE" or bool(request.get("spp_existed"))
     )
     if must_reload:
-        if request.get("action") == "UPDATE":
-            _log("Update requested; reimporting the low-poly mesh without baking")
+        if needs_bake:
+            _log("Low-poly mesh changed; reloading it before mesh-map baking")
         else:
-            _log("Low-poly mesh changed; reloading it before baking")
+            _log("Low-poly mesh changed; reimporting without mesh-map baking")
         reload_settings = substance_painter.project.MeshReloadingSettings(
             import_cameras=False,
             preserve_strokes=True,
@@ -652,6 +822,12 @@ def _on_project_ready(_event=None):
                 _log("Painter is still loading; mesh reimport will retry")
                 return
             raise
+    elif needs_bake:
+        if high_changed:
+            _log("High-poly mesh changed; starting mesh-map baking")
+        elif settings_changed:
+            _log("Bake settings changed; starting mesh-map baking")
+        _start_bake(request)
     elif request.get("action") == "UPDATE":
         substance_painter.project.execute_when_not_busy(_save_reimported_request)
     else:

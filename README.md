@@ -49,7 +49,11 @@ the temporary Low export copy instead.
 The companion Painter startup plugin:
 
 - reloads the low mesh only when its exported contents changed;
-- rebakes only when low/high FBX contents or bake settings changed;
+- rebakes High-to-Low Texture Sets only when their high FBX contents or bake
+  settings changed;
+- rebakes Low Poly as High Texture Sets when their low mesh changed;
+- keeps low-only changes in High-to-Low Texture Sets as a reimport/save
+  operation without mesh-map baking;
 - uses High Definition Mesh, vertex-color IDs, automatic cage, and all standard
   mesh maps;
 - defaults to `By Mesh Name`, with `Always` available in Blender;
@@ -90,11 +94,14 @@ Texture Set.
 
 When no SPP exists, the primary button is `Create in Painter`. Once the SPP
 exists it becomes `Open Painter Project`, while `Update Painter` is available.
-Opening launches the existing SPP when Painter is not running. Updating rewrites the FBX and
-request data; an open Painter project detects the changed request and performs
-one mesh reimport without running mesh-map baking. It then updates the Blender
-Base Color Fill Layer and saves the SPP. If Painter is closed, the existing SPP
-is opened first.
+Opening launches the existing SPP when Painter is not running. Updating rewrites
+the FBX and request data; an open Painter project detects the changed request.
+If only High-to-Low Low meshes changed, Painter reimports the Low mesh without
+running mesh-map baking, updates the Blender Base Color Fill Layer, and saves
+the SPP. If a Low Poly as High Texture Set changed, that Texture Set is rebaked.
+If the High mesh or bake settings changed, Painter runs mesh-map baking after
+any required Low mesh reimport. If Painter is closed, the existing SPP is opened
+first.
 
 `Export Painter Textures & Apply` asks the open Painter project to export with
 the `Unreal_V2` preset, waits for completion, reloads the exported maps in
@@ -111,22 +118,11 @@ The Painter plugin is installed from
 
 `Documents/Adobe/Adobe Substance 3D Painter/python/startup/`
 
-# Usage
-
-- Put objects you want to texture into a collection and give them materials. Individual materials will become texture sets in Painter! If an object doesn't have a material it will be created automatically
-- Click on the collection you want to texture in the outliner
-- Press the `Export and Open in Painter` button
-- When you're done, export textures from Painter (`Ctrl+Shift+E`), and press `Load Painter Textures` in Blender ✨
-
-Tip:
-- In Blender you can link objects to a collection instead of moving them if you hold `Ctrl` when you drag them in the outliner. This way you can create collections specifically for Substance Painter export and group assets however you like!
-
 # Preferences
 
 In the addon preferences you can configure:
 
 - Substance Painter Path (in case it wasn't automatically detected)
-- Textures Path. Path to the directory where all of the subdirectories for collections will be created. Leave blank to create them in the same directory as the blend file
 
 # Supported Substance Versions
 
