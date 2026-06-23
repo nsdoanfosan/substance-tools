@@ -1,134 +1,198 @@
 # Substance Import-Export Tools
 
-<img width="960" alt="substancetools" src="https://github.com/passivestar/substance-tools/assets/60579014/0e13aa12-3ddd-4151-bbbc-dae41137027a">
+A Blender add-on that drives a **Blender → Substance Painter → Unreal** baking
+and texturing pipeline. Meshes are organised in a fixed `Baking` collection
+layout, sent to Painter for mesh-map baking and texturing, and the resulting
+maps are loaded back onto the Blender materials. Changes are tracked per
+Texture Set so only what actually changed is re-baked.
 
-https://github.com/passivestar/substance-tools/assets/60579014/b47d8e04-7535-4510-aed2-9c4569880b02
-
-Join our [discord](https://discord.gg/pPHQ5HQ) for discussion!
+> Fork of [passivestar/substance-tools](https://github.com/passivestar/substance-tools).
+> The original collection-based "export the active collection" workflow
+> (`Export and Open in Painter` / `Load Painter Textures`, Node Wrangler
+> dependency, custom Textures Path) was **removed in 3.0.0**. The only workflow
+> now is the `Baking` collection pipeline described below.
 
 ## Installation
 
-- Click on "Releases" on the right and download zip
-- Go to `Edit -> Preferences -> Addons`
-- Press `Install...`
-- Select the archive
+### Blender add-on
 
-In 3D view press N. You'll find new buttons in the menu on the right on the "Substance" tab
+- `Edit -> Preferences -> Add-ons -> Install...`
+- Select the add-on zip (or this repository's `__init__.py`).
+- In the 3D view press `N` and open the **Substance** tab.
 
-## Baking workflow
+### Painter companion plugin
 
-The add-on creates this collection layout automatically:
+The Blender add-on talks to Painter through a startup plugin. Copy
 
-```text
-Baking
-|- low
-|- high
-`- alpha
-```
+`painter/startup/substance_tools_unreal_viewport`
 
-`Create in Painter` exports evaluated meshes without changing the Blender source:
-
-- `low/<blend>_low.fbx`
-- `high/<blend>_high.fbx`
-- `texture/<blend>_SP.spp`
-
-`Pair Selected Low + High` is the explicit naming step. Select exactly one Low
-and one or more High meshes that are already in their Baking collections. The
-Low becomes `A_low`; one High becomes `A_high`, while several become
-`A_high_01`, `A_high_02`, and so on. Existing Low materials keep their names
-and receive only a missing `M_` prefix. Selecting more than one Low is rejected.
-
-Low FBX material names have the leading `M_` removed so `M_rock` becomes the
-Painter Texture Set `rock`. High-poly Sculpt Face Sets are converted to stable
-vertex colors for the ID baker by default. Blender also offers `Existing Vertex
-Color` and `Material Color` as ID sources. Conversion happens only on the
-temporary export copy; source Blender meshes are not modified. When `high` is
-empty and Painter uses Low-as-High, Face Sets on the Low mesh are converted on
-the temporary Low export copy instead.
-
-The companion Painter startup plugin:
-
-- reloads the low mesh only when its exported contents changed;
-- rebakes High-to-Low Texture Sets only when their high FBX contents or bake
-  settings changed;
-- rebakes Low Poly as High Texture Sets when their low mesh changed;
-- keeps low-only changes in High-to-Low Texture Sets as a reimport/save
-  operation without mesh-map baking;
-- uses High Definition Mesh, vertex-color IDs, automatic cage, and all standard
-  mesh maps;
-- defaults to `By Mesh Name`, with `Always` available in Blender;
-- saves the SPP after a successful bake;
-- returns Painter to Painting mode after a successful bake;
-- creates new projects from Painter's bundled `Unreal Engine.spt`, including
-  that template's project, viewport, and post-effects defaults.
-
-`Bake Alpha Details` treats meshes in `Baking/alpha` as editable decals or
-logos. Name them to match their Low mesh, for example `rock_low` and
-`rock_alpha`. If the matching Low mesh has one material, its Painter Texture
-Set is selected automatically. If it has several materials, choose the target
-for each Alpha object in the panel. Reusing the same material name on the Alpha
-object also selects that target automatically.
-
-Each Alpha material must use a Principled BSDF with an image texture connected
-to both Base Color and Alpha. The add-on writes one RGBA texture per target,
-for example `texture/T_rock_body_Color_alpha.png`: RGB contains the decal color
-and A contains its opacity. In Blender this image is mixed over the baked High
-Base Color for preview. The overlay is disabled automatically when the final
-Painter Base Color is selected, because that export already contains the
-Painter layer result.
-
-Painter imports the RGBA image into a top Fill Layer named
-`Blender Alpha Details`, enables only Base Color, adds a black mask, and places
-`Blender Alpha Mask` as a Fill effect inside that mask. Alpha meshes are never
-included in the Painter High FBX or Painter mesh-map bake.
-
-`Bake Base Color` transfers an image texture connected upstream of the
-High-poly Principled BSDF Base Color to the Low UVs with a Cycles
-Selected-to-Active diffuse-color bake. It uses the existing texture naming
-rule with a `_baking` suffix, for example
-`texture/T_rock_Color_baking.png`, then connects that image to the Low
-materials' Principled BSDF Base Color inputs. Painter imports the same file and
-assigns it to a bottom Fill Layer named `Blender High Base Color`, with only
-Base Color enabled. This button currently requires exactly one Low-poly
-Texture Set.
-
-When no SPP exists, the primary button is `Create in Painter`. Once the SPP
-exists it becomes `Open Painter Project`, while `Update Painter` is available.
-Opening launches the existing SPP when Painter is not running. Updating rewrites
-the FBX and request data; an open Painter project detects the changed request.
-If only High-to-Low Low meshes changed, Painter reimports the Low mesh without
-running mesh-map baking, updates the Blender Base Color Fill Layer, and saves
-the SPP. If a Low Poly as High Texture Set changed, that Texture Set is rebaked.
-If the High mesh or bake settings changed, Painter runs mesh-map baking after
-any required Low mesh reimport. If Painter is closed, the existing SPP is opened
-first.
-
-`Export Painter Textures & Apply` asks the open Painter project to export with
-the `Unreal_V2` preset, waits for completion, reloads the exported maps in
-Blender, and connects Color, Normal, packed Extra, Emissive, and Height maps to
-the Low materials. The packed Extra texture uses Green for Roughness and Blue
-for Metallic. `Use Baked Base Color` / `Use Painter Base Color` switches only
-the Low material connection; both source files remain untouched.
-
-Texture export remains manual. Select the existing `Unreal_V2` Painter preset
-and export PNG files into the shared `texture` folder.
-
-The Painter plugin is installed from
-`painter/startup/substance_tools_unreal_viewport` into:
+into
 
 `Documents/Adobe/Adobe Substance 3D Painter/python/startup/`
 
-# Preferences
+and restart Painter. The two halves communicate over file-based JSON in the
+project's `texture` folder (`.substance_tools_request.json`,
+`.substance_tools_bake_plan.json`, and the export request/result files). The
+plugin polls every 0.5 s and performs project creation, mesh reimport,
+mesh-map baking, and `Unreal_V2` texture export automatically.
 
-In the addon preferences you can configure:
+## Collection layout
 
-- Substance Painter Path (in case it wasn't automatically detected)
+The add-on creates this layout automatically:
 
-# Supported Substance Versions
+```text
+Baking
+|- low      # the meshes that get UVs, textures, and the final bake target
+|- high     # high-poly source for High-to-Low baking (optional per asset)
+`- alpha    # decal/logo meshes baked as editable alpha overlays (optional)
+```
 
-The addon is working with:
+Everything the pipeline sends to Painter comes from these collections — there
+is no "pick a collection in the outliner" step anymore. Source meshes are never
+modified; exports run on temporary evaluated copies.
+
+## Panel: Substance Painter Tools
+
+### High to Low Baking
+
+- **Pair Selected Low + High** — the explicit naming step. Select exactly one
+  Low and one or more High meshes already in their Baking collections. The Low
+  becomes `A_low`; a single High becomes `A_high`, several become `A_high_01`,
+  `A_high_02`, … Existing Low materials keep their names and only receive a
+  missing `M_` prefix. Selecting more than one Low is rejected.
+- **Group Selected Meshes** — parents selected meshes under an Empty. If one
+  Empty is in the selection, every selected mesh is moved under it (even meshes
+  already parented to another Empty). Otherwise a new Empty is created from the
+  active mesh's name, and meshes that are already inside an Empty are rejected.
+- **Toggle Export Link** — links/unlinks the selected objects **and their whole
+  child hierarchy** (meshes, curves, empties — any type) in the
+  [Send to Unreal](https://github.com/poly-hammer/BlenderTools) `Export`
+  collection, in one direction: if everything gathered is already in `Export`
+  they are all unlinked, otherwise the missing ones are linked in. Objects keep
+  their original collection too. Unlinking never deletes — an object whose only
+  home was `Export` is moved to the scene root. The `Baking/low` set is never
+  touched.
+- **Bake Resolution** — `512` … `8192` (default `2048`).
+- **High-Low Matching** — `By Mesh Name` (match `rock_low` ↔ `rock_high`,
+  default) or `Always` (every high projects to every low).
+- **ID Source** — how the Painter ID map is generated:
+  - `High Face Sets` (default): convert High-poly Sculpt Face Sets to stable
+    temporary vertex colors;
+  - `Existing Vertex Color`: use the High-poly vertex color attribute as-is;
+  - `Material Color`: use High-poly material colors.
+
+  Conversion happens only on the temporary export copy. When `high` is empty
+  and a Texture Set bakes Low-as-High, Face Sets on the Low mesh are converted
+  on the temporary Low copy instead.
+
+### Bake Plan (incremental baking)
+
+Change detection is **per Texture Set**, hashing mesh contents directly (not
+FBX file bytes), so editing one asset doesn't force a full re-bake.
+
+- **Check Bake Plan** — computes what the next Painter update would do and shows
+  it per material/Texture Set:
+  - `High-to-Low` vs `Low Poly as High` (whether the Texture Set has a matching
+    high-poly mesh);
+  - `Rebake`, `Low changed: reload only`, `High changed`, `Settings changed`,
+    or `Low baseline missing`.
+
+  It writes `.substance_tools_bake_plan.json` next to the project.
+
+> **Check Bake Plan is required before `Update Painter`.** Running an update
+> without a current plan is rejected with *"Run Check Bake Plan before Update
+> Painter"*. After every successful create/update the plan is reset to a clean
+> baseline; re-run Check Bake Plan after editing meshes again.
+
+### Base color & alpha bakes
+
+- **Bake Base Color** — Cycles Selected-to-Active diffuse bake transferring an
+  image connected upstream of the High-poly Principled BSDF Base Color onto the
+  Low UVs. Output is named with a `_baking` suffix, e.g.
+  `texture/T_rock_Color_baking.png`, and connected to the Low materials. Painter
+  imports the same file into a bottom Fill Layer `Blender High Base Color`.
+  Currently requires exactly one Low-poly Texture Set.
+- **Bake Alpha Details** — treats `Baking/alpha` meshes as editable decals/logos.
+  Name them to match their Low mesh (`rock_low` ↔ `rock_alpha`). Each Alpha
+  material must use a Principled BSDF with one image texture wired to **both**
+  Base Color and Alpha. One RGBA texture is written per target, e.g.
+  `texture/T_rock_body_Color_alpha.png` (RGB = color, A = opacity). When a Low
+  mesh has multiple materials, pick the target Texture Set per Alpha object in
+  the **Alpha Targets** sub-panel. Painter imports it into a top Fill Layer
+  `Blender Alpha Details` with a `Blender Alpha Mask`. Alpha meshes are never
+  included in the High FBX or the mesh-map bake.
+
+### Painter project buttons
+
+- **Create in Painter** (when no `.spp` exists) — creates the project from
+  Painter's bundled `Unreal Engine.spt` template and bakes every Texture Set.
+  Once the project exists this button becomes **Open Painter Project**.
+- **Update Painter** (enabled once the project exists) — rewrites the FBX and
+  request data; the open Painter project applies the plan:
+  - only High-to-Low Low meshes changed → reimport Low without baking, update
+    the Blender Base Color Fill Layer, save;
+  - a Low Poly as High Texture Set changed → that Texture Set is re-baked;
+  - High mesh or bake settings changed → mesh-map baking runs after any
+    required Low reimport.
+
+  If Painter is closed it is launched on the existing project first.
+- **Export Painter Textures & Apply** (enabled once the project exists) — asks
+  the open project to export with the `Unreal_V2` preset, waits (5-minute
+  timeout), reloads the maps, and connects **Color, Normal, packed Extra,
+  Emissive, and Height** to the Low materials. The packed Extra texture uses
+  **Green = Roughness, Blue = Metallic**.
+- **Base Color Source** — `Use Painter Base Color` / `Use Baked Base Color`
+  switches only the Low material connection; both source files stay untouched.
+  The Painter Base Color already contains the alpha-overlay result, so the
+  Blender overlay preview is disabled when it is selected.
+
+The companion Painter plugin saves the `.spp` after a successful bake, returns
+Painter to Painting mode, and marks failed requests so they are not retried in
+a loop.
+
+## Panel: Export Status
+
+A read-only sub-panel that classifies the `Send to Unreal` `Export` collection:
+
+- **Low Auto** — the `Baking/low` meshes (plus their parent/armature chain) that
+  belong to the Painter export; managed automatically, not toggleable here.
+- **Linked** — objects in `Export` that also live in another collection.
+- **Export Only** — objects whose only home is `Export`.
+
+The hierarchy is shown with indentation, clicking a row selects that object, and
+objects that are hidden (and would therefore not export) are flagged with a
+warning.
+
+## Naming conventions
+
+Unreal naming drives the whole pipeline:
+
+- Material `M_rock` → the `M_` prefix is stripped on the Low FBX → Painter
+  Texture Set `rock`.
+- Exported textures are `T_<set>_<map>`, e.g. `T_rock_Color.png`.
+- Low/High meshes are paired as `A_low` / `A_high` (or `A_high_01`, …).
+
+## Typical workflow
+
+1. Put meshes into `Baking/low` (and `Baking/high`, `Baking/alpha` as needed).
+2. **Pair Selected Low + High** to name each bake pair.
+3. (Optional) **Group Selected Meshes** and **Toggle Export Link** for the
+   Send to Unreal export set.
+4. Set **Bake Resolution**, **High-Low Matching**, **ID Source**.
+5. **Create in Painter** — first full bake; texture in Painter.
+6. After editing meshes: **Check Bake Plan** → **Update Painter** (only the
+   changed Texture Sets re-bake).
+7. **Export Painter Textures & Apply** to bring the maps back onto the Low
+   materials.
+8. Toggle **Base Color Source** between the Painter and baked result as needed.
+
+## Preferences
+
+- **Substance Painter Path** — set this if the executable wasn't auto-detected.
+
+## Supported Substance versions
 
 - Windows CC Substance Painter
 - Windows Steam Substance Painter
-- MacOS CC Substance Painter
-- MacOS Steam Substance Painter
+- macOS CC Substance Painter
+- macOS Steam Substance Painter
