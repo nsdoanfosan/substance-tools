@@ -1,13 +1,14 @@
-import bpy, glob, re, subprocess, os, time, traceback
+import bpy, bmesh, re, subprocess, os, time, traceback
 import colorsys
 import hashlib
 import json
+from array import array
 from collections import defaultdict
 from pathlib import Path
 
 bl_info = {
   'name': 'Substance Import-Export Tools',
-  'version': (2, 0, 2),
+  'version': (3, 0, 0),
   'author': 'passivestar',
   'blender': (4, 1, 0),
   'location': '3D View N Panel',
@@ -20,7 +21,11 @@ bl_info = {
 BAKING_COLLECTION = 'Baking'
 LOW_COLLECTION = 'low'
 HIGH_COLLECTION = 'high'
+ALPHA_COLLECTION = 'alpha'
+# Send to Unreal (send2ue) export set: ToolInfo.EXPORT_COLLECTION = 'Export'.
+SEND2UE_EXPORT_COLLECTION = 'Export'
 PAINTER_REQUEST = '.substance_tools_request.json'
+BAKE_PLAN = '.substance_tools_bake_plan.json'
 PENDING_REQUEST = 'pending_request.json'
 PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
@@ -31,13 +36,19 @@ def clean_name(value):
   return value or 'Asset'
 
 
+def fbx_filename_from_object_name(value):
+  value = re.sub(r'[<>:"/\\|?*]+', '_', str(value or '')).strip()
+  value = value.rstrip('. ')
+  return value or 'Object'
+
+
 def ensure_baking_collections(scene=None):
   if scene is None:
     scene = getattr(bpy.context, 'scene', None)
   if scene is None and bpy.data.scenes:
     scene = bpy.data.scenes[0]
   if scene is None:
-    return None, None, None
+    return None, None, None, None
   root = bpy.data.collections.get(BAKING_COLLECTION)
   if root is None:
     root = bpy.data.collections.new(BAKING_COLLECTION)
@@ -45,14 +56,19 @@ def ensure_baking_collections(scene=None):
     scene.collection.children.link(root)
 
   children = {}
-  for name in (LOW_COLLECTION, HIGH_COLLECTION):
+  for name in (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION):
     collection = bpy.data.collections.get(name)
     if collection is None:
       collection = bpy.data.collections.new(name)
     if collection.name not in {child.name for child in root.children}:
       root.children.link(collection)
     children[name] = collection
-  return root, children[LOW_COLLECTION], children[HIGH_COLLECTION]
+  return (
+    root,
+    children[LOW_COLLECTION],
+    children[HIGH_COLLECTION],
+    children[ALPHA_COLLECTION],
+  )
 
 
 @bpy.app.handlers.persistent
@@ -65,6 +81,78 @@ def ensure_baking_collections_deferred():
   for scene in bpy.data.scenes:
     ensure_baking_collections(scene)
   return None
+
+
+def get_baking_collections():
+  """Look up the baking collections without creating or linking anything.
+
+  Use this in UI draw code: a load handler and a deferred timer already create
+  the collections, and Blender discourages modifying data during draw().
+  """
+  return (
+    bpy.data.collections.get(BAKING_COLLECTION),
+    bpy.data.collections.get(LOW_COLLECTION),
+    bpy.data.collections.get(HIGH_COLLECTION),
+    bpy.data.collections.get(ALPHA_COLLECTION),
+  )
+
+
+def painter_low_export_hierarchy():
+  """Return the low meshes, parent chains, and Armature modifier rigs."""
+  low_objects = set()
+  baking_collection = bpy.data.collections.get(BAKING_COLLECTION)
+  low_collection = None
+  if baking_collection is not None:
+    low_collection = next(
+      (
+        child for child in baking_collection.children
+        if child.name == LOW_COLLECTION
+      ),
+      None,
+    )
+
+  if low_collection is not None:
+    for obj in low_collection.all_objects:
+      if obj.type != 'MESH':
+        continue
+      low_objects.add(obj)
+      for modifier in obj.modifiers:
+        if modifier.type == 'ARMATURE' and modifier.object is not None:
+          rig = modifier.object
+          low_objects.add(rig)
+          rig_parent = rig.parent
+          while rig_parent is not None:
+            low_objects.add(rig_parent)
+            rig_parent = rig_parent.parent
+      parent = obj.parent
+      while parent is not None:
+        low_objects.add(parent)
+        parent = parent.parent
+  return low_objects
+
+
+def export_status_groups():
+  """Classify Send to Unreal members without changing scene structure."""
+  export_collection = bpy.data.collections.get(SEND2UE_EXPORT_COLLECTION)
+  if export_collection is None:
+    return (), (), ()
+
+  export_objects = set(export_collection.all_objects)
+  low_objects = painter_low_export_hierarchy()
+  low_auto = export_objects & low_objects
+  remaining = export_objects - low_auto
+  linked = {
+    obj for obj in remaining
+    if any(collection != export_collection for collection in obj.users_collection)
+  }
+  export_only = remaining - linked
+
+  sort_key = lambda obj: obj.name.casefold()
+  return (
+    tuple(sorted(low_auto, key=sort_key)),
+    tuple(sorted(linked, key=sort_key)),
+    tuple(sorted(export_only, key=sort_key)),
+  )
 
 
 def blend_asset_name():
@@ -87,6 +175,7 @@ def baking_paths():
     'low_fbx': low_dir / f'{asset}_low.fbx',
     'high_fbx': high_dir / f'{asset}_high.fbx',
     'spp': texture_dir / f'{asset}_SP.spp',
+    'bake_plan': texture_dir / BAKE_PLAN,
   }
 
 
@@ -117,6 +206,13 @@ def write_json(path, value):
     encoding='utf-8',
   )
   os.replace(temporary_path, path)
+
+
+def read_json(path, default=None):
+  try:
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+  except (OSError, ValueError):
+    return default
 
 
 def load_or_reload_image(path):
@@ -200,8 +296,258 @@ def low_texture_set_names(low_objects):
   })
 
 
+def low_as_high_texture_set_names(low_objects, high_objects):
+  high_bases = {
+    match_base(obj.name, 'high').lower()
+    for obj in high_objects
+  }
+  return sorted({
+    stripped_material_name(slot.material.name)
+    for obj in low_objects
+    if match_base(obj.name, 'low').lower() not in high_bases
+    for slot in obj.material_slots
+    if slot.material
+  })
+
+
+def low_objects_by_texture_set(low_objects):
+  objects_by_texture_set = defaultdict(list)
+  for obj in low_objects:
+    for slot in obj.material_slots:
+      if not slot.material:
+        continue
+      texture_set = stripped_material_name(slot.material.name)
+      if obj not in objects_by_texture_set[texture_set]:
+        objects_by_texture_set[texture_set].append(obj)
+  return {
+    texture_set: sorted(objects, key=lambda item: item.name_full)
+    for texture_set, objects in objects_by_texture_set.items()
+  }
+
+
+def low_material_bake_modes(low_objects, high_objects):
+  high_bases = {
+    match_base(obj.name, 'high').lower()
+    for obj in high_objects
+  }
+  material_objects = defaultdict(list)
+  for obj in low_objects:
+    for slot in obj.material_slots:
+      if slot.material:
+        material_objects[stripped_material_name(slot.material.name)].append(obj)
+
+  rows = []
+  for texture_set, objects in sorted(material_objects.items()):
+    has_low_without_high = any(
+      match_base(obj.name, 'low').lower() not in high_bases
+      for obj in objects
+    )
+    rows.append((
+      texture_set,
+      'Low Poly as High' if has_low_without_high else 'High-to-Low',
+      tuple(sorted({obj.name for obj in objects})),
+    ))
+  return rows
+
+
+def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
+  high_by_base = {
+    match_base(obj.name, 'high').lower(): obj
+    for obj in high_objects
+  }
+  entries = defaultdict(lambda: {'objects': [], 'bases': set()})
+  for low in low_objects:
+    base = match_base(low.name, 'low').lower()
+    high = high_by_base.get(base)
+    if high is None:
+      continue
+    for slot in low.material_slots:
+      if not slot.material:
+        continue
+      texture_set = stripped_material_name(slot.material.name)
+      if high not in entries[texture_set]['objects']:
+        entries[texture_set]['objects'].append(high)
+      entries[texture_set]['bases'].add(base)
+
+  result = []
+  for texture_set in sorted(entries):
+    objects = sorted(entries[texture_set]['objects'], key=lambda obj: obj.name_full)
+    fbxs = [
+      high_dir / f"{fbx_filename_from_object_name(obj.name)}.fbx"
+      for obj in objects
+    ]
+    result.append({
+      'texture_set': texture_set,
+      'bases': sorted(entries[texture_set]['bases']),
+      'objects': objects,
+      'fbx': fbxs[0] if len(fbxs) == 1 else None,
+      'fbxs': fbxs,
+    })
+  return result
+
+
 def base_color_bake_name(texture_set):
   return f'T_{clean_name(texture_set)}_Color_baking'
+
+
+def alpha_color_bake_name(texture_set):
+  return f'T_{clean_name(texture_set)}_Color_alpha'
+
+
+def material_has_alpha_texture(material):
+  if material is None or not material.use_nodes or material.node_tree is None:
+    return False
+  for node in material.node_tree.nodes:
+    if node.type != 'BSDF_PRINCIPLED':
+      continue
+    if socket_contains_image_texture(node.inputs.get('Alpha')):
+      return True
+  return False
+
+
+def object_role_base(name, role):
+  name = re.sub(r'\.\d{3}$', '', name)
+  return match_base(name, role)
+
+
+def matching_low_objects(alpha_object, low_objects):
+  alpha_base = object_role_base(alpha_object.name, 'alpha').lower()
+  return [
+    low
+    for low in low_objects
+    if object_role_base(low.name, 'low').lower() == alpha_base
+  ]
+
+
+def alpha_target_material_items(alpha_object, _context):
+  if alpha_object is None:
+    return [('AUTO', 'Auto', 'Use the only or same-named Low material')]
+  _, low_collection, _, _ = ensure_baking_collections()
+  low_objects = collection_meshes(low_collection) if low_collection else []
+  materials = []
+  seen = set()
+  for low in matching_low_objects(alpha_object, low_objects):
+    for material in low.data.materials:
+      if material is None or material.name in seen:
+        continue
+      seen.add(material.name)
+      materials.append((
+        material.name,
+        stripped_material_name(material.name),
+        f"Painter Texture Set: {stripped_material_name(material.name)}",
+      ))
+  return [
+    ('AUTO', 'Auto', 'Use the only or same-named Low material'),
+    *materials,
+  ]
+
+
+def resolve_alpha_target(alpha_object, low_objects):
+  matching_lows = matching_low_objects(alpha_object, low_objects)
+  if not matching_lows:
+    raise RuntimeError(
+      f"No Low mesh matches '{alpha_object.name}'. "
+      "Use names such as rock_low and rock_alpha"
+    )
+  candidates = {
+    material.name: material
+    for low in matching_lows
+    for material in low.data.materials
+    if material is not None
+  }
+  explicit = getattr(alpha_object, 'substance_tools_alpha_target_material', '')
+  if explicit and explicit != 'AUTO' and explicit in candidates:
+    return matching_lows, candidates[explicit]
+  if len(candidates) == 1:
+    return matching_lows, next(iter(candidates.values()))
+  alpha_material_names = {
+    material.name
+    for material in alpha_object.data.materials
+    if material is not None
+  }
+  shared = sorted(alpha_material_names & set(candidates))
+  if len(shared) == 1:
+    return matching_lows, candidates[shared[0]]
+  choices = ', '.join(stripped_material_name(name) for name in sorted(candidates))
+  raise RuntimeError(
+    f"Choose Target Material for '{alpha_object.name}' ({choices})"
+  )
+
+
+def _alpha_mix_name(principled):
+  return f'__SubstanceToolsAlphaMix_{principled.name}'
+
+
+def _alpha_gate_name(principled):
+  return f'__SubstanceToolsAlphaGate_{principled.name}'
+
+
+def _ensure_alpha_mix(material, principled, alpha_image=None):
+  node_tree = material.node_tree
+  base_color = principled.inputs.get('Base Color')
+  if base_color is None:
+    return None
+  mix_name = _alpha_mix_name(principled)
+  mix = node_tree.nodes.get(mix_name)
+  if mix is None or mix.type != 'MIX_RGB':
+    previous_socket = base_color.links[0].from_socket if base_color.is_linked else None
+    previous_color = tuple(base_color.default_value)
+    mix = node_tree.nodes.new('ShaderNodeMixRGB')
+    mix.name = mix_name
+    mix.label = 'Substance Tools Alpha Overlay'
+    mix.blend_type = 'MIX'
+    mix.inputs[0].default_value = 0.0
+    mix.inputs[1].default_value = previous_color
+    if previous_socket is not None:
+      node_tree.links.new(previous_socket, mix.inputs[1])
+    node_tree.links.new(mix.outputs['Color'], base_color)
+  if alpha_image is not None:
+    image_name = f'__SubstanceToolsAlpha_{clean_name(stripped_material_name(material.name))}'
+    image_node = node_tree.nodes.get(image_name)
+    if image_node is None or image_node.type != 'TEX_IMAGE':
+      image_node = node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = image_name
+    image_node.label = 'Baked Alpha Detail'
+    image_node.image = alpha_image
+    image_node.interpolation = 'Linear'
+    gate_name = _alpha_gate_name(principled)
+    gate = node_tree.nodes.get(gate_name)
+    if gate is None or gate.type != 'MATH':
+      gate = node_tree.nodes.new('ShaderNodeMath')
+      gate.name = gate_name
+      gate.label = 'Substance Tools Alpha Visibility'
+      gate.operation = 'MULTIPLY'
+      gate.inputs[1].default_value = 1.0
+    node_tree.links.new(image_node.outputs['Alpha'], gate.inputs[0])
+    node_tree.links.new(gate.outputs['Value'], mix.inputs[0])
+    node_tree.links.new(image_node.outputs['Color'], mix.inputs[2])
+  return mix
+
+
+def set_material_alpha_overlay_enabled(material, enabled):
+  if material is None or material.node_tree is None:
+    return
+  value = 1.0 if enabled else 0.0
+  for node in material.node_tree.nodes:
+    if node.type == 'MATH' and node.name.startswith('__SubstanceToolsAlphaGate_'):
+      node.inputs[1].default_value = value
+
+
+def connect_alpha_bake_to_material(material, image, enabled=True):
+  if material is None:
+    return 0
+  material.use_nodes = True
+  if material.node_tree is None:
+    return 0
+  connected = 0
+  for principled in (
+    node for node in material.node_tree.nodes
+    if node.type == 'BSDF_PRINCIPLED'
+  ):
+    if _ensure_alpha_mix(material, principled, image) is not None:
+      connected += 1
+  set_material_alpha_overlay_enabled(material, enabled)
+  return connected
 
 
 def connect_base_color_bake_to_low_materials(low_objects, image):
@@ -231,7 +577,10 @@ def connect_base_color_bake_to_low_materials(low_objects, image):
       base_color = principled.inputs.get('Base Color')
       if base_color is None:
         continue
-      node_tree.links.new(image_node.outputs['Color'], base_color)
+      mix = _ensure_alpha_mix(material, principled)
+      target = mix.inputs[1] if mix is not None else base_color
+      node_tree.links.new(image_node.outputs['Color'], target)
+      set_material_alpha_overlay_enabled(material, True)
       connected += 1
   return connected
 
@@ -254,7 +603,9 @@ def set_material_base_color_image(material, image):
   ):
     base_color = principled.inputs.get('Base Color')
     if base_color is not None:
-      node_tree.links.new(image_node.outputs['Color'], base_color)
+      mix = _ensure_alpha_mix(material, principled)
+      target = mix.inputs[1] if mix is not None else base_color
+      node_tree.links.new(image_node.outputs['Color'], target)
       connected += 1
   return connected
 
@@ -291,6 +642,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
     ]
     if images.get('Color') is not None:
       applied += set_material_base_color_image(material, images['Color'])
+      set_material_alpha_overlay_enabled(material, False)
     if images.get('Normal') is not None:
       normal_image = images['Normal']
       normal_image.colorspace_settings.name = 'Non-Color'
@@ -632,6 +984,311 @@ def bake_high_base_color_to_low(
       bpy.context.view_layer.objects.active = previous_active
 
 
+def _keep_only_material_faces(mesh, material_index):
+  editable = bmesh.new()
+  try:
+    editable.from_mesh(mesh)
+    remove_faces = [
+      face for face in editable.faces
+      if face.material_index != material_index
+    ]
+    if remove_faces:
+      bmesh.ops.delete(editable, geom=remove_faces, context='FACES')
+    editable.to_mesh(mesh)
+    mesh.update()
+  finally:
+    editable.free()
+
+
+def _make_emission_material(material, channel, temporary_materials):
+  copied = material.copy()
+  copied.use_nodes = True
+  node_tree = copied.node_tree
+  principled = next(
+    (node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'),
+    None,
+  )
+  output = next(
+    (node for node in node_tree.nodes if node.type == 'OUTPUT_MATERIAL'),
+    None,
+  )
+  if principled is None or output is None:
+    raise RuntimeError(
+      f"Alpha material needs Principled BSDF and Material Output: {material.name}"
+    )
+  source = principled.inputs.get('Base Color' if channel == 'COLOR' else 'Alpha')
+  emission = node_tree.nodes.new('ShaderNodeEmission')
+  emission.name = f'__SubstanceToolsAlpha{channel}'
+  if source is not None and source.is_linked:
+    node_tree.links.new(source.links[0].from_socket, emission.inputs['Color'])
+  elif channel == 'ALPHA' and source is not None:
+    value = float(source.default_value)
+    emission.inputs['Color'].default_value = (value, value, value, 1.0)
+  elif source is not None:
+    emission.inputs['Color'].default_value = tuple(source.default_value)
+  node_tree.links.new(emission.outputs['Emission'], output.inputs['Surface'])
+  temporary_materials.append(copied)
+  return copied
+
+
+def _prepare_alpha_source_duplicates(
+  alpha_objects,
+  collection,
+  channel,
+  temporary_materials,
+):
+  duplicates, _, _ = duplicate_for_export(alpha_objects, collection)
+  for duplicate in duplicates:
+    for index, material in enumerate(list(duplicate.data.materials)):
+      if material is None:
+        continue
+      duplicate.data.materials[index] = _make_emission_material(
+        material,
+        channel,
+        temporary_materials,
+      )
+  return duplicates
+
+
+def _prepare_alpha_low_duplicate(
+  low_object,
+  target_material,
+  collection,
+  image,
+  temporary_materials,
+):
+  duplicates, _, _ = duplicate_for_export([low_object], collection)
+  duplicate = duplicates[0]
+  material_index = next(
+    (
+      index for index, material in enumerate(low_object.data.materials)
+      if material == target_material
+    ),
+    None,
+  )
+  if material_index is None:
+    raise RuntimeError(
+      f"{target_material.name} is not assigned to {low_object.name}"
+    )
+  _keep_only_material_faces(duplicate.data, material_index)
+  duplicate.data.materials.clear()
+  target = bpy.data.materials.new('__SubstanceToolsAlphaBakeTarget')
+  target.use_nodes = True
+  image_node = target.node_tree.nodes.new('ShaderNodeTexImage')
+  image_node.name = '__SubstanceToolsAlphaBakeTarget'
+  image_node.image = image
+  target.node_tree.nodes.active = image_node
+  image_node.select = True
+  duplicate.data.materials.append(target)
+  temporary_materials.append(target)
+  return duplicate
+
+
+def _bake_alpha_pass(
+  entries,
+  image,
+  channel,
+  temporary_collection,
+  temporary_materials,
+  margin,
+):
+  alpha_objects = list(dict.fromkeys(entry[0] for entry in entries))
+  source_duplicates = _prepare_alpha_source_duplicates(
+    alpha_objects,
+    temporary_collection,
+    channel,
+    temporary_materials,
+  )
+  duplicate_by_source = dict(zip(alpha_objects, source_duplicates))
+  low_duplicates = []
+  try:
+    for low_object in dict.fromkeys(
+      low for _, matching_lows, _ in entries for low in matching_lows
+    ):
+      relevant_entries = [
+        entry for entry in entries if low_object in entry[1]
+      ]
+      target_material = relevant_entries[0][2]
+      low_duplicate = _prepare_alpha_low_duplicate(
+        low_object,
+        target_material,
+        temporary_collection,
+        image,
+        temporary_materials,
+      )
+      low_duplicates.append(low_duplicate)
+      sources = [
+        duplicate_by_source[alpha_object]
+        for alpha_object, matching_lows, _ in relevant_entries
+        if low_object in matching_lows
+      ]
+      bpy.ops.object.select_all(action='DESELECT')
+      for source in sources:
+        source.select_set(True)
+      low_duplicate.select_set(True)
+      bpy.context.view_layer.objects.active = low_duplicate
+      bpy.context.scene.render.bake.margin = margin
+      bpy.ops.object.bake(
+        type='EMIT',
+        use_selected_to_active=True,
+      )
+  finally:
+    for duplicate in source_duplicates + low_duplicates:
+      mesh = duplicate.data
+      bpy.data.objects.remove(duplicate, do_unlink=True)
+      if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _copy_mask_to_alpha(color_image, mask_image):
+  pixel_count = len(color_image.pixels)
+  chunk_size = 1024 * 1024
+  for offset in range(0, pixel_count, chunk_size):
+    end = min(pixel_count, offset + chunk_size)
+    color_chunk = list(color_image.pixels[offset:end])
+    mask_chunk = mask_image.pixels[offset:end]
+    first_alpha = (4 - (offset % 4) + 3) % 4
+    for index in range(first_alpha, len(color_chunk), 4):
+      color_chunk[index] = mask_chunk[index - 3]
+    color_image.pixels[offset:end] = color_chunk
+  color_image.update()
+
+
+def _fill_image(image, color):
+  pixel_count = len(image.pixels)
+  chunk_size = 1024 * 1024
+  pixels_per_chunk = chunk_size // 4
+  full_chunk = list(color) * pixels_per_chunk
+  for offset in range(0, pixel_count, chunk_size):
+    end = min(pixel_count, offset + chunk_size)
+    chunk = full_chunk[:end - offset]
+    image.pixels[offset:end] = chunk
+  image.update()
+
+
+def bake_alpha_details_to_low(
+  low_objects,
+  alpha_objects,
+  texture_dir,
+  resolution,
+):
+  if not alpha_objects:
+    return {}
+  entries_by_texture_set = defaultdict(list)
+  for alpha_object in alpha_objects:
+    if not any(
+      material_has_alpha_texture(material)
+      for material in alpha_object.data.materials
+      if material is not None
+    ):
+      raise RuntimeError(
+        f"No image texture is connected to Principled Alpha on {alpha_object.name}"
+      )
+    matching_lows, target_material = resolve_alpha_target(
+      alpha_object,
+      low_objects,
+    )
+    texture_set = stripped_material_name(target_material.name)
+    entries_by_texture_set[texture_set].append(
+      (alpha_object, matching_lows, target_material)
+    )
+
+  texture_dir.mkdir(parents=True, exist_ok=True)
+  temporary_collection = bpy.data.collections.new('__SubstanceToolsAlphaBake')
+  bpy.context.scene.collection.children.link(temporary_collection)
+  temporary_materials = []
+  temporary_images = []
+  result = {}
+  previous_selection = list(bpy.context.selected_objects)
+  previous_active = bpy.context.view_layer.objects.active
+  previous_engine = bpy.context.scene.render.engine
+  bake = bpy.context.scene.render.bake
+  previous_bake = {
+    'use_selected_to_active': bake.use_selected_to_active,
+    'use_clear': bake.use_clear,
+    'margin': bake.margin,
+    'cage_extrusion': bake.cage_extrusion,
+    'max_ray_distance': bake.max_ray_distance,
+  }
+  try:
+    bpy.context.scene.render.engine = 'CYCLES'
+    bake.use_selected_to_active = True
+    bake.use_clear = False
+    bounds = [obj.dimensions.length for obj in low_objects + alpha_objects]
+    bake.cage_extrusion = max(bounds, default=1.0) * 0.01
+    bake.max_ray_distance = 0.0
+    for texture_set, entries in entries_by_texture_set.items():
+      image_name = alpha_color_bake_name(texture_set)
+      image_path = texture_dir / f'{image_name}.png'
+      color_image = bpy.data.images.get(image_name)
+      if color_image is None:
+        color_image = bpy.data.images.new(
+          image_name,
+          width=resolution,
+          height=resolution,
+          alpha=True,
+          float_buffer=False,
+        )
+      elif list(color_image.size) != [resolution, resolution]:
+        color_image.scale(resolution, resolution)
+      color_image.generated_color = (0.0, 0.0, 0.0, 0.0)
+      color_image.alpha_mode = 'STRAIGHT'
+      color_image.filepath_raw = str(image_path)
+      color_image.file_format = 'PNG'
+      _fill_image(color_image, (0.0, 0.0, 0.0, 0.0))
+
+      mask_image = bpy.data.images.new(
+        f'__SubstanceToolsAlphaMask_{clean_name(texture_set)}',
+        width=resolution,
+        height=resolution,
+        alpha=False,
+        float_buffer=False,
+      )
+      mask_image.generated_color = (0.0, 0.0, 0.0, 1.0)
+      temporary_images.append(mask_image)
+      _fill_image(mask_image, (0.0, 0.0, 0.0, 1.0))
+
+      _bake_alpha_pass(
+        entries,
+        color_image,
+        'COLOR',
+        temporary_collection,
+        temporary_materials,
+        max(8, min(64, resolution // 128)),
+      )
+      _bake_alpha_pass(
+        entries,
+        mask_image,
+        'ALPHA',
+        temporary_collection,
+        temporary_materials,
+        0,
+      )
+      _copy_mask_to_alpha(color_image, mask_image)
+      color_image.save()
+      if not image_path.is_file():
+        raise RuntimeError(f'Alpha detail bake was not written: {image_path}')
+      result[texture_set] = str(image_path.resolve())
+    return result
+  finally:
+    bpy.context.scene.render.engine = previous_engine
+    for key, value in previous_bake.items():
+      setattr(bake, key, value)
+    bpy.ops.object.select_all(action='DESELECT')
+    for material in temporary_materials:
+      if material.users == 0:
+        bpy.data.materials.remove(material)
+    for image in temporary_images:
+      if image.users == 0:
+        bpy.data.images.remove(image)
+    bpy.data.collections.remove(temporary_collection)
+    for obj in previous_selection:
+      if obj.name in bpy.context.view_layer.objects:
+        obj.select_set(True)
+    if previous_active and previous_active.name in bpy.context.view_layer.objects:
+      bpy.context.view_layer.objects.active = previous_active
+
+
 def file_hash(path):
   digest = hashlib.sha256()
   with path.open('rb') as stream:
@@ -640,8 +1297,459 @@ def file_hash(path):
   return digest.hexdigest()
 
 
+def _hash_update_value(digest, value):
+  digest.update(repr(value).encode('utf-8'))
+  digest.update(b'\n')
+
+
+def _rounded_tuple(values):
+  return tuple(round(float(value), 6) for value in values)
+
+
+def _hash_mesh_object(digest, obj):
+  mesh = obj.data
+  _hash_update_value(digest, ('object', obj.name))
+  _hash_update_value(
+    digest,
+    ('matrix_world', [_rounded_tuple(row) for row in obj.matrix_world]),
+  )
+  _hash_update_value(
+    digest,
+    ('materials', [material.name if material else '' for material in mesh.materials]),
+  )
+  _hash_update_value(digest, ('vertices', len(mesh.vertices)))
+  for vertex in mesh.vertices:
+    _hash_update_value(digest, _rounded_tuple(vertex.co))
+  _hash_update_value(digest, ('edges', len(mesh.edges)))
+  for edge in mesh.edges:
+    _hash_update_value(digest, tuple(edge.vertices))
+  _hash_update_value(digest, ('polygons', len(mesh.polygons)))
+  for polygon in mesh.polygons:
+    _hash_update_value(
+      digest,
+      (
+        tuple(polygon.vertices),
+        polygon.material_index,
+        polygon.use_smooth,
+      ),
+    )
+  for uv_layer in sorted(mesh.uv_layers, key=lambda layer: layer.name):
+    _hash_update_value(digest, ('uv', uv_layer.name, len(uv_layer.data)))
+    for item in uv_layer.data:
+      _hash_update_value(digest, _rounded_tuple(item.uv))
+  for color_attribute in sorted(mesh.color_attributes, key=lambda attr: attr.name):
+    _hash_update_value(
+      digest,
+      (
+        'color_attribute',
+        color_attribute.name,
+        color_attribute.domain,
+        color_attribute.data_type,
+        len(color_attribute.data),
+      ),
+    )
+    for item in color_attribute.data:
+      color = getattr(item, 'color', None)
+      value = color if color is not None else getattr(item, 'value', None)
+      if value is not None:
+        _hash_update_value(digest, _rounded_tuple(value))
+
+
+def _hash_attribute_data(digest, attribute):
+  _hash_update_value(
+    digest,
+    (
+      'attribute',
+      attribute.name,
+      attribute.domain,
+      attribute.data_type,
+      len(attribute.data),
+    ),
+  )
+  for item in attribute.data:
+    for name in ('value', 'vector', 'color'):
+      if not hasattr(item, name):
+        continue
+      value = getattr(item, name)
+      try:
+        iter(value)
+      except TypeError:
+        _hash_update_value(digest, value)
+      else:
+        _hash_update_value(digest, _rounded_tuple(value))
+      break
+
+
+def _hash_modifier_summary(digest, obj):
+  for modifier in obj.modifiers:
+    _hash_update_value(
+      digest,
+      (
+        'modifier',
+        modifier.name,
+        modifier.type,
+        modifier.show_viewport,
+        modifier.show_render,
+      ),
+    )
+    for prop in modifier.bl_rna.properties:
+      if prop.is_readonly or prop.identifier in {'name', 'rna_type'}:
+        continue
+      try:
+        value = getattr(modifier, prop.identifier)
+      except Exception:
+        continue
+      if isinstance(value, (str, int, float, bool)):
+        _hash_update_value(digest, (prop.identifier, value))
+      elif hasattr(value, 'name'):
+        _hash_update_value(digest, (prop.identifier, value.name))
+
+
+def _hash_source_mesh_object(
+  digest,
+  obj,
+  strip_material_prefix=False,
+  id_source='NONE',
+  include_modifier_summary=False,
+):
+  mesh = obj.data
+  _hash_update_value(digest, ('object', obj.name, id_source))
+  _hash_update_value(
+    digest,
+    ('matrix_world', [_rounded_tuple(row) for row in obj.matrix_world]),
+  )
+  if include_modifier_summary:
+    _hash_modifier_summary(digest, obj)
+  material_names = []
+  for material in mesh.materials:
+    name = material.name if material else ''
+    material_names.append(stripped_material_name(name) if strip_material_prefix else name)
+  _hash_update_value(digest, ('materials', material_names))
+  _hash_update_value(digest, ('vertices', len(mesh.vertices)))
+  for vertex in mesh.vertices:
+    _hash_update_value(digest, _rounded_tuple(vertex.co))
+  _hash_update_value(digest, ('edges', len(mesh.edges)))
+  for edge in mesh.edges:
+    _hash_update_value(digest, tuple(edge.vertices))
+  _hash_update_value(digest, ('polygons', len(mesh.polygons)))
+  for polygon in mesh.polygons:
+    _hash_update_value(
+      digest,
+      (
+        tuple(polygon.vertices),
+        polygon.material_index,
+        polygon.use_smooth,
+      ),
+    )
+  for uv_layer in sorted(mesh.uv_layers, key=lambda layer: layer.name):
+    _hash_update_value(digest, ('uv', uv_layer.name, len(uv_layer.data)))
+    for item in uv_layer.data:
+      _hash_update_value(digest, _rounded_tuple(item.uv))
+  for color_attribute in sorted(mesh.color_attributes, key=lambda attr: attr.name):
+    _hash_attribute_data(digest, color_attribute)
+  if id_source == 'FACE_SETS':
+    for attribute in sorted(mesh.attributes, key=lambda attr: attr.name):
+      if (
+        attribute.domain == 'FACE'
+        and attribute.name in {'.sculpt_face_set', 'sculpt_face_set', 'face_set'}
+      ):
+        _hash_attribute_data(digest, attribute)
+
+
+def source_content_hash(
+  source_objects,
+  strip_material_prefix=False,
+  id_source='NONE',
+  include_modifier_summary=False,
+):
+  digest = hashlib.sha256()
+  for obj in sorted(source_objects, key=lambda item: item.name_full):
+    _hash_source_mesh_object(
+      digest,
+      obj,
+      strip_material_prefix=strip_material_prefix,
+      id_source=id_source,
+      include_modifier_summary=include_modifier_summary,
+    )
+  return digest.hexdigest()
+
+
+def _hash_fast_mesh_signature(
+  digest,
+  obj,
+  strip_material_prefix=False,
+  id_source='NONE',
+):
+  mesh = obj.data
+  _hash_update_value(digest, ('object', obj.name, obj.type, id_source))
+  _hash_update_value(digest, ('data', mesh.name))
+  _hash_update_value(
+    digest,
+    ('matrix_world', [_rounded_tuple(row) for row in obj.matrix_world]),
+  )
+  _hash_update_value(digest, ('dimensions', _rounded_tuple(obj.dimensions)))
+  _hash_update_value(
+    digest,
+    ('bound_box', [_rounded_tuple(corner) for corner in obj.bound_box]),
+  )
+  _hash_update_value(
+    digest,
+    ('counts', len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)),
+  )
+  if mesh.vertices:
+    values = array('f', [0.0]) * (len(mesh.vertices) * 3)
+    mesh.vertices.foreach_get('co', values)
+    digest.update(b'vertex_co\0')
+    digest.update(values.tobytes())
+  if mesh.edges:
+    values = array('i', [0]) * (len(mesh.edges) * 2)
+    mesh.edges.foreach_get('vertices', values)
+    digest.update(b'edge_vertices\0')
+    digest.update(values.tobytes())
+  if mesh.polygons:
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('material_index', values)
+    digest.update(b'polygon_material_index\0')
+    digest.update(values.tobytes())
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('loop_start', values)
+    digest.update(b'polygon_loop_start\0')
+    digest.update(values.tobytes())
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('loop_total', values)
+    digest.update(b'polygon_loop_total\0')
+    digest.update(values.tobytes())
+    smooth_values = array('b', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('use_smooth', smooth_values)
+    digest.update(b'polygon_use_smooth\0')
+    digest.update(smooth_values.tobytes())
+  if mesh.loops:
+    values = array('i', [0]) * len(mesh.loops)
+    mesh.loops.foreach_get('vertex_index', values)
+    digest.update(b'loop_vertex_index\0')
+    digest.update(values.tobytes())
+  material_names = []
+  for material in mesh.materials:
+    name = material.name if material else ''
+    material_names.append(stripped_material_name(name) if strip_material_prefix else name)
+  _hash_update_value(digest, ('materials', material_names))
+  for uv_layer in sorted(mesh.uv_layers, key=lambda layer: layer.name):
+    _hash_update_value(digest, ('uv', uv_layer.name, len(uv_layer.data)))
+    if uv_layer.data:
+      values = array('f', [0.0]) * (len(uv_layer.data) * 2)
+      uv_layer.data.foreach_get('uv', values)
+      digest.update(b'uv\0')
+      digest.update(values.tobytes())
+  _hash_update_value(
+    digest,
+    ('uv_layers', [(layer.name, len(layer.data)) for layer in mesh.uv_layers]),
+  )
+  _hash_update_value(
+    digest,
+    (
+      'attributes',
+      [
+        (attribute.name, attribute.domain, attribute.data_type, len(attribute.data))
+        for attribute in mesh.attributes
+      ],
+    ),
+  )
+  _hash_update_value(
+    digest,
+    (
+      'color_attributes',
+      [
+        (attribute.name, attribute.domain, attribute.data_type, len(attribute.data))
+        for attribute in mesh.color_attributes
+      ],
+    ),
+  )
+  for color_attribute in sorted(mesh.color_attributes, key=lambda attr: attr.name):
+    if color_attribute.data and hasattr(color_attribute.data[0], 'color'):
+      values = array('f', [0.0]) * (len(color_attribute.data) * 4)
+      color_attribute.data.foreach_get('color', values)
+      digest.update(b'color_attribute_color\0')
+      digest.update(values.tobytes())
+  if id_source == 'FACE_SETS':
+    for attribute in sorted(mesh.attributes, key=lambda attr: attr.name):
+      if (
+        attribute.domain == 'FACE'
+        and attribute.name in {'.sculpt_face_set', 'sculpt_face_set', 'face_set'}
+      ):
+        _hash_update_value(digest, ('face_set', attribute.name, len(attribute.data)))
+        values = array('i', [0]) * len(attribute.data)
+        attribute.data.foreach_get('value', values)
+        digest.update(b'face_set_value\0')
+        digest.update(values.tobytes())
+  _hash_modifier_summary(digest, obj)
+
+
+def fast_content_hash(source_objects, strip_material_prefix=False, id_source='NONE'):
+  digest = hashlib.sha256()
+  for obj in sorted(source_objects, key=lambda item: item.name_full):
+    _hash_fast_mesh_signature(
+      digest,
+      obj,
+      strip_material_prefix=strip_material_prefix,
+      id_source=id_source,
+    )
+  return digest.hexdigest()
+
+
+def _hash_mesh_arrays(digest, mesh, object_name, strip_material_prefix=False, id_source='NONE'):
+  _hash_update_value(digest, ('object', object_name, id_source))
+  material_names = []
+  for material in mesh.materials:
+    name = material.name if material else ''
+    material_names.append(stripped_material_name(name) if strip_material_prefix else name)
+  _hash_update_value(digest, ('materials', material_names))
+  _hash_update_value(
+    digest,
+    ('counts', len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)),
+  )
+  if mesh.vertices:
+    values = array('f', [0.0]) * (len(mesh.vertices) * 3)
+    mesh.vertices.foreach_get('co', values)
+    digest.update(b'vertex_co\0')
+    digest.update(values.tobytes())
+  if mesh.edges:
+    values = array('i', [0]) * (len(mesh.edges) * 2)
+    mesh.edges.foreach_get('vertices', values)
+    digest.update(b'edge_vertices\0')
+    digest.update(values.tobytes())
+  if mesh.polygons:
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('material_index', values)
+    digest.update(b'polygon_material_index\0')
+    digest.update(values.tobytes())
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('loop_start', values)
+    digest.update(b'polygon_loop_start\0')
+    digest.update(values.tobytes())
+    values = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('loop_total', values)
+    digest.update(b'polygon_loop_total\0')
+    digest.update(values.tobytes())
+    smooth_values = array('b', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('use_smooth', smooth_values)
+    digest.update(b'polygon_use_smooth\0')
+    digest.update(smooth_values.tobytes())
+  if mesh.loops:
+    values = array('i', [0]) * len(mesh.loops)
+    mesh.loops.foreach_get('vertex_index', values)
+    digest.update(b'loop_vertex_index\0')
+    digest.update(values.tobytes())
+  for uv_layer in sorted(mesh.uv_layers, key=lambda layer: layer.name):
+    _hash_update_value(digest, ('uv', uv_layer.name, len(uv_layer.data)))
+    if uv_layer.data:
+      values = array('f', [0.0]) * (len(uv_layer.data) * 2)
+      uv_layer.data.foreach_get('uv', values)
+      digest.update(b'uv\0')
+      digest.update(values.tobytes())
+  for color_attribute in sorted(mesh.color_attributes, key=lambda attr: attr.name):
+    _hash_update_value(
+      digest,
+      (
+        'color_attribute',
+        color_attribute.name,
+        color_attribute.domain,
+        color_attribute.data_type,
+        len(color_attribute.data),
+      ),
+    )
+    if color_attribute.data and hasattr(color_attribute.data[0], 'color'):
+      values = array('f', [0.0]) * (len(color_attribute.data) * 4)
+      color_attribute.data.foreach_get('color', values)
+      digest.update(b'color_attribute_color\0')
+      digest.update(values.tobytes())
+  if id_source == 'FACE_SETS':
+    for attribute in sorted(mesh.attributes, key=lambda attr: attr.name):
+      if (
+        attribute.domain == 'FACE'
+        and attribute.name in {'.sculpt_face_set', 'sculpt_face_set', 'face_set'}
+      ):
+        _hash_update_value(digest, ('face_set', attribute.name, len(attribute.data)))
+        values = array('i', [0]) * len(attribute.data)
+        attribute.data.foreach_get('value', values)
+        digest.update(b'face_set_value\0')
+        digest.update(values.tobytes())
+
+
+def evaluated_content_hash(source_objects, strip_material_prefix=False, id_source='NONE'):
+  depsgraph = bpy.context.evaluated_depsgraph_get()
+  digest = hashlib.sha256()
+  for obj in sorted(source_objects, key=lambda item: item.name_full):
+    _hash_update_value(
+      digest,
+      ('matrix_world', obj.name, [_rounded_tuple(row) for row in obj.matrix_world]),
+    )
+    _hash_modifier_summary(digest, obj)
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(
+      preserve_all_data_layers=True,
+      depsgraph=depsgraph,
+    )
+    try:
+      _hash_mesh_arrays(
+        digest,
+        mesh,
+        obj.name,
+        strip_material_prefix=strip_material_prefix,
+        id_source=id_source,
+      )
+    finally:
+      evaluated.to_mesh_clear()
+  return digest.hexdigest()
+
+
+def load_bake_plan(paths, context):
+  plan = read_json(paths['bake_plan'], {})
+  if plan:
+    return plan
+  try:
+    return json.loads(context.scene.get('substance_tools_bake_plan_preview', '{}'))
+  except ValueError:
+    return {}
+
+
+def export_content_hash(source_objects, strip_material_prefix=False, id_source='NONE'):
+  """Hash the deterministic contents exported to Painter, not FBX file bytes."""
+  temporary_collection = bpy.data.collections.new('__SubstanceToolsHash')
+  bpy.context.scene.collection.children.link(temporary_collection)
+  duplicates = []
+  temporary_materials = []
+  renamed_materials = []
+  try:
+    duplicates, temporary_materials, renamed_materials = duplicate_for_export(
+      source_objects,
+      temporary_collection,
+      strip_material_prefix=strip_material_prefix,
+      id_source=id_source,
+    )
+    digest = hashlib.sha256()
+    for duplicate in sorted(duplicates, key=lambda obj: obj.name_full):
+      _hash_mesh_object(digest, duplicate)
+    return digest.hexdigest()
+  finally:
+    for duplicate in duplicates:
+      mesh = duplicate.data
+      bpy.data.objects.remove(duplicate, do_unlink=True)
+      if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+    for material in temporary_materials:
+      if material.users == 0:
+        bpy.data.materials.remove(material)
+    for material, original_name in renamed_materials:
+      material.name = original_name
+    bpy.data.collections.remove(temporary_collection)
+
+
 def match_base(name, suffix):
-  return re.sub(rf'(?i)(?:[_. -]?{suffix})$', '', name)
+  return re.sub(
+    rf'(?i)(?:[_. -]?{suffix})(?:[_. -]?\d+)?$',
+    '',
+    name,
+  )
 
 
 def unmatched_mesh_names(low_objects, high_objects):
@@ -741,40 +1849,13 @@ def painter_is_running(painter_path):
     return False
 
 
-def material_needs_setup(material):
-  if material.node_tree is None:
-    return False
-  if len(material.node_tree.nodes) == 2:
-    return True
-  return False
+# Scanning every drive for the Painter executable is slow, so do it once.
+_DETECTED_PAINTER_PATH = detect_substance_painter_path()
 
 # Mock data for testing through blender text editor without installing
 mocks = {
-  'painter_path': detect_substance_painter_path(),
-  'textures_path': ''
+  'painter_path': _DETECTED_PAINTER_PATH,
 }
-
-def get_paths(context):
-  textures_path = get_preferences(context)["textures_path"]
-
-  if textures_path == '':
-    textures_path = Path(bpy.path.abspath('//'))
-  else:
-    textures_path = Path(textures_path)
-  
-  collection_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', bpy.context.view_layer.active_layer_collection.name)
-
-  textures_path_for_collection = textures_path.joinpath('textures_' + collection_name_clean + '/')
-
-  fbx_path = textures_path_for_collection.joinpath(collection_name_clean + '.fbx')
-  spp_path = textures_path_for_collection.joinpath(collection_name_clean + '.spp')
-
-  return {
-    'fbx': fbx_path,
-    'spp': spp_path,
-    'directory': textures_path_for_collection,
-    'collection_name_clean': collection_name_clean
-  }
 
 def get_preferences(context):
   if __name__ == '__main__':
@@ -783,11 +1864,7 @@ def get_preferences(context):
     prefs = context.preferences.addons[__name__].preferences
     return {
       'painter_path': prefs.painter_path,
-      'textures_path': prefs.textures_path
     }
-
-def object_has_material(obj):
-  return len(obj.data.materials) > 0 and obj.data.materials[0] is not None
 
 def create_material_for_object(obj):
   material = bpy.data.materials.new(name=obj.name)
@@ -803,83 +1880,411 @@ def create_material_for_object(obj):
 
 # @Operators
 
-class ExportToSubstancePainterOperator(bpy.types.Operator):
-  """Export Collection to Substance Painter. Press Ctrl+Shift+R in Painter to reload after re-export"""
-  bl_idname, bl_label = 'st.open_in_substance_painter', 'Export Collection to Substance Painter'
-
-  run_painter: bpy.props.BoolProperty(name='Run Substance Painter', default=True)
+class PairSelectedBakingMeshesOperator(bpy.types.Operator):
+  """Rename one selected Low and one or more selected High meshes as a bake pair"""
+  bl_idname = 'st.pair_selected_baking_meshes'
+  bl_label = 'Pair Selected Low + High'
+  bl_options = {'REGISTER', 'UNDO'}
 
   def execute(self, context):
-    preferences = get_preferences(context)
-    painter_path = preferences["painter_path"]
-
-    paths = get_paths(context)
-    directory = paths['directory']
-    fbx = paths['fbx']
-    spp = paths['spp']
-
-    if bpy.data.filepath == '':
-      self.report({'ERROR'}, 'File is not saved. Please save your blend file')
-      return {'FINISHED'}
-
-    for o in bpy.context.view_layer.active_layer_collection.collection.objects:
-      # Check if the object is mesh:
-      if o.type != 'MESH':
-        self.report({'ERROR'}, f'Object {o.name} is not a mesh')
-        return {'FINISHED'}
-
-      # Check if the object has a material and create if necessary:
-      if not object_has_material(o):
-        create_material_for_object(o)
-    
-    if not directory.exists():
-      directory.mkdir(parents=True, exist_ok=True)
-
-    # Export FBX
-    bpy.ops.wm.save_mainfile()
-    bpy.ops.export_scene.fbx(
-      mesh_smooth_type='EDGE',
-      use_mesh_modifiers=True,
-      add_leaf_bones=False,
-      apply_scale_options='FBX_SCALE_ALL',
-      bake_anim_use_nla_strips=False,
-      bake_space_transform=True,
-      use_active_collection=True,
-      filepath=str(fbx)
+    _, low_collection, high_collection, _ = ensure_baking_collections(
+      context.scene
     )
+    selected = {obj for obj in context.selected_objects if obj.type == 'MESH'}
+    low_selected = [
+      obj for obj in collection_meshes(low_collection) if obj in selected
+    ]
+    high_selected = [
+      obj for obj in collection_meshes(high_collection) if obj in selected
+    ]
+    if len(low_selected) > 1:
+      self.report(
+        {'ERROR'},
+        'Multiple Low meshes are selected. Select exactly one Low mesh',
+      )
+      return {'CANCELLED'}
+    if len(low_selected) != 1:
+      self.report({'ERROR'}, 'Select one mesh from Baking/low')
+      return {'CANCELLED'}
+    if not high_selected:
+      self.report({'ERROR'}, 'Select at least one mesh from Baking/high')
+      return {'CANCELLED'}
+    low_object = low_selected[0]
+    if low_object in high_selected:
+      self.report({'ERROR'}, 'Low and High must be different mesh objects')
+      return {'CANCELLED'}
+    base_name = clean_name(object_role_base(low_object.name, 'low'))
+    low_object.name = f'{base_name}_low'
+    high_selected = sorted(high_selected, key=lambda obj: obj.name_full)
+    if len(high_selected) == 1:
+      high_selected[0].name = f'{base_name}_high'
+    else:
+      for index, high_object in enumerate(high_selected, 1):
+        high_object.name = f'{base_name}_high_{index:02d}'
 
-    # If we only need to export the fbx, we're done
-    if not self.run_painter:
+    normalized = 0
+    if not any(material is not None for material in low_object.data.materials):
+      create_material_for_object(low_object)
+      low_object.data.materials[0].name = f'M_{base_name}'
+      normalized += 1
+    for material in {
+      material for material in low_object.data.materials if material is not None
+    }:
+      target_name = f'M_{stripped_material_name(material.name)}'
+      if material.name != target_name:
+        material.name = target_name
+        normalized += 1
+    self.report(
+      {'INFO'},
+      f'Paired {low_object.name} with {len(high_selected)} High mesh(es); '
+      f'normalized {normalized} Low material name(s)',
+    )
+    return {'FINISHED'}
+
+
+class GroupSelectedMeshesOperator(bpy.types.Operator):
+  """Group selected meshes under an Empty.
+
+  If one Empty is included in the selection, every selected mesh is moved under
+  it (even meshes already parented to another Empty). Otherwise a new Empty is
+  created from the active mesh name; in that case meshes already inside an Empty
+  are rejected.
+  """
+  bl_idname = 'st.group_selected_meshes'
+  bl_label = 'Group Selected Meshes'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    selected = list(context.selected_objects)
+    meshes = [obj for obj in selected if obj.type == 'MESH']
+    empties = [obj for obj in selected if obj.type == 'EMPTY']
+
+    if not meshes:
+      self.report({'ERROR'}, 'Select at least one mesh')
+      return {'CANCELLED'}
+    if len(empties) > 1:
+      self.report({'ERROR'}, 'Select at most one Empty as the group target')
+      return {'CANCELLED'}
+
+    target_empty = empties[0] if empties else None
+
+    if target_empty is not None:
+      # An Empty in the selection is an explicit target: move every selected
+      # mesh under it, even meshes that already belong to another Empty.
+      ordered = sorted(meshes, key=lambda obj: obj.name_full)
+      added = 0
+      for obj in ordered:
+        if obj.parent == target_empty:
+          continue
+        world_matrix = obj.matrix_world.copy()
+        obj.parent = target_empty
+        obj.matrix_world = world_matrix
+        added += 1
+
+      bpy.ops.object.select_all(action='DESELECT')
+      target_empty.select_set(True)
+      for obj in ordered:
+        obj.select_set(True)
+      context.view_layer.objects.active = target_empty
+      self.report(
+        {'INFO'},
+        f'Added {added} mesh(es) to {target_empty.name}',
+      )
       return {'FINISHED'}
 
-    if painter_path == '':
-      self.report({'ERROR'}, 'Please specify Substance Painter path in addon preferences')
-      return {'FINISHED'}
+    active = context.view_layer.objects.active
+    if active is None or active.type != 'MESH' or active not in meshes:
+      self.report({'ERROR'}, 'Make one selected mesh active')
+      return {'CANCELLED'}
 
-    # Check if preferences.painter_path exists
-    if not Path(painter_path).exists():
-      self.report({'ERROR'}, 'Substance Painter path is not valid. Please set the corrent path to Substance Painter in addon preferences')
-      return {'FINISHED'}
+    # No target Empty selected: refuse to build a new group from meshes that are
+    # already inside an Empty (select that Empty to move them instead).
+    for mesh in meshes:
+      if mesh.parent is not None and mesh.parent.type == 'EMPTY':
+        self.report(
+          {'ERROR'},
+          f'{mesh.name} is already inside an Empty: {mesh.parent.name}',
+        )
+        return {'CANCELLED'}
 
-    # Check if a mac .app and add the executable part automatically first
-    if os.name == 'posix' and painter_path.endswith('.app'):
-      painter_path = painter_path + '/Contents/MacOS/Adobe Substance 3D Painter'
-    
-    # Display an error message if the path is a directory
-    if os.path.isdir(painter_path):
-      self.report({'ERROR'}, 'Substance Painter path is set to a directory. Please set it to the executable file')
-      return {'FINISHED'}
+    original_active_name = re.sub(r'\.\d{3}$', '', active.name)
+    group_name = clean_name(object_role_base(original_active_name, 'low'))
+    ordered = [active] + sorted(
+      (obj for obj in meshes if obj != active),
+      key=lambda obj: obj.name_full,
+    )
+    existing_group = bpy.data.objects.get(group_name)
+    if existing_group is not None and existing_group != active:
+      self.report({'ERROR'}, f'Object name already exists: {group_name}')
+      return {'CANCELLED'}
 
-    try:
-      if os.name == 'nt':
-        subprocess.Popen([painter_path, '--mesh', fbx, '--export-path', directory, spp])
-      else:
-        subprocess.Popen(f'"{painter_path}" --mesh "{fbx}" --export-path "{directory}" "{spp}"', shell=True)
+    _, low_collection, high_collection, alpha_collection = (
+      ensure_baking_collections(context.scene)
+    )
+    preferred_collections = (
+      low_collection,
+      high_collection,
+      alpha_collection,
+    )
+    target_collection = next(
+      (
+        collection for collection in preferred_collections
+        if active.name in collection.all_objects
+      ),
+      active.users_collection[0] if active.users_collection else None,
+    )
+    if target_collection is None:
+      target_collection = context.scene.collection
 
-    except Exception as e:
-      self.report({'ERROR'}, f'Error opening Substance Painter: {e}')
-      return {'FINISHED'}
+    active_world = active.matrix_world.copy()
+    if active.name == group_name:
+      child_name = f'{group_name}_child'
+      existing_child = bpy.data.objects.get(child_name)
+      if existing_child is not None and existing_child != active:
+        self.report({'ERROR'}, f'Object name already exists: {child_name}')
+        return {'CANCELLED'}
+      active.name = child_name
 
+    empty = bpy.data.objects.new(group_name, None)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.empty_display_size = 0.5
+    target_collection.objects.link(empty)
+    empty.matrix_world = active_world
+
+    for obj in ordered:
+      world_matrix = obj.matrix_world.copy()
+      obj.parent = empty
+      obj.matrix_world = world_matrix
+
+    bpy.ops.object.select_all(action='DESELECT')
+    empty.select_set(True)
+    for obj in ordered:
+      obj.select_set(True)
+    context.view_layer.objects.active = empty
+    self.report(
+      {'INFO'},
+      f'Grouped {len(ordered)} mesh(es) under {empty.name}',
+    )
+    return {'FINISHED'}
+
+
+class ToggleExportLinkOperator(bpy.types.Operator):
+  """Link or unlink the selected objects in the Send to Unreal 'Export' collection.
+
+  Every selected object plus its whole child hierarchy (meshes, curves, empties,
+  anything) is toggled together in one direction: if every gathered object is
+  already in 'Export' they are all unlinked; otherwise the ones still missing are
+  linked in (they stay in their current collection too). Unlinking never deletes
+  an object — if 'Export' was its only home it is moved to the scene root so it
+  stays visible. The Baking/low set used for the Painter export is never touched.
+  """
+  bl_idname = 'st.toggle_export_link'
+  bl_label = 'Toggle Export Link'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    # Gather every selected object plus its full child hierarchy, regardless of
+    # type, so a parented group links or unlinks as one unit.
+    targets = set()
+    for obj in context.selected_objects:
+      targets.add(obj)
+      targets.update(obj.children_recursive)
+    if not targets:
+      self.report({'ERROR'}, 'Select at least one object')
+      return {'CANCELLED'}
+
+    export_collection = bpy.data.collections.get(SEND2UE_EXPORT_COLLECTION)
+    if export_collection is None:
+      export_collection = bpy.data.collections.new(SEND2UE_EXPORT_COLLECTION)
+      context.scene.collection.children.link(export_collection)
+
+    ordered = sorted(targets, key=lambda o: o.name_full)
+    low_auto = painter_low_export_hierarchy()
+    protected = [obj for obj in ordered if obj in low_auto]
+    ordered = [obj for obj in ordered if obj not in low_auto]
+    if not ordered:
+      self.report(
+        {'WARNING'},
+        'Low Auto objects are managed by Baking/low and cannot be toggled here',
+      )
+      return {'CANCELLED'}
+
+    # One direction for the whole selection: if every object is already in
+    # 'Export', unlink them all; otherwise link whatever is still missing.
+    all_in_export = all(
+      obj.name in export_collection.objects for obj in ordered
+    )
+    if all_in_export:
+      for obj in ordered:
+        export_collection.objects.unlink(obj)
+        # Keep the object visible if 'Export' was its only collection.
+        if not obj.users_collection:
+          context.scene.collection.objects.link(obj)
+      message = f"'Export': unlinked {len(ordered)} object(s)"
+    else:
+      linked = 0
+      for obj in ordered:
+        if obj.name not in export_collection.objects:
+          export_collection.objects.link(obj)
+          linked += 1
+      message = f"'Export': linked {linked} object(s)"
+    if protected:
+      message += f'; skipped {len(protected)} Low Auto object(s)'
+    self.report({'INFO'}, message)
+    return {'FINISHED'}
+
+
+class CheckBakePlanOperator(bpy.types.Operator):
+  """Calculate which Texture Sets would rebake on the next Painter update."""
+  bl_idname = 'st.check_bake_plan'
+  bl_label = 'Check Bake Plan'
+  bl_options = {'REGISTER'}
+
+  def execute(self, context):
+    if not bpy.data.filepath:
+      self.report({'ERROR'}, 'Save the .blend file before checking bake changes')
+      return {'CANCELLED'}
+
+    paths = baking_paths()
+    _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
+      context.scene
+    )
+    low_objects = collection_meshes(low_collection)
+    alpha_ids = {
+      obj.as_pointer()
+      for obj in collection_meshes(alpha_collection)
+    }
+    high_objects = [
+      obj for obj in collection_meshes(high_collection)
+      if obj.as_pointer() not in alpha_ids
+    ]
+    if not low_objects:
+      self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
+      return {'CANCELLED'}
+
+    previous_request = read_json(paths['texture_dir'] / PAINTER_REQUEST, {})
+    previous_plan = read_json(paths['bake_plan'], {})
+    previous_low_hashes = (
+      previous_request.get('low_hashes')
+      or previous_plan.get('low_hashes')
+      or {}
+    )
+    previous_high_hashes = previous_request.get('high_hashes', {})
+    texture_sets = low_texture_set_names(low_objects)
+    low_hashes = {}
+    changed_low_texture_sets = []
+    low_baseline_missing = not bool(previous_low_hashes)
+    for texture_set, objects in low_objects_by_texture_set(low_objects).items():
+      texture_low_hash = fast_content_hash(
+        objects,
+        strip_material_prefix=True,
+        id_source=(
+          context.scene.substance_tools_baking.id_source
+          if not high_objects
+          else 'NONE'
+        ),
+      )
+      low_hashes[texture_set] = texture_low_hash
+      if (
+        not low_baseline_missing
+        and texture_low_hash != previous_low_hashes.get(texture_set)
+      ):
+        changed_low_texture_sets.append(texture_set)
+    low_hash = hashlib.sha256(
+      json.dumps(low_hashes, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    low_changed = bool(changed_low_texture_sets)
+    changed_high_texture_sets = []
+    high_hashes = {}
+    high_hash_cache = {}
+    for entry in high_entries_by_texture_set(
+      low_objects,
+      high_objects,
+      paths['high_dir'],
+      paths['asset'],
+    ):
+      cache_key = tuple(obj.name_full for obj in entry['objects'])
+      high_hash = high_hash_cache.get(cache_key)
+      if high_hash is None:
+        high_hash = fast_content_hash(
+          entry['objects'],
+          id_source=context.scene.substance_tools_baking.id_source,
+        )
+        high_hash_cache[cache_key] = high_hash
+      high_hashes[entry['texture_set']] = high_hash
+      if high_hash != previous_high_hashes.get(entry['texture_set']):
+        changed_high_texture_sets.append(entry['texture_set'])
+    missing_low_texture_sets = sorted(set(texture_sets) - set(low_hashes))
+    if missing_low_texture_sets:
+      changed_low_texture_sets.extend(missing_low_texture_sets)
+
+    settings = {
+      'resolution': int(context.scene.substance_tools_baking.resolution),
+      'match': context.scene.substance_tools_baking.match,
+      'cage': 'AUTOMATIC',
+      'id_source': context.scene.substance_tools_baking.id_source,
+      'low_as_high_texture_sets': low_as_high_texture_set_names(
+        low_objects,
+        high_objects,
+      ),
+      'mesh_maps': [
+        'Normal', 'WorldSpaceNormal', 'ID', 'AO',
+        'Curvature', 'Position', 'Thickness',
+      ],
+    }
+    settings_hash = hashlib.sha256(
+      json.dumps(settings, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    settings_changed = settings_hash != previous_request.get('settings_hash', '')
+    low_as_high_texture_sets = settings['low_as_high_texture_sets']
+    if settings_changed or not paths['spp'].is_file():
+      rebake_source = texture_sets
+    else:
+      rebake_source = list(changed_high_texture_sets)
+      rebake_source.extend(
+        texture_set for texture_set in changed_low_texture_sets
+        if texture_set in low_as_high_texture_sets
+      )
+    rebake_texture_sets = sorted(set(rebake_source))
+    reload_only_texture_sets = sorted(
+      set(changed_low_texture_sets) - set(rebake_texture_sets)
+    )
+    preview = {
+      'version': 1,
+      'blend_file': str(Path(bpy.data.filepath).resolve()),
+      'texture_sets': texture_sets,
+      'low_hash': low_hash,
+      'low_hashes': low_hashes,
+      'low_changed': low_changed,
+      'low_baseline_missing': low_baseline_missing,
+      'changed_low_texture_sets': sorted(changed_low_texture_sets),
+      'changed_high_texture_sets': sorted(changed_high_texture_sets),
+      'rebake_texture_sets': rebake_texture_sets,
+      'high_hashes': high_hashes,
+      'low_as_high_texture_sets': low_as_high_texture_sets,
+      'reload_only_texture_sets': reload_only_texture_sets,
+      'settings_hash': settings_hash,
+      'settings_changed': settings_changed,
+    }
+    context.scene['substance_tools_bake_plan_preview'] = json.dumps(
+      preview,
+      sort_keys=True,
+    )
+    paths['texture_dir'].mkdir(parents=True, exist_ok=True)
+    write_json(paths['bake_plan'], preview)
+    report_parts = []
+    if low_baseline_missing:
+      report_parts.append('Low baseline missing')
+    elif low_changed:
+      report_parts.append('Low changed')
+    if changed_high_texture_sets:
+      report_parts.append('High changed: ' + ', '.join(changed_high_texture_sets))
+    if settings_changed:
+      report_parts.append('Settings changed')
+    self.report(
+      {'INFO'},
+      '; '.join(report_parts) if report_parts else 'No mesh changes',
+    )
     return {'FINISHED'}
 
 
@@ -926,38 +2331,35 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       self.report({'INFO'}, f'Opening Painter project: {paths["spp"].name}')
       return {'FINISHED'}
 
-    _, low_collection, high_collection = ensure_baking_collections(context.scene)
+    _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
+      context.scene
+    )
     low_objects = collection_meshes(low_collection)
-    high_objects = collection_meshes(high_collection)
+    alpha_objects = collection_meshes(alpha_collection)
+    alpha_ids = {obj.as_pointer() for obj in alpha_objects}
+    high_objects = [
+      obj for obj in collection_meshes(high_collection)
+      if obj.as_pointer() not in alpha_ids
+    ]
     if not low_objects:
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
 
-    stripped_names = [
-      stripped_material_name(slot.material.name)
-      for obj in low_objects
-      for slot in obj.material_slots
-      if slot.material
-    ]
-    duplicates = sorted({name for name in stripped_names if stripped_names.count(name) > 1})
-    original_names = {
-      slot.material.name
-      for obj in low_objects
-      for slot in obj.material_slots
-      if slot.material
-    }
-    real_collisions = [
-      name for name in duplicates
-      if len({original for original in original_names if stripped_material_name(original) == name}) > 1
-    ]
-    if real_collisions:
-      self.report(
-        {'ERROR'},
-        'Material names collide after removing M_: ' + ', '.join(real_collisions),
-      )
-      return {'CANCELLED'}
-
     props = context.scene.substance_tools_baking
+    low_as_high_texture_sets = low_as_high_texture_set_names(
+      low_objects,
+      high_objects,
+    )
+    if props.match == 'BY_MESH_NAME' and high_objects:
+      unmatched_low, unmatched_high = unmatched_mesh_names(low_objects, high_objects)
+      if unmatched_high:
+        self.report(
+          {'ERROR'},
+          'Fix Baking high/low names before sending to Painter. '
+          + 'High without Low: ' + ', '.join(unmatched_high),
+        )
+        return {'CANCELLED'}
+
     if self.action == 'CREATE' and spp_existed:
       self.report(
         {'ERROR'},
@@ -974,24 +2376,125 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     for directory in (paths['low_dir'], paths['high_dir'], paths['texture_dir']):
       directory.mkdir(parents=True, exist_ok=True)
 
+    settings = {
+      'resolution': int(props.resolution),
+      'match': props.match,
+      'cage': 'AUTOMATIC',
+      'id_source': props.id_source,
+      'low_as_high_texture_sets': low_as_high_texture_sets,
+      'mesh_maps': [
+        'Normal', 'WorldSpaceNormal', 'ID', 'AO',
+        'Curvature', 'Position', 'Thickness',
+      ],
+    }
+    settings_hash = hashlib.sha256(
+      json.dumps(settings, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+
     try:
-      export_objects_to_fbx(
-        low_objects,
-        paths['low_fbx'],
-        strip_material_prefix=True,
-        id_source=props.id_source if not high_objects else 'NONE',
+      previous_request = read_json(paths['texture_dir'] / PAINTER_REQUEST, {})
+      previous_low_hashes = previous_request.get('low_hashes', {})
+      previous_high_hashes = previous_request.get('high_hashes', {})
+      texture_sets = low_texture_set_names(low_objects)
+      plan = load_bake_plan(paths, context)
+      plan_valid = (
+        self.action == 'UPDATE'
+        and bool(plan)
+        and 'low_hash' in plan
+        and 'high_hashes' in plan
       )
-      high_hash = ''
-      if high_objects:
+      if self.action == 'UPDATE' and not plan_valid:
+        self.report({'ERROR'}, 'Run Check Bake Plan before Update Painter')
+        return {'CANCELLED'}
+      if plan_valid:
+        low_hash = plan.get('low_hash', '')
+        low_hashes = dict(plan.get('low_hashes', {}))
+        low_changed = bool(plan.get('low_changed'))
+        changed_low_texture_sets = list(plan.get('changed_low_texture_sets', []))
+        high_hashes = dict(plan.get('high_hashes', {}))
+        changed_high_texture_sets = list(plan.get('changed_high_texture_sets', []))
+        texture_sets = list(plan.get('texture_sets', texture_sets))
+      else:
+        low_hashes = {}
+        changed_low_texture_sets = []
+        for texture_set, objects in low_objects_by_texture_set(low_objects).items():
+          texture_low_hash = fast_content_hash(
+            objects,
+            strip_material_prefix=True,
+            id_source=props.id_source if not high_objects else 'NONE',
+          )
+          low_hashes[texture_set] = texture_low_hash
+          if texture_low_hash != previous_low_hashes.get(texture_set):
+            changed_low_texture_sets.append(texture_set)
+        low_hash = hashlib.sha256(
+          json.dumps(low_hashes, sort_keys=True).encode('utf-8')
+        ).hexdigest()
+        low_changed = bool(changed_low_texture_sets)
+        high_hashes = {}
+        changed_high_texture_sets = []
+      high_hash_cache = {}
+      if low_changed or not paths['low_fbx'].is_file():
         export_objects_to_fbx(
-          high_objects,
-          paths['high_fbx'],
-          id_source=props.id_source,
+          low_objects,
+          paths['low_fbx'],
+          strip_material_prefix=True,
+          id_source=props.id_source if not high_objects else 'NONE',
         )
-        high_hash = file_hash(paths['high_fbx'])
+      high_entries = []
+      if high_objects:
+        for entry in high_entries_by_texture_set(
+          low_objects,
+          high_objects,
+          paths['high_dir'],
+          paths['asset'],
+        ):
+          texture_set = entry['texture_set']
+          if plan_valid and texture_set in high_hashes:
+            high_hash = high_hashes.get(texture_set, '')
+            changed = texture_set in changed_high_texture_sets
+          elif plan_valid:
+            raise RuntimeError(
+              f"Check Bake Plan is missing High data for {texture_set}"
+            )
+          else:
+            cache_key = tuple(obj.name_full for obj in entry['objects'])
+            high_hash = high_hash_cache.get(cache_key)
+            if high_hash is None:
+              high_hash = fast_content_hash(
+                entry['objects'],
+                id_source=props.id_source,
+              )
+              high_hash_cache[cache_key] = high_hash
+            high_hashes[texture_set] = high_hash
+            changed = high_hash != previous_high_hashes.get(texture_set)
+          missing_fbxs = [
+            fbx for fbx in entry['fbxs']
+            if not fbx.is_file()
+          ]
+          if changed or missing_fbxs:
+            for obj, fbx in zip(entry['objects'], entry['fbxs']):
+              if changed or not fbx.is_file():
+                export_objects_to_fbx(
+                  [obj],
+                  fbx,
+                  id_source=props.id_source,
+                )
+            if texture_set not in changed_high_texture_sets:
+              changed_high_texture_sets.append(texture_set)
+          resolved_fbxs = [
+            str(fbx.resolve())
+            for fbx in entry['fbxs']
+          ]
+          high_entries.append({
+            'texture_set': texture_set,
+            'bases': entry['bases'],
+            'fbx': resolved_fbxs[0] if len(resolved_fbxs) == 1 else '',
+            'fbxs': resolved_fbxs,
+            'hash': high_hash,
+            'changed': changed,
+          })
       elif paths['high_fbx'].exists():
         paths['high_fbx'].unlink()
-      texture_sets = low_texture_set_names(low_objects)
       baked_base_color = (
         paths['texture_dir'] / f'{base_color_bake_name(texture_sets[0])}.png'
         if len(texture_sets) == 1
@@ -1002,24 +2505,37 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         if baked_base_color is not None and baked_base_color.is_file()
         else {}
       )
+      alpha_color_maps = {
+        texture_set: str(
+          (
+            paths['texture_dir']
+            / f'{alpha_color_bake_name(texture_set)}.png'
+          ).resolve()
+        )
+        for texture_set in texture_sets
+        if (
+          paths['texture_dir']
+          / f'{alpha_color_bake_name(texture_set)}.png'
+        ).is_file()
+      }
     except Exception as error:
       self.report({'ERROR'}, f'Export or Base Color bake failed: {error}')
       traceback.print_exc()
       return {'CANCELLED'}
 
-    settings = {
-      'resolution': int(props.resolution),
-      'match': props.match,
-      'cage': 'AUTOMATIC',
-      'id_source': props.id_source,
-      'mesh_maps': [
-        'Normal', 'WorldSpaceNormal', 'ID', 'AO',
-        'Curvature', 'Position', 'Thickness',
-      ],
-    }
-    settings_hash = hashlib.sha256(
-      json.dumps(settings, sort_keys=True).encode('utf-8')
-    ).hexdigest()
+    settings_changed = settings_hash != previous_request.get('settings_hash', '')
+    if settings_changed or self.action == 'CREATE' or not spp_existed:
+      rebake_source = texture_sets
+    else:
+      rebake_source = list(changed_high_texture_sets)
+      rebake_source.extend(
+        texture_set for texture_set in changed_low_texture_sets
+        if texture_set in low_as_high_texture_sets
+      )
+    rebake_texture_sets = sorted(set(rebake_source))
+    reload_only_texture_sets = sorted(
+      set(changed_low_texture_sets) - set(rebake_texture_sets)
+    )
     base_color_hashes = {
       texture_set: file_hash(Path(image_path))
       for texture_set, image_path in base_color_maps.items()
@@ -1027,27 +2543,93 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     base_color_hash = hashlib.sha256(
       json.dumps(base_color_hashes, sort_keys=True).encode('utf-8')
     ).hexdigest()
+    alpha_color_hashes = {
+      texture_set: file_hash(Path(image_path))
+      for texture_set, image_path in alpha_color_maps.items()
+    }
+    alpha_color_hash = hashlib.sha256(
+      json.dumps(alpha_color_hashes, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    base_color_changed = (
+      base_color_hashes != previous_request.get('base_color_hashes', {})
+    )
+    alpha_color_changed = (
+      alpha_color_hashes != previous_request.get('alpha_color_hashes', {})
+    )
+    no_painter_work_needed = (
+      self.action == 'UPDATE'
+      and not low_changed
+      and not changed_high_texture_sets
+      and not settings_changed
+      and not base_color_changed
+      and not alpha_color_changed
+    )
+    if no_painter_work_needed:
+      preview = {
+        'version': 1,
+        'blend_file': str(Path(bpy.data.filepath).resolve()),
+        'low_hash': low_hash,
+        'low_hashes': low_hashes,
+        'low_changed': False,
+        'low_baseline_missing': False,
+        'changed_low_texture_sets': [],
+        'high_hashes': high_hashes,
+        'changed_high_texture_sets': [],
+        'rebake_texture_sets': [],
+        'reload_only_texture_sets': [],
+        'texture_sets': texture_sets,
+        'settings_hash': settings_hash,
+        'settings_changed': False,
+      }
+      context.scene['substance_tools_bake_plan_preview'] = json.dumps(
+        preview,
+        sort_keys=True,
+      )
+      write_json(paths['bake_plan'], preview)
+      self.report({'INFO'}, 'No checked bake changes. Run Check Bake Plan after editing.')
+      return {'FINISHED'}
     request = {
       'version': 1,
       'request_id': str(time.time_ns()),
       'action': self.action,
       'blend_file': str(Path(bpy.data.filepath).resolve()),
       'low_fbx': str(paths['low_fbx'].resolve()),
-      'high_fbx': str(paths['high_fbx'].resolve()) if high_objects else '',
+      'high_fbx': (
+        high_entries[0]['fbx']
+        if len(high_entries) == 1 and len(high_entries[0].get('fbxs', [])) == 1
+        else ''
+      ),
+      'high_entries': high_entries,
       'spp': str(paths['spp'].resolve()),
       'texture_dir': str(paths['texture_dir'].resolve()),
-      'low_hash': file_hash(paths['low_fbx']),
-      'high_hash': high_hash,
+      'low_hash': low_hash,
+      'low_hashes': low_hashes,
+      'low_changed': low_changed,
+      'low_baseline_missing': False,
+      'changed_low_texture_sets': changed_low_texture_sets,
+      'high_hash': hashlib.sha256(
+        json.dumps(high_hashes, sort_keys=True).encode('utf-8')
+      ).hexdigest(),
+      'high_hashes': high_hashes,
+      'changed_high_texture_sets': changed_high_texture_sets,
+      'rebake_texture_sets': rebake_texture_sets,
+      'reload_only_texture_sets': reload_only_texture_sets,
+      'bake_plan_used': bool(plan_valid),
       'settings_hash': settings_hash,
+      'settings_changed': settings_changed,
       'pipeline_hash': hashlib.sha256(
         (
-          f"{file_hash(paths['low_fbx'])}:{high_hash}:"
-          f"{settings_hash}:{base_color_hash}"
+          f"{low_hash}:{json.dumps(high_hashes, sort_keys=True)}:"
+          f"{settings_hash}:{base_color_hash}:{alpha_color_hash}"
         ).encode('utf-8')
       ).hexdigest(),
       'spp_existed': spp_existed,
       'base_color_maps': base_color_maps,
       'base_color_hashes': base_color_hashes,
+      'base_color_changed': base_color_changed,
+      'alpha_color_maps': alpha_color_maps,
+      'alpha_color_hashes': alpha_color_hashes,
+      'alpha_color_changed': alpha_color_changed,
       'settings': settings,
     }
     request_paths = (
@@ -1056,16 +2638,6 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     )
     for request_path in request_paths:
       write_json(request_path, request)
-
-    if props.match == 'BY_MESH_NAME' and high_objects:
-      unmatched_low, unmatched_high = unmatched_mesh_names(low_objects, high_objects)
-      if unmatched_low or unmatched_high:
-        message = []
-        if unmatched_low:
-          message.append('Low without High: ' + ', '.join(unmatched_low))
-        if unmatched_high:
-          message.append('High without Low: ' + ', '.join(unmatched_high))
-        self.report({'WARNING'}, ' | '.join(message))
 
     painter_path = get_preferences(context)['painter_path']
     if not painter_path or not Path(painter_path).is_file():
@@ -1095,6 +2667,28 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       self.report({'ERROR'}, f'Error opening Substance Painter: {error}')
       return {'CANCELLED'}
 
+    clean_plan = {
+      'version': 1,
+      'blend_file': str(Path(bpy.data.filepath).resolve()),
+      'texture_sets': texture_sets,
+      'low_hash': low_hash,
+      'low_hashes': low_hashes,
+      'low_changed': False,
+      'low_baseline_missing': False,
+      'changed_low_texture_sets': [],
+      'high_hashes': high_hashes,
+      'changed_high_texture_sets': [],
+      'rebake_texture_sets': [],
+      'reload_only_texture_sets': [],
+      'settings_hash': settings_hash,
+      'settings_changed': False,
+    }
+    context.scene['substance_tools_bake_plan_preview'] = json.dumps(
+      clean_plan,
+      sort_keys=True,
+    )
+    write_json(paths['bake_plan'], clean_plan)
+
     if self.action == 'CREATE':
       self.report({'INFO'}, 'Creating a new Painter project')
     else:
@@ -1116,9 +2710,17 @@ class BakeBaseColorToLowOperator(bpy.types.Operator):
       self.report({'ERROR'}, 'Save the .blend file before baking')
       return {'CANCELLED'}
 
-    _, low_collection, high_collection = ensure_baking_collections(context.scene)
+    _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
+      context.scene
+    )
     low_objects = collection_meshes(low_collection)
-    high_objects = collection_meshes(high_collection)
+    alpha_ids = {
+      obj.as_pointer() for obj in collection_meshes(alpha_collection)
+    }
+    high_objects = [
+      obj for obj in collection_meshes(high_collection)
+      if obj.as_pointer() not in alpha_ids
+    ]
     if not low_objects:
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
@@ -1197,6 +2799,62 @@ class BakeBaseColorToLowOperator(bpy.types.Operator):
     return {'FINISHED'}
 
 
+class BakeAlphaDetailsToLowOperator(bpy.types.Operator):
+  """Bake Baking/alpha RGBA details to their matching Low Texture Sets"""
+  bl_idname = 'st.bake_alpha_details_to_low'
+  bl_label = 'Bake Alpha Details'
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    if not bpy.data.filepath:
+      self.report({'ERROR'}, 'Save the .blend file before baking')
+      return {'CANCELLED'}
+    _, low_collection, _, alpha_collection = ensure_baking_collections(
+      context.scene
+    )
+    low_objects = collection_meshes(low_collection)
+    alpha_objects = collection_meshes(alpha_collection)
+    if not low_objects:
+      self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
+      return {'CANCELLED'}
+    if not alpha_objects:
+      self.report({'ERROR'}, "The 'Baking/alpha' collection has no mesh objects")
+      return {'CANCELLED'}
+    props = context.scene.substance_tools_baking
+    paths = baking_paths()
+    try:
+      result = bake_alpha_details_to_low(
+        low_objects,
+        alpha_objects,
+        paths['texture_dir'],
+        int(props.resolution),
+      )
+    except Exception as error:
+      self.report({'ERROR'}, f'Alpha detail bake failed: {error}')
+      traceback.print_exc()
+      return {'CANCELLED'}
+    connected = 0
+    for texture_set, image_path in result.items():
+      image = load_or_reload_image(image_path)
+      for material in {
+        material
+        for low in low_objects
+        for material in low.data.materials
+        if material is not None
+        and stripped_material_name(material.name) == texture_set
+      }:
+        connected += connect_alpha_bake_to_material(
+          material,
+          image,
+          enabled=props.base_color_source == 'BAKING',
+        )
+    self.report(
+      {'INFO'},
+      f'Baked {len(result)} alpha texture(s) and connected {connected} shader(s)',
+    )
+    return {'FINISHED'}
+
+
 class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   """Export with Painter Unreal_V2, then connect the results to Low materials"""
   bl_idname = 'st.export_painter_textures_and_apply'
@@ -1205,6 +2863,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
 
   _timer = None
   _request_id = ''
+  _deadline = 0.0
+  TIMEOUT_SECONDS = 300
 
   def execute(self, context):
     if not bpy.data.filepath:
@@ -1214,7 +2874,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if not paths['spp'].is_file():
       self.report({'ERROR'}, 'Create the Painter project first')
       return {'CANCELLED'}
-    _, low_collection, _ = ensure_baking_collections(context.scene)
+    _, low_collection, _, _ = ensure_baking_collections(context.scene)
     if not collection_meshes(low_collection):
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
@@ -1238,6 +2898,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if not painter_is_running(painter_path):
       subprocess.Popen([painter_path, str(paths['spp'])])
 
+    self._deadline = time.time() + self.TIMEOUT_SECONDS
     self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
     context.window_manager.modal_handler_add(self)
     self.report({'INFO'}, 'Painter texture export requested')
@@ -1246,6 +2907,16 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   def modal(self, context, event):
     if event.type != 'TIMER':
       return {'PASS_THROUGH'}
+    if time.time() > self._deadline:
+      context.window_manager.event_timer_remove(self._timer)
+      self._timer = None
+      self.report(
+        {'ERROR'},
+        f'Painter 텍스처 익스포트 응답이 {self.TIMEOUT_SECONDS // 60}분 내에 오지 '
+        '않았습니다. Painter가 실행 중이고 프로젝트가 열려 있는지 확인하세요 '
+        '(Painter export timed out)',
+      )
+      return {'CANCELLED'}
     result_path = baking_paths()['texture_dir'] / PAINTER_EXPORT_RESULT
     if not result_path.is_file():
       return {'PASS_THROUGH'}
@@ -1262,13 +2933,12 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     canonicalize_painter_export_files(result)
-    _, low_collection, _ = ensure_baking_collections(context.scene)
+    _, low_collection, _, _ = ensure_baking_collections(context.scene)
     low_objects = collection_meshes(low_collection)
     applied = apply_painter_textures_to_low(
       low_objects,
       baking_paths()['texture_dir'],
     )
-    context.scene.substance_tools_baking.base_color_source = 'PAINTER'
     if applied == 0:
       # Apply looks files up as T_<material-without-M_>_<role>.png. If Painter's
       # Texture Set names no longer match the Blender material names (e.g. the
@@ -1291,6 +2961,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         '(applied 0 textures: Painter Texture Set names may differ from material names)',
       )
       return {'FINISHED'}
+    context.scene.substance_tools_baking.base_color_source = 'PAINTER'
     self.report(
       {'INFO'},
       f'완료 (done): Painter 텍스처를 Base Color 셰이더 {applied}개에 적용 '
@@ -1311,7 +2982,7 @@ class ToggleBaseColorSourceOperator(bpy.types.Operator):
   bl_options = {'REGISTER', 'UNDO'}
 
   def execute(self, context):
-    _, low_collection, _ = ensure_baking_collections(context.scene)
+    _, low_collection, _, _ = ensure_baking_collections(context.scene)
     low_objects = collection_meshes(low_collection)
     texture_sets = low_texture_set_names(low_objects)
     if len(texture_sets) != 1:
@@ -1339,109 +3010,40 @@ class ToggleBaseColorSourceOperator(bpy.types.Operator):
         if slot.material
       }
     )
+    for material in {
+      slot.material
+      for obj in low_objects
+      for slot in obj.material_slots
+      if slot.material
+    }:
+      set_material_alpha_overlay_enabled(material, target == 'BAKING')
     props.base_color_source = target
     self.report({'INFO'}, f'Base Color source: {target.title()} ({connected} shader(s))')
     return {'FINISHED'}
 
 
-class LoadSubstancePainterTexturesOperator(bpy.types.Operator):
-  """Load Substance Painter Textures"""
-  bl_idname, bl_label, bl_options = 'st.load_substance_painter_textures', 'Load Substance Painter Textures', {'REGISTER', 'UNDO'}
+class SelectExportStatusObjectOperator(bpy.types.Operator):
+  """Select an object shown in the Export Status list."""
+  bl_idname = 'st.select_export_status_object'
+  bl_label = 'Select Export Object'
+  bl_options = {'INTERNAL'}
+
+  object_name: bpy.props.StringProperty()
 
   def execute(self, context):
-    preferences = get_preferences(context)
+    obj = context.view_layer.objects.get(self.object_name)
+    if obj is None:
+      self.report({'WARNING'}, f"'{self.object_name}' is not visible in this view layer")
+      return {'CANCELLED'}
+    if obj.type == 'EMPTY':
+      return {'CANCELLED'}
 
-    paths = get_paths(context)
-    directory = paths['directory']
-
-    # Check that node wrangler is enabled
-    if 'node_wrangler' not in bpy.context.preferences.addons:
-      self.report({'ERROR'}, 'Node Wrangler needs to be enabled! Please enable it in Edit -> Preferences -> Add-ons')
-      return {'FINISHED'}
-
-    # All of the materials in the blend file
-    material_names = [material.name for material in bpy.data.materials]
-
-    # Reload all of the unique images in materials of the current collection
-    unique_images = set()
-    for obj in bpy.context.view_layer.active_layer_collection.collection.objects:
-      if obj.type == 'MESH' and len(obj.data.materials) > 0:
-        for material in obj.data.materials:
-          if material is not None and material.use_nodes:
-            for node in material.node_tree.nodes:
-              if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                unique_images.add(node.image)
-    for image in unique_images:
-      image.reload()
-
-    # Return if the file is not save
-    if bpy.data.filepath == '':
-      self.report({'ERROR'}, 'File is not saved')
-      return {'FINISHED'}
-
-    # Return if the texture folder doesn't exist
-    if not directory.exists():
-      self.report({'ERROR'}, 'There is no texture folder')
-      return {'FINISHED'}
-
-    # Return if there are no materials in the scene
-    if len(bpy.data.materials) == 0:
-      self.report({'ERROR'}, 'There are no materials in the scene')
-      return {'FINISHED'}
-
-    # Iterate through all of the files and group them by texture set name (material)
-    texture_sets = defaultdict(list)
-    material_names = sorted([material.name for material in bpy.data.materials if material_needs_setup(material)], key=len, reverse=True)
-    for texture_file in directory.iterdir():
-      # If texture_file is not a common texture file extension, skip it
-      if texture_file.suffix not in ['.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.bmp', '.exr']:
-        continue
-      for material_name in material_names:
-        if material_name in texture_file.name:
-          texture_sets[material_name].append(texture_file.name)
-          break
-    # Create an empty mesh object with an empty material slot and set it as active
-    # This is needed to be able to use the shader editor to assign textures with node wrangler
-    previous_active_object = context.view_layer.objects.active
-    temp_mesh = bpy.data.meshes.new(name="TempMesh")
-    temp_obj = bpy.data.objects.new(name="TempObject", object_data=temp_mesh)
-    temp_obj.data.materials.append(None)
-    context.scene.collection.objects.link(temp_obj)
-    context.view_layer.objects.active = temp_obj
-
-    # Set area type to node editor
-    previous_context = context.area.type
-    context.area.type = 'NODE_EDITOR'
-    context.area.ui_type = 'ShaderNodeTree'
-
-    # Try catch to make sure that the context is ALWAYS returned to the previous one
-    # Otherwise the UI may break
-    try:
-      # For all of the texture sets that have a material with matching name add nodes via node wrangler
-      for texture_set_name, texture_file_names in texture_sets.items():
-        if texture_set_name in material_names:
-          # Set node editor to current material
-          material = bpy.data.materials[texture_set_name]
-          context.object.data.materials[0] = material
-          context.space_data.node_tree = material.node_tree
-          # Select the Principled BSDF node
-          for node in context.space_data.node_tree.nodes:
-            if node.bl_idname == 'ShaderNodeBsdfPrincipled':
-              context.space_data.node_tree.nodes.active = node
-              break
-          # Add textures to node tree using node wrangler
-          directory = str(directory) + os.sep
-          files = [{'name':n} for n in texture_file_names]
-          bpy.ops.node.nw_add_textures_for_principled(directory=directory, files=files)
-    except Exception as e:
-      tb = traceback.format_exc()
-      self.report({'ERROR'}, f'Error occurred while adding textures: {e}\n{tb}')
-    finally:
-      context.area.type = previous_context
-      context.view_layer.objects.active = previous_active_object
-      bpy.data.objects.remove(temp_obj)
-
+    for selected in tuple(context.selected_objects):
+      selected.select_set(False)
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
     return {'FINISHED'}
+
 
 # @UI
 
@@ -1509,14 +3111,111 @@ class SubstanceToolsPanel(bpy.types.Panel):
 
     baking_box = layout.box()
     baking_box.label(text='High to Low Baking', icon='RENDER_STILL')
+    baking_box.operator(
+      'st.pair_selected_baking_meshes',
+      text='Pair Selected Low + High',
+      icon='UV_SYNC_SELECT',
+    )
+    baking_box.operator(
+      'st.group_selected_meshes',
+      text='Group Selected Meshes',
+      icon='OUTLINER_OB_EMPTY',
+    )
+    baking_box.operator(
+      'st.toggle_export_link',
+      text='Toggle Export Link',
+      icon='LINKED',
+    )
     baking_box.prop(baking, 'resolution')
     baking_box.prop(baking, 'match')
     baking_box.prop(baking, 'id_source')
+    _, low_collection, high_collection, alpha_collection = get_baking_collections()
+    low_objects = collection_meshes(low_collection) if low_collection else []
+    alpha_objects = collection_meshes(alpha_collection) if alpha_collection else []
+    alpha_ids = {obj.as_pointer() for obj in alpha_objects}
+    high_objects = [
+      obj for obj in (collection_meshes(high_collection) if high_collection else [])
+      if obj.as_pointer() not in alpha_ids
+    ]
+    bake_plan_box = baking_box.box()
+    bake_plan_box.label(text='Bake Plan', icon='INFO')
+    bake_plan_box.operator(
+      'st.check_bake_plan',
+      text='Check Bake Plan',
+      icon='VIEWZOOM',
+    )
+    bake_rows = low_material_bake_modes(low_objects, high_objects)
+    request_paths = baking_paths() if bpy.data.filepath else None
+    last_request = (
+      read_json(request_paths['texture_dir'] / PAINTER_REQUEST, {})
+      if request_paths
+      else {}
+    )
+    try:
+      preview = json.loads(context.scene.get('substance_tools_bake_plan_preview', '{}'))
+    except ValueError:
+      preview = {}
+    low_changed_preview = bool(preview.get('low_changed'))
+    low_baseline_missing = bool(preview.get('low_baseline_missing'))
+    changed_low_texture_sets = set(preview.get('changed_low_texture_sets', []))
+    settings_changed_preview = bool(preview.get('settings_changed'))
+    changed_high_texture_sets = set(preview.get('changed_high_texture_sets', []))
+    rebake_texture_sets = set(preview.get('rebake_texture_sets', []))
+    reload_only_texture_sets = set(preview.get('reload_only_texture_sets', []))
+    last_rebake_texture_sets = set(last_request.get('rebake_texture_sets', []))
+    if bake_rows:
+      for texture_set, mode, objects in bake_rows:
+        material_row = bake_plan_box.row()
+        material_row.label(text=texture_set, icon='MATERIAL')
+        mode_row = bake_plan_box.row()
+        mode_row.separator(factor=1.2)
+        mode_text = mode
+        change_labels = []
+        if low_baseline_missing:
+          change_labels.append('Low baseline missing')
+        if texture_set in rebake_texture_sets:
+          change_labels.append('Rebake')
+        if texture_set in reload_only_texture_sets:
+          change_labels.append('Low changed: reload only')
+        elif texture_set in changed_low_texture_sets and texture_set in rebake_texture_sets:
+          change_labels.append('Low changed')
+        if texture_set in changed_high_texture_sets:
+          change_labels.append('High changed')
+        if settings_changed_preview:
+          change_labels.append('Settings changed')
+        if change_labels:
+          mode_text += ' / ' + ' / '.join(change_labels)
+        elif texture_set in last_rebake_texture_sets:
+          mode_text += ' / Last Update: Rebaked'
+        mode_row.label(text=mode_text, icon='RENDER_STILL')
+    else:
+      disabled = bake_plan_box.row()
+      disabled.enabled = False
+      disabled.label(text='No Baking/low materials')
     baking_box.operator(
       'st.bake_base_color_to_low',
       text='Bake Base Color',
       icon='IMAGE_DATA',
     )
+    baking_box.operator(
+      'st.bake_alpha_details_to_low',
+      text='Bake Alpha Details',
+      icon='IMAGE_DATA',
+    )
+    if alpha_objects:
+      alpha_box = baking_box.box()
+      alpha_box.label(text='Alpha Targets', icon='IMAGE_DATA')
+      for alpha_object in alpha_objects:
+        row = alpha_box.row(align=True)
+        if not matching_low_objects(alpha_object, low_objects):
+          row.alert = True
+          row.label(text=f'{alpha_object.name}: no matching _low')
+          continue
+        row.prop(
+          alpha_object,
+          'substance_tools_alpha_target_material',
+          text=alpha_object.name,
+        )
     painter_project_exists = baking_paths()['spp'].is_file() if bpy.data.filepath else False
     primary_action = baking_box.operator(
       'st.export_baking_to_substance_painter',
@@ -1550,62 +3249,151 @@ class SubstanceToolsPanel(bpy.types.Panel):
       icon='FILE_REFRESH',
     )
 
-    paths = get_paths(context)
-    fbx = paths['fbx']
-    collection_name_clean = paths['collection_name_clean']
 
-    fbx_exists = Path(fbx).exists()
+class SubstanceToolsExportStatusPanel(bpy.types.Panel):
+  """Read-only visual classification of the Send to Unreal export set."""
+  bl_idname = 'SCENE_PT_substance_tools_export_status'
+  bl_label = 'Export Status'
+  bl_space_type = 'VIEW_3D'
+  bl_region_type = 'UI'
+  bl_category = 'Substance'
+  bl_parent_id = 'SCENE_PT_substance_tools'
+  bl_options = {'DEFAULT_CLOSED'}
 
-    box_column = layout.box().column(align=True)
+  @staticmethod
+  def hierarchy_rows(objects):
+    object_set = set(objects)
+    children = {
+      obj: sorted(
+        (child for child in obj.children if child in object_set),
+        key=lambda child: child.name.casefold(),
+      )
+      for obj in object_set
+    }
+    roots = sorted(
+      (obj for obj in object_set if obj.parent not in object_set),
+      key=lambda obj: obj.name.casefold(),
+    )
+    rows = []
+    visited = set()
 
-    if collection_name_clean == 'Scene_Collection':
-      box_column.label(text='Select a collection in the outliner')
-    else:
-      box_column.label(text=f'Collection: {collection_name_clean}')
-      box_column.separator()
-      column = box_column.column(align=True)
-      column.operator('st.open_in_substance_painter', text=f'Export', icon='EXPORT').run_painter = False
-      column.operator('st.open_in_substance_painter', text=f'Export and Open in Painter', icon='WINDOW').run_painter = True
+    def append_branch(obj, depth):
+      if obj in visited:
+        return
+      visited.add(obj)
+      rows.append((obj, depth))
+      for child in children[obj]:
+        append_branch(child, depth + 1)
 
-      if fbx_exists:
-        # Load textures button
-        if 'node_wrangler' in bpy.context.preferences.addons:
-          column.operator('st.load_substance_painter_textures', text='Load Painter Textures', icon='IMPORT')
-        else:
-          column.label(text='Node Wrangler addon needs to be enabled!')
-          column.label(text='Please enable it in Edit -> Preferences -> Add-ons')
+    for root in roots:
+      append_branch(root, 0)
+    for obj in sorted(object_set - visited, key=lambda item: item.name.casefold()):
+      append_branch(obj, 0)
+    return rows
+
+  @staticmethod
+  def draw_group(layout, label, objects, icon):
+    box = layout.box()
+    box.label(text=f'{label} ({len(objects)})', icon=icon)
+    if not objects:
+      row = box.row()
+      row.enabled = False
+      row.label(text='None')
+      return
+
+    object_set = set(objects)
+    for obj, depth in SubstanceToolsExportStatusPanel.hierarchy_rows(objects):
+      row = box.row(align=True)
+      for _ in range(depth):
+        row.separator(factor=0.7)
+      if depth:
+        row.label(text='', icon='DISCLOSURE_TRI_RIGHT')
+      display_name = obj.name
+      if depth == 0 and obj.parent is not None and obj.parent not in object_set:
+        display_name = f'{obj.parent.name} \u25b8 {obj.name}'
+      is_send2ue_asset = obj.type in {'MESH', 'ARMATURE', 'CURVES'}
+      if is_send2ue_asset and not obj.visible_get():
+        display_name += ' [Hidden - Not Exported]'
+        row.alert = True
+      if obj.type == 'EMPTY':
+        row.label(text=display_name, icon='OUTLINER_OB_EMPTY')
+        continue
+      operator = row.operator(
+        'st.select_export_status_object',
+        text=display_name,
+        icon='OBJECT_DATA',
+        emboss=False,
+      )
+      operator.object_name = obj.name
+
+  def draw(self, context):
+    layout = self.layout
+    export_collection = bpy.data.collections.get(SEND2UE_EXPORT_COLLECTION)
+    if export_collection is None:
+      layout.label(text="No 'Export' collection", icon='INFO')
+      return
+
+    low_auto, linked, export_only = export_status_groups()
+    export_objects = tuple(export_collection.all_objects)
+    hidden_count = sum(
+      obj.type in {'MESH', 'ARMATURE', 'CURVES'} and not obj.visible_get()
+      for obj in export_objects
+    )
+    layout.label(
+      text=f'{len(export_objects)} Export member(s)',
+      icon='EXPORT',
+    )
+    if hidden_count:
+      warning = layout.row()
+      warning.alert = True
+      warning.label(
+        text=f'{hidden_count} hidden object(s) will not export',
+        icon='ERROR',
+      )
+    self.draw_group(layout, 'Low Auto', low_auto, 'COLORSET_03_VEC')
+    self.draw_group(layout, 'Linked', linked, 'COLORSET_04_VEC')
+    self.draw_group(layout, 'Export Only', export_only, 'COLORSET_01_VEC')
+
 
 # @Preferences
 
 class SubstanceToolsPreferences(bpy.types.AddonPreferences):
   bl_idname = __name__
 
-  painter_path: bpy.props.StringProperty(name='Substance Painter Executable', default=detect_substance_painter_path(), subtype='FILE_PATH')
-  textures_path: bpy.props.StringProperty(name='Export Path (Blank for blend file path)', default='', subtype='DIR_PATH')
+  painter_path: bpy.props.StringProperty(name='Substance Painter Executable', default=_DETECTED_PAINTER_PATH, subtype='FILE_PATH')
 
   def draw(self, context):
     layout = self.layout
     layout.prop(self, 'painter_path')
-    layout.prop(self, 'textures_path')
 
 # @Register
 
 classes = (
   SubstanceToolsBakingSettings,
-  ExportToSubstancePainterOperator,
+  PairSelectedBakingMeshesOperator,
+  GroupSelectedMeshesOperator,
+  ToggleExportLinkOperator,
+  CheckBakePlanOperator,
   ExportBakingToSubstancePainterOperator,
   BakeBaseColorToLowOperator,
+  BakeAlphaDetailsToLowOperator,
   ExportPainterTexturesAndApplyOperator,
   ToggleBaseColorSourceOperator,
-  LoadSubstancePainterTexturesOperator,
+  SelectExportStatusObjectOperator,
 
   SubstanceToolsPanel,
+  SubstanceToolsExportStatusPanel,
 
   SubstanceToolsPreferences
 )
 
 def register():
   for c in classes: bpy.utils.register_class(c)
+  bpy.types.Object.substance_tools_alpha_target_material = bpy.props.EnumProperty(
+    name='Target Material',
+    description='Low material / Painter Texture Set that receives this alpha detail',
+    items=alpha_target_material_items,
+  )
   bpy.types.Scene.substance_tools_baking = bpy.props.PointerProperty(
     type=SubstanceToolsBakingSettings
   )
@@ -1621,6 +3409,8 @@ def unregister():
     bpy.app.handlers.load_post.remove(ensure_baking_collections_on_load)
   if hasattr(bpy.types.Scene, 'substance_tools_baking'):
     del bpy.types.Scene.substance_tools_baking
+  if hasattr(bpy.types.Object, 'substance_tools_alpha_target_material'):
+    del bpy.types.Object.substance_tools_alpha_target_material
   for c in reversed(classes): bpy.utils.unregister_class(c)
 
 if __name__ == '__main__': register()
