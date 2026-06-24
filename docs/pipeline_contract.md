@@ -73,6 +73,9 @@ This pipeline currently has several convention-only links:
 - Send to Unreal collection named `Export`
 - Material and texture prefixes `M_` and `T_`
 - Painter Texture Set names derived from Blender Low material names
+- Texture Sets ending in `_back` are treated as backsides; their front Texture
+  Set is the same name without `_back` (for example `sibuki_01_back` uses
+  `sibuki_01`)
 - JSON request files exchanged through the `texture` and `low` folders plus
   `%LOCALAPPDATA%/SubstanceTools/` (see the JSON IPC Contract for exact paths)
 - Unreal path anchoring such as `Forestportfolio` -> `/Game/Meshes`
@@ -184,6 +187,13 @@ Important behavior:
   - High changes rebake mesh maps.
 - Low Poly as High Texture Sets:
   - Low changes rebake mesh maps.
+- `_back` Texture Sets:
+  - They follow Low Poly as High change behavior.
+  - Low changes rebake mesh maps instead of reload-only.
+  - The matching front Texture Set's Normal mesh map is assigned to the `_back`
+    Texture Set.
+  - Normal baker is disabled for that `_back` Texture Set once the source Normal
+    mesh map is assigned; the remaining mesh maps are baked.
 - Low hashes are tracked per Texture Set.
 - Stable source mesh array hashes are preferred for baselines. Avoid evaluated
   mesh hashes for stored baselines unless the instability is understood and

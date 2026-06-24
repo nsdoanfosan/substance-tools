@@ -30,6 +30,7 @@ PENDING_REQUEST = 'pending_request.json'
 PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
 EXPORT_PRESET_NAME = 'Unreal_V2'
+BACK_TEXTURE_SET_SUFFIX = '_back'
 
 
 def clean_name(value):
@@ -331,6 +332,10 @@ def low_texture_set_names(low_objects):
   })
 
 
+def is_back_texture_set(texture_set):
+  return str(texture_set).lower().endswith(BACK_TEXTURE_SET_SUFFIX)
+
+
 def low_as_high_texture_set_names(low_objects, high_objects):
   high_bases = {
     match_base(obj.name, 'high').lower()
@@ -339,9 +344,12 @@ def low_as_high_texture_set_names(low_objects, high_objects):
   return sorted({
     stripped_material_name(slot.material.name)
     for obj in low_objects
-    if match_base(obj.name, 'low').lower() not in high_bases
     for slot in obj.material_slots
     if slot.material
+    if (
+      match_base(obj.name, 'low').lower() not in high_bases
+      or is_back_texture_set(stripped_material_name(slot.material.name))
+    )
   })
 
 
@@ -377,9 +385,10 @@ def low_material_bake_modes(low_objects, high_objects):
       match_base(obj.name, 'low').lower() not in high_bases
       for obj in objects
     )
+    is_backside = is_back_texture_set(texture_set)
     rows.append((
       texture_set,
-      'Low Poly as High' if has_low_without_high else 'High-to-Low',
+      'Low Poly as High' if has_low_without_high or is_backside else 'High-to-Low',
       tuple(sorted({obj.name for obj in objects})),
     ))
   return rows
@@ -427,6 +436,32 @@ def base_color_bake_name(texture_set):
 
 def alpha_color_bake_name(texture_set):
   return f'T_{clean_name(texture_set)}_Color_alpha'
+
+
+def back_normal_mesh_map_plan(texture_sets, texture_dir):
+  texture_set_lookup = {name.lower(): name for name in texture_sets}
+  plan = {}
+  for texture_set in texture_sets:
+    if not texture_set.lower().endswith(BACK_TEXTURE_SET_SUFFIX):
+      continue
+    source_name = texture_set[:-len(BACK_TEXTURE_SET_SUFFIX)]
+    source_texture_set = texture_set_lookup.get(source_name.lower(), source_name)
+    source_normal_texture = (
+      Path(texture_dir) / f'T_{clean_name(source_texture_set)}_Normal.png'
+    )
+    plan[texture_set] = {
+      'source_texture_set': source_texture_set,
+      'source_normal_texture': str(source_normal_texture.resolve()),
+    }
+  return plan
+
+
+def hash_existing_back_normal_sources(back_normal_mesh_maps):
+  return {
+    texture_set: file_hash(Path(entry['source_normal_texture']))
+    for texture_set, entry in back_normal_mesh_maps.items()
+    if Path(entry['source_normal_texture']).is_file()
+  }
 
 
 def material_has_alpha_texture(material):
@@ -2252,6 +2287,20 @@ class CheckBakePlanOperator(bpy.types.Operator):
     missing_low_texture_sets = sorted(set(texture_sets) - set(low_hashes))
     if missing_low_texture_sets:
       changed_low_texture_sets.extend(missing_low_texture_sets)
+    back_normal_mesh_maps = back_normal_mesh_map_plan(
+      texture_sets,
+      paths['texture_dir'],
+    )
+    back_normal_hashes = hash_existing_back_normal_sources(back_normal_mesh_maps)
+    changed_back_normal_texture_sets = sorted(
+      texture_set
+      for texture_set in back_normal_mesh_maps
+      if (
+        texture_set in back_normal_hashes
+        and back_normal_hashes.get(texture_set)
+        != previous_request.get('back_normal_hashes', {}).get(texture_set)
+      )
+    )
 
     settings = {
       'resolution': int(context.scene.substance_tools_baking.resolution),
@@ -2266,6 +2315,7 @@ class CheckBakePlanOperator(bpy.types.Operator):
         'Normal', 'WorldSpaceNormal', 'ID', 'AO',
         'Curvature', 'Position', 'Thickness',
       ],
+      'back_normal_mesh_maps': back_normal_mesh_maps,
     }
     settings_hash = hashlib.sha256(
       json.dumps(settings, sort_keys=True).encode('utf-8')
@@ -2280,6 +2330,7 @@ class CheckBakePlanOperator(bpy.types.Operator):
         texture_set for texture_set in changed_low_texture_sets
         if texture_set in low_as_high_texture_sets
       )
+      rebake_source.extend(changed_back_normal_texture_sets)
     rebake_texture_sets = sorted(set(rebake_source))
     reload_only_texture_sets = sorted(
       set(changed_low_texture_sets) - set(rebake_texture_sets)
@@ -2294,8 +2345,10 @@ class CheckBakePlanOperator(bpy.types.Operator):
       'low_baseline_missing': low_baseline_missing,
       'changed_low_texture_sets': sorted(changed_low_texture_sets),
       'changed_high_texture_sets': sorted(changed_high_texture_sets),
+      'changed_back_normal_texture_sets': changed_back_normal_texture_sets,
       'rebake_texture_sets': rebake_texture_sets,
       'high_hashes': high_hashes,
+      'back_normal_hashes': back_normal_hashes,
       'low_as_high_texture_sets': low_as_high_texture_sets,
       'reload_only_texture_sets': reload_only_texture_sets,
       'settings_hash': settings_hash,
@@ -2314,6 +2367,10 @@ class CheckBakePlanOperator(bpy.types.Operator):
       report_parts.append('Low changed')
     if changed_high_texture_sets:
       report_parts.append('High changed: ' + ', '.join(changed_high_texture_sets))
+    if changed_back_normal_texture_sets:
+      report_parts.append(
+        'Back Normal changed: ' + ', '.join(changed_back_normal_texture_sets)
+      )
     if settings_changed:
       report_parts.append('Settings changed')
     self.report(
@@ -2417,6 +2474,10 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'cage': 'AUTOMATIC',
       'id_source': props.id_source,
       'low_as_high_texture_sets': low_as_high_texture_sets,
+      'back_normal_mesh_maps': back_normal_mesh_map_plan(
+        low_texture_set_names(low_objects),
+        paths['texture_dir'],
+      ),
       'mesh_maps': [
         'Normal', 'WorldSpaceNormal', 'ID', 'AO',
         'Curvature', 'Position', 'Thickness',
@@ -2448,6 +2509,9 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         changed_low_texture_sets = list(plan.get('changed_low_texture_sets', []))
         high_hashes = dict(plan.get('high_hashes', {}))
         changed_high_texture_sets = list(plan.get('changed_high_texture_sets', []))
+        changed_back_normal_texture_sets = list(
+          plan.get('changed_back_normal_texture_sets', [])
+        )
         texture_sets = list(plan.get('texture_sets', texture_sets))
       else:
         low_hashes = {}
@@ -2467,6 +2531,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         low_changed = bool(changed_low_texture_sets)
         high_hashes = {}
         changed_high_texture_sets = []
+        changed_back_normal_texture_sets = []
       high_hash_cache = {}
       if low_changed or not paths['low_fbx'].is_file():
         export_objects_to_fbx(
@@ -2559,6 +2624,18 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     settings_changed = settings_hash != previous_request.get('settings_hash', '')
+    back_normal_mesh_maps = settings.get('back_normal_mesh_maps', {})
+    back_normal_hashes = hash_existing_back_normal_sources(back_normal_mesh_maps)
+    if not plan_valid:
+      changed_back_normal_texture_sets = sorted(
+        texture_set
+        for texture_set in back_normal_mesh_maps
+        if (
+          texture_set in back_normal_hashes
+          and back_normal_hashes.get(texture_set)
+          != previous_request.get('back_normal_hashes', {}).get(texture_set)
+        )
+      )
     if settings_changed or self.action == 'CREATE' or not spp_existed:
       rebake_source = texture_sets
     else:
@@ -2567,6 +2644,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         texture_set for texture_set in changed_low_texture_sets
         if texture_set in low_as_high_texture_sets
       )
+      rebake_source.extend(changed_back_normal_texture_sets)
     rebake_texture_sets = sorted(set(rebake_source))
     reload_only_texture_sets = sorted(
       set(changed_low_texture_sets) - set(rebake_texture_sets)
@@ -2591,13 +2669,18 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     alpha_color_changed = (
       alpha_color_hashes != previous_request.get('alpha_color_hashes', {})
     )
+    back_normal_changed = (
+      back_normal_hashes != previous_request.get('back_normal_hashes', {})
+    )
     no_painter_work_needed = (
       self.action == 'UPDATE'
       and not low_changed
       and not changed_high_texture_sets
+      and not changed_back_normal_texture_sets
       and not settings_changed
       and not base_color_changed
       and not alpha_color_changed
+      and not back_normal_changed
     )
     if no_painter_work_needed:
       preview = {
@@ -2610,6 +2693,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         'changed_low_texture_sets': [],
         'high_hashes': high_hashes,
         'changed_high_texture_sets': [],
+        'changed_back_normal_texture_sets': [],
+        'back_normal_hashes': back_normal_hashes,
         'rebake_texture_sets': [],
         'reload_only_texture_sets': [],
         'texture_sets': texture_sets,
@@ -2647,6 +2732,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       ).hexdigest(),
       'high_hashes': high_hashes,
       'changed_high_texture_sets': changed_high_texture_sets,
+      'changed_back_normal_texture_sets': changed_back_normal_texture_sets,
       'rebake_texture_sets': rebake_texture_sets,
       'reload_only_texture_sets': reload_only_texture_sets,
       'bake_plan_used': bool(plan_valid),
@@ -2655,7 +2741,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'pipeline_hash': hashlib.sha256(
         (
           f"{low_hash}:{json.dumps(high_hashes, sort_keys=True)}:"
-          f"{settings_hash}:{base_color_hash}:{alpha_color_hash}"
+          f"{settings_hash}:{base_color_hash}:{alpha_color_hash}:"
+          f"{json.dumps(back_normal_hashes, sort_keys=True)}"
         ).encode('utf-8')
       ).hexdigest(),
       'spp_existed': spp_existed,
@@ -2665,6 +2752,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'alpha_color_maps': alpha_color_maps,
       'alpha_color_hashes': alpha_color_hashes,
       'alpha_color_changed': alpha_color_changed,
+      'back_normal_hashes': back_normal_hashes,
+      'back_normal_changed': back_normal_changed,
       'settings': settings,
     }
     # Written to both the texture dir and the low dir because the Painter
@@ -2716,6 +2805,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'changed_low_texture_sets': [],
       'high_hashes': high_hashes,
       'changed_high_texture_sets': [],
+      'changed_back_normal_texture_sets': [],
+      'back_normal_hashes': back_normal_hashes,
       'rebake_texture_sets': [],
       'reload_only_texture_sets': [],
       'settings_hash': settings_hash,

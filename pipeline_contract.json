@@ -29,6 +29,8 @@
   "naming": {
     "material_prefix": "M_",
     "texture_prefix": "T_",
+    "back_texture_set_suffix": "_back",
+    "back_texture_set_behavior": "Texture Sets ending in _back are backsides. They follow Low Poly as High change behavior, so low changes rebake instead of reload-only. The matching front Texture Set is the same name without _back; for example sibuki_01_back uses sibuki_01 as the Normal mesh-map source.",
     "painter_export_preset": "Unreal_V2",
     "texture_name_pattern": "T_<texture_set>_<map>.png",
     "texture_set_from_material": "strip exactly one leading 'M_' from the Blender low material name (name[2:] when it startswith 'M_')",
@@ -80,7 +82,8 @@
     "request_payload_fields": [
       "request_id", "pipeline_hash", "low_hash", "low_hashes",
       "changed_low_texture_sets", "low_fbx", "spp", "template", "settings",
-      "base_color_maps/hashes/changed", "alpha_color_maps/hashes/changed", "spp_existed"
+      "base_color_maps/hashes/changed", "alpha_color_maps/hashes/changed",
+      "back_normal_hashes/changed", "spp_existed"
     ],
     "proposed_not_yet_implemented": {
       "note": "Genuine gaps only. NOT written by the code today - do not assume present.",
@@ -103,6 +106,7 @@
       "Update Painter on an existing project",
       "Confirm low reload without mesh-map bake for High-to-Low low-only edits",
       "Confirm rebake for Low Poly as High low edits",
+      "Confirm _back Texture Sets use the matching front Normal mesh map while baking the remaining mesh maps",
       "Export Painter Textures & Apply",
       "Send to Unreal handoff through the Export collection"
     ]

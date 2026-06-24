@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 from PySide6 import QtCore
@@ -10,6 +11,7 @@ from PySide6 import QtCore
 import substance_painter.baking
 import substance_painter.event
 import substance_painter.export
+import substance_painter.js
 import substance_painter.layerstack
 import substance_painter.project
 import substance_painter.resource
@@ -30,6 +32,16 @@ _pending_timer = None
 _last_polled_pipeline_hash = None
 _last_export_request_id = None
 _export_processing = False
+_last_busy_log_time = 0.0
+
+
+def _log_file_path():
+    base = Path(
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("TEMP")
+        or Path.home()
+    )
+    return base / "SubstanceTools" / "substance_tools_timing.log"
 
 
 def _normalized_path(path):
@@ -38,6 +50,30 @@ def _normalized_path(path):
 
 def _log(message):
     print(f"[Substance Tools] {message}")
+    try:
+        path = _log_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{timestamp} [Substance Tools] {message}\n")
+    except Exception:
+        pass
+
+
+def _elapsed_ms(start):
+    return (time.perf_counter() - start) * 1000.0
+
+
+def _request_age_ms(request):
+    try:
+        request_id = int(request.get("request_id", ""))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (time.time_ns() - request_id) / 1_000_000.0)
+
+
+def _log_timing(message):
+    _log(f"[timing] {message}")
 
 
 def _request_candidates():
@@ -77,9 +113,10 @@ def _load_request():
             if project_path and request.get("spp"):
                 if _normalized_path(project_path) != _normalized_path(request["spp"]):
                     continue
-            if request.get("status") == "FAILED":
+            if request.get("status") in {"FAILED", "SUCCESS"}:
                 continue
             request["_request_path"] = str(path)
+            request["_loaded_perf"] = time.perf_counter()
             return request
         except (OSError, ValueError) as error:
             _log(f"Could not read {path}: {error}")
@@ -142,6 +179,42 @@ def _mark_request_failed(request, message):
         _write_json(Path(request_path), saved)
     except Exception as error:
         _log(f"Could not mark request failed: {error}")
+
+
+def _mark_request_success(request):
+    request_path = request.get("_request_path")
+    if not request_path:
+        return
+    try:
+        saved = dict(request)
+        saved.pop("_request_path", None)
+        saved.pop("_loaded_perf", None)
+        saved.pop("_accepted_perf", None)
+        saved.pop("_reload_started_perf", None)
+        saved.pop("_bake_started_perf", None)
+        saved.pop("_needs_bake", None)
+        saved.pop("_low_reloaded", None)
+        saved.pop("_save_retry_count", None)
+        saved["status"] = "SUCCESS"
+        saved.pop("failure", None)
+        _write_json(Path(request_path), saved)
+    except Exception as error:
+        _log(f"Could not mark request successful: {error}")
+
+
+def _request_matches_saved_metadata(metadata, request):
+    for key in (
+        "pipeline_hash",
+        "low_hash",
+        "high_hash",
+        "settings_hash",
+        "base_color_hashes",
+        "alpha_color_hashes",
+        "back_normal_hashes",
+    ):
+        if _metadata_value(metadata, key) != _request_value(request, key):
+            return False
+    return True
 
 
 def _process_export_request():
@@ -317,6 +390,54 @@ def _mesh_map_usages(names):
     return usages
 
 
+def _assign_back_normal_mesh_map(texture_set, normal_plan):
+    normal_usage = substance_painter.textureset.MeshMapUsage.Normal
+    texture_set_name = _texture_set_name(texture_set)
+    source_name = str(normal_plan.get("source_texture_set", ""))
+    source_path = str(normal_plan.get("source_normal_texture", ""))
+    resource_id = None
+
+    if source_name:
+        try:
+            source_set = substance_painter.textureset.TextureSet.from_name(source_name)
+            resource_id = source_set.get_mesh_map_resource(normal_usage)
+        except Exception as error:
+            _log(
+                f"{texture_set_name}: could not read Normal mesh map "
+                f"from {source_name}: {error}"
+            )
+
+    if resource_id is None and source_path and Path(source_path).is_file():
+        try:
+            imported = substance_painter.resource.import_project_resource(
+                source_path,
+                substance_painter.resource.Usage.TEXTURE,
+                name=f"{texture_set_name}_SourceNormalMeshMap",
+                group="Substance Tools",
+            )
+            resource_id = imported.identifier()
+        except Exception as error:
+            _log(f"{texture_set_name}: could not import Normal mesh map: {error}")
+
+    if resource_id is None:
+        _log(
+            f"{texture_set_name}: source Normal mesh map was not found; "
+            "Normal baker stays enabled"
+        )
+        return False
+
+    try:
+        texture_set.set_mesh_map_resource(normal_usage, resource_id)
+        _log(
+            f"{texture_set_name}: using {source_name or source_path} "
+            "as Normal mesh map"
+        )
+        return True
+    except Exception as error:
+        _log(f"{texture_set_name}: could not assign Normal mesh map: {error}")
+        return False
+
+
 def _metadata_value(metadata, key):
     value = metadata.get(key)
     return "" if value is None else value
@@ -356,20 +477,30 @@ def _texture_set_matches(texture_set_name, names):
 
 
 def _configure_baking(request):
+    configure_started = time.perf_counter()
     settings = request["settings"]
     resolution = int(settings.get("resolution", 2048))
+    resolution_started = time.perf_counter()
     texture_sets = substance_painter.textureset.all_texture_sets()
     substance_painter.textureset.set_resolutions(
         texture_sets,
         substance_painter.textureset.Resolution(resolution, resolution),
     )
+    _log_timing(
+        f"texture set listing/resolution took {_elapsed_ms(resolution_started):.1f} ms "
+        f"for {len(texture_sets)} Texture Set(s)"
+    )
+    unlink_started = time.perf_counter()
     try:
         substance_painter.baking.unlink_all_common_parameters()
     except Exception as error:
         _log(f"Could not unlink common baking parameters: {error}")
+    finally:
+        _log_timing(f"unlink common baking parameters took {_elapsed_ms(unlink_started):.1f} ms")
 
     enabled_maps = _mesh_map_usages(settings.get("mesh_maps", []))
     low_as_high_texture_sets = [str(name) for name in settings.get("low_as_high_texture_sets", [])]
+    back_normal_mesh_maps = settings.get("back_normal_mesh_maps", {})
     rebake_texture_sets = [str(name) for name in request.get("rebake_texture_sets", [])]
     high_entry_by_texture_set = {
         str(entry.get("texture_set", "")): entry
@@ -379,11 +510,31 @@ def _configure_baking(request):
     high_path = request.get("high_fbx", "")
 
     for texture_set in texture_sets:
+        texture_set_started = time.perf_counter()
         texture_set_name = _texture_set_name(texture_set)
         should_bake = (
             not rebake_texture_sets
             or _texture_set_matches(texture_set_name, rebake_texture_sets)
         )
+        use_low_as_high = _texture_set_matches(texture_set_name, low_as_high_texture_sets)
+        params = substance_painter.baking.BakingParameters.from_texture_set(texture_set)
+        params.set_textureset_enabled(should_bake)
+        if not should_bake:
+            params.set_enabled_bakers([])
+            try:
+                params.set_enabled_uv_tiles([])
+            except Exception as error:
+                _log(f"Texture Set '{texture_set_name}': could not disable UV tiles: {error}")
+            _log(
+                f"Texture Set '{texture_set_name}': skip, "
+                f"{'Low Poly as High' if use_low_as_high else 'High-to-Low'}"
+            )
+            _log_timing(
+                f"configured Texture Set '{texture_set_name}' in "
+                f"{_elapsed_ms(texture_set_started):.1f} ms"
+            )
+            continue
+
         high_entry = next(
             (
                 entry for name, entry in high_entry_by_texture_set.items()
@@ -406,13 +557,22 @@ def _configure_baking(request):
             QtCore.QUrl.fromLocalFile(str(Path(path).resolve())).toString()
             for path in texture_high_paths
         ]
-        use_low_as_high = (
-            not bool(texture_high_urls)
-            or _texture_set_matches(texture_set_name, low_as_high_texture_sets)
+        use_low_as_high = use_low_as_high or not bool(texture_high_urls)
+        texture_set_enabled_maps = list(enabled_maps)
+        normal_plan = next(
+            (
+                plan for name, plan in back_normal_mesh_maps.items()
+                if _texture_set_matches(texture_set_name, [name])
+            ),
+            None,
         )
-        params = substance_painter.baking.BakingParameters.from_texture_set(texture_set)
-        params.set_textureset_enabled(should_bake)
-        params.set_enabled_bakers(enabled_maps)
+        if normal_plan and _assign_back_normal_mesh_map(texture_set, normal_plan):
+            normal_usage = substance_painter.textureset.MeshMapUsage.Normal
+            texture_set_enabled_maps = [
+                usage for usage in texture_set_enabled_maps
+                if usage != normal_usage
+            ]
+        params.set_enabled_bakers(texture_set_enabled_maps)
         common = params.common()
         changes = {}
 
@@ -470,11 +630,16 @@ def _configure_baking(request):
             f"{'REBAKE' if should_bake else 'skip'}, "
             f"{'Low Poly as High' if use_low_as_high else 'High-to-Low'}"
         )
+        _log_timing(
+            f"configured Texture Set '{texture_set_name}' in "
+            f"{_elapsed_ms(texture_set_started):.1f} ms"
+        )
 
     _log(
         f"Configured {len(texture_sets)} Texture Set(s), "
         f"{resolution}px, match={settings.get('match')}"
     )
+    _log_timing(f"configure baking total {_elapsed_ms(configure_started):.1f} ms")
 
 
 def _apply_base_color_layers(request):
@@ -613,13 +778,35 @@ def _apply_alpha_color_layers(request):
     _log(f"Applied Blender Alpha Details to {applied} Painter Fill Layer(s)")
 
 
+def _schedule_successful_save_retry(request, reason, delay_ms=1000, max_retries=120):
+    retry_count = int(request.get("_save_retry_count", 0))
+    if retry_count >= max_retries:
+        _log(f"Could not save the successful bake state after waiting: {reason}")
+        return False
+    request["_save_retry_count"] = retry_count + 1
+    QtCore.QTimer.singleShot(delay_ms, _save_successful_request)
+    _log_timing(
+        f"save wait {request['_save_retry_count']} scheduled after "
+        f"{delay_ms} ms ({reason})"
+    )
+    return True
+
+
 def _save_successful_request():
     global _processing, _active_request
     request = _active_request
     if request is None:
         _processing = False
         return
+    try:
+        if substance_painter.project.is_busy():
+            if _schedule_successful_save_retry(request, "Painter is busy"):
+                return
+    except Exception as error:
+        _log(f"Could not query Painter busy state before save: {error}")
+
     saved = False
+    started = time.perf_counter()
     try:
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
@@ -631,6 +818,7 @@ def _save_successful_request():
             "settings_hash",
             "base_color_hashes",
             "alpha_color_hashes",
+            "back_normal_hashes",
         ):
             metadata.set(key, request.get(key, ""))
 
@@ -641,9 +829,13 @@ def _save_successful_request():
         else:
             substance_painter.project.save_as(requested_path)
         saved = True
+        _mark_request_success(request)
         _log(f"Bake succeeded and project was saved: {requested_path}")
+        _log_timing(f"post-bake layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Could not save the successful bake state: {error}")
+        if _schedule_successful_save_retry(request, str(error)):
+            return
     try:
         if saved:
             # Painter's Python API calls Painting mode "Edition".
@@ -661,6 +853,7 @@ def _save_reimported_request():
     if request is None:
         _processing = False
         return
+    started = time.perf_counter()
     try:
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
@@ -672,14 +865,17 @@ def _save_reimported_request():
             "settings_hash",
             "base_color_hashes",
             "alpha_color_hashes",
+            "back_normal_hashes",
         ):
             metadata.set(key, request.get(key, ""))
         substance_painter.project.save()
+        _mark_request_success(request)
         substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
         if request.get("_low_reloaded"):
             _log("Low-poly mesh reimported without mesh-map baking; project saved")
         else:
             _log("Painter update applied without mesh-map baking; project saved")
+        _log_timing(f"reload-only layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Low-poly mesh was reimported, but the update could not be saved: {error}")
     _active_request = None
@@ -687,14 +883,19 @@ def _save_reimported_request():
 
 
 def _on_baking_ended(event):
+    global _processing, _active_request
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.BakingProcessEnded,
         _on_baking_ended,
     )
+    if _active_request is not None and _active_request.get("_bake_started_perf"):
+        _log_timing(
+            "baking process ended after "
+            f"{(time.perf_counter() - _active_request['_bake_started_perf']) * 1000.0:.1f} ms"
+        )
     if event.status == substance_painter.baking.BakingStatus.Success:
         substance_painter.project.execute_when_not_busy(_save_successful_request)
     else:
-        global _processing, _active_request
         message = f"Baking did not complete successfully: {event.status}"
         _log(message)
         if _active_request is not None:
@@ -703,17 +904,52 @@ def _on_baking_ended(event):
         _processing = False
 
 
+def _single_rebake_texture_set(request):
+    rebake_texture_sets = [
+        str(name)
+        for name in request.get("rebake_texture_sets", [])
+        if str(name)
+    ]
+    if len(rebake_texture_sets) == 1:
+        return rebake_texture_sets[0]
+    return None
+
+
+def _start_single_texture_set_bake(request, texture_set_name):
+    bake_call_started = time.perf_counter()
+    request["_bake_started_perf"] = bake_call_started
+    substance_painter.js.evaluate(
+        f"alg.baking.bake({json.dumps(texture_set_name)})"
+    )
+    _log_timing(
+        f"alg.baking.bake({texture_set_name}) call took "
+        f"{_elapsed_ms(bake_call_started):.1f} ms"
+    )
+    _log(f"Automatic single Texture Set mesh-map baking ran: {texture_set_name}")
+    QtCore.QTimer.singleShot(3000, _save_successful_request)
+
+
 def _start_bake(request):
+    global _processing, _active_request
     try:
+        started = time.perf_counter()
         _configure_baking(request)
+        _log_timing(f"_configure_baking returned after {_elapsed_ms(started):.1f} ms")
+        single_texture_set = _single_rebake_texture_set(request)
+        if single_texture_set:
+            _start_single_texture_set_bake(request, single_texture_set)
+            return
+
+        bake_call_started = time.perf_counter()
         substance_painter.event.DISPATCHER.connect_strong(
             substance_painter.event.BakingProcessEnded,
             _on_baking_ended,
         )
         substance_painter.baking.bake_selected_textures_async()
+        request["_bake_started_perf"] = time.perf_counter()
+        _log_timing(f"bake_selected_textures_async call took {_elapsed_ms(bake_call_started):.1f} ms")
         _log("Automatic mesh-map baking started")
     except Exception as error:
-        global _processing, _active_request
         message = f"Could not start automatic baking: {error}"
         _log(message)
         _mark_request_failed(request, message)
@@ -722,8 +958,9 @@ def _start_bake(request):
 
 
 def _after_reload(status):
+    global _processing, _active_request
+    reload_done_perf = time.perf_counter()
     if status != substance_painter.project.ReloadMeshStatus.SUCCESS:
-        global _processing, _active_request
         message = "Low-poly mesh reload failed; bake was not started"
         _log(message)
         if _active_request is not None:
@@ -732,6 +969,11 @@ def _after_reload(status):
         _processing = False
         return
     _log("Low-poly mesh reloaded")
+    reload_started = _active_request.get("_reload_started_perf") if _active_request else None
+    if reload_started:
+        _log_timing(
+            f"reload_mesh callback after {(reload_done_perf - reload_started) * 1000.0:.1f} ms"
+        )
     _active_request["_low_reloaded"] = True
     if _active_request.get("_needs_bake"):
         _log("Bake-relevant data changed; baking after low-poly mesh reload")
@@ -744,19 +986,45 @@ def _after_reload(status):
 
 def _on_project_ready(_event=None):
     global _processing, _active_request, _last_polled_pipeline_hash
+    global _last_busy_log_time
     if _processing:
         return
     if substance_painter.project.is_busy():
+        now = time.perf_counter()
+        if now - _last_busy_log_time >= 2.0:
+            _log_timing("project is busy; request handling deferred")
+            _last_busy_log_time = now
         return
 
+    started = time.perf_counter()
     request = _load_request()
     if request is None:
         return
     request_marker = request.get("request_id") or request.get("pipeline_hash")
     if request_marker == _last_polled_pipeline_hash:
         return
+    request["_accepted_perf"] = time.perf_counter()
+    age = _request_age_ms(request)
+    age_text = f", age={age:.1f} ms" if age is not None else ""
+    loaded_perf = request.get("_loaded_perf")
+    load_to_accept = (
+        (request["_accepted_perf"] - loaded_perf) * 1000.0
+        if loaded_perf
+        else 0.0
+    )
+    _log_timing(
+        f"request accepted in {_elapsed_ms(started):.1f} ms "
+        f"(load_to_accept={load_to_accept:.1f} ms{age_text})"
+    )
 
+    decision_started = time.perf_counter()
     metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
+    if _request_matches_saved_metadata(metadata, request):
+        _mark_request_success(request)
+        _last_polled_pipeline_hash = request_marker
+        _log("Existing Painter state already matches the request; startup bake skipped")
+        return
+
     low_changed = (
         bool(request.get("low_changed"))
         if "low_changed" in request
@@ -784,6 +1052,12 @@ def _on_project_ready(_event=None):
     )
     base_color_changed = bool(request.get("base_color_changed"))
     alpha_color_changed = bool(request.get("alpha_color_changed"))
+    _log_timing(
+        "change decision "
+        f"low_changed={low_changed}, high_changed={high_changed}, "
+        f"settings_changed={settings_changed}, needs_bake={needs_bake}, "
+        f"rebake={rebake_texture_sets}, took={_elapsed_ms(decision_started):.1f} ms"
+    )
     if (
         request.get("action") != "UPDATE"
         and metadata.get("pipeline_hash") == request.get("pipeline_hash")
@@ -821,10 +1095,15 @@ def _on_project_ready(_event=None):
             preserve_strokes=True,
         )
         try:
+            reload_submit_started = time.perf_counter()
+            request["_reload_started_perf"] = reload_submit_started
             substance_painter.project.reload_mesh(
                 request["low_fbx"],
                 reload_settings,
                 _after_reload,
+            )
+            _log_timing(
+                f"reload_mesh submit took {_elapsed_ms(reload_submit_started):.1f} ms"
             )
         except Exception as error:
             _processing = False
