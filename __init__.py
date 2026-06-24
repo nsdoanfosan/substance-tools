@@ -2667,6 +2667,9 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'alpha_color_changed': alpha_color_changed,
       'settings': settings,
     }
+    # Written to both the texture dir and the low dir because the Painter
+    # plugin's _request_candidates() looks next to the open .spp (texture dir)
+    # AND next to the last imported mesh (low dir); writing both guarantees a hit.
     request_paths = (
       paths['texture_dir'] / PAINTER_REQUEST,
       paths['low_dir'] / PAINTER_REQUEST,

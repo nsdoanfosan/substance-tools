@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "owner": "substance-tools",
+  "status": "documented_contract_not_yet_runtime_enforced",
+  "verified_against_code": "2026-06-24",
+  "repositories": {
+    "substance_tools": "https://github.com/nsdoanfosan/substance-tools",
+    "ue_unique_export_names_addon": "https://github.com/nsdoanfosan/ue-unique-export-names-addon",
+    "blender_tools": "https://github.com/nsdoanfosan/BlenderTools"
+  },
+  "blender_collections": {
+    "baking_root": "Baking",
+    "low": "low",
+    "high": "high",
+    "alpha": "alpha",
+    "send_to_unreal_export": "Export",
+    "note": "low/high/alpha are child collections of the 'Baking' root. The actual collection names are 'low'/'high'/'alpha', not 'Baking/low'. Role classification is by COLLECTION MEMBERSHIP, not by object-name suffix."
+  },
+  "on_disk_layout": {
+    "base": "the folder that contains the .blend file",
+    "asset": "the .blend filename stem (cleaned) - NOT a per-object name",
+    "low_dir": "<base>/low",
+    "high_dir": "<base>/high",
+    "texture_dir": "<base>/texture",
+    "low_fbx": "<base>/low/<asset>_low.fbx",
+    "high_fbx": "<base>/high/<asset>_high.fbx",
+    "spp": "<base>/texture/<asset>_SP.spp"
+  },
+  "naming": {
+    "material_prefix": "M_",
+    "texture_prefix": "T_",
+    "painter_export_preset": "Unreal_V2",
+    "texture_name_pattern": "T_<texture_set>_<map>.png",
+    "texture_set_from_material": "strip exactly one leading 'M_' from the Blender low material name (name[2:] when it startswith 'M_')",
+    "role_pairing_suffix": {
+      "roles": ["low", "high", "alpha"],
+      "match_regex": "(?i)(?:[_. -]?(low|high|alpha))(?:[_. -]?\\d+)?$",
+      "behavior": "low<->high (baking) and low<->alpha (alpha detail) objects are paired by stripping a trailing role token and comparing the remaining base. The separator is optional and may be '_', '.', '-', a space, or nothing; an optional trailing number is allowed, so rock_high, rock_high_01 and rock_high1 all reduce to base 'rock'. A Blender '.001' duplicate suffix is stripped first. Matching is case-insensitive.",
+      "example": "rock_low pairs with rock_high and rock_alpha",
+      "note": "This suffix exists for PAIRING across roles, not for deciding which collection an object belongs to (that is collection membership)."
+    }
+  },
+  "json_ipc": {
+    "poll_interval_seconds": 0.5,
+    "atomic_write": "each file is written to a '.<name>.tmp' sibling then os.replace()d into place",
+    "request_files": {
+      "pending_request": {
+        "file": "pending_request.json",
+        "location": "%LOCALAPPDATA%/SubstanceTools/ (falls back to %TEMP%, then the user home)"
+      },
+      "painter_request": {
+        "file": ".substance_tools_request.json",
+        "location": ["<base>/texture", "<base>/low"],
+        "note": "written to BOTH the texture dir and the low dir"
+      },
+      "bake_plan": {
+        "file": ".substance_tools_bake_plan.json",
+        "location": "<base>/texture"
+      },
+      "texture_export_request": {
+        "file": ".substance_tools_export_request.json",
+        "location": "<base>/texture"
+      },
+      "texture_export_result": {
+        "file": ".substance_tools_export_result.json",
+        "location": "<base>/texture"
+      }
+    },
+    "status_values_in_use": {
+      "SUCCESS": "operation completed; Blender treats any value other than 'SUCCESS' as failure",
+      "ERROR": "operation ran but did not succeed",
+      "FAILED": "request could not be processed; marks the request so it is NOT retried forever"
+    },
+    "status_and_message_live_in": "the export RESULT file (.substance_tools_export_result.json), written by the Painter plugin and read by Blender (result.get('status'), result.get('message'))",
+    "staleness_marker": {
+      "fields": ["request_id", "pipeline_hash"],
+      "behavior": "Painter compares request_id (falling back to pipeline_hash) against the last one it processed (_last_polled_pipeline_hash) and skips a request it already handled. request_id is str(time.time_ns()).",
+      "note": "Stale-vs-current detection is ALREADY implemented via these markers - it is not a gap."
+    },
+    "request_payload_fields": [
+      "request_id", "pipeline_hash", "low_hash", "low_hashes",
+      "changed_low_texture_sets", "low_fbx", "spp", "template", "settings",
+      "base_color_maps/hashes/changed", "alpha_color_maps/hashes/changed", "spp_existed"
+    ],
+    "proposed_not_yet_implemented": {
+      "note": "Genuine gaps only. NOT written by the code today - do not assume present.",
+      "status_values": ["PENDING", "RUNNING"],
+      "fields": ["created_at", "updated_at"]
+    }
+  },
+  "unreal_path_mapping": {
+    "current_default": {
+      "local_anchor": "Forestportfolio",
+      "unreal_anchor": "/Game/Meshes",
+      "implemented_in": "BlenderTools send2ue core/utilities.py sync_unreal_mesh_folder_path() (single hardcoded anchor)"
+    },
+    "risk": "A single hardcoded anchor is fragile when a local subtree does not mirror the Unreal content path. This already broke the character/ subtree once.",
+    "target_direction": "Support multiple mappings and/or a sidecar file next to the .blend, and fail loudly when no mapping matches instead of silently using a plausible-but-wrong path."
+  },
+  "validation": {
+    "minimum_real_round_trip": [
+      "Blender Check Bake Plan",
+      "Update Painter on an existing project",
+      "Confirm low reload without mesh-map bake for High-to-Low low-only edits",
+      "Confirm rebake for Low Poly as High low edits",
+      "Export Painter Textures & Apply",
+      "Send to Unreal handoff through the Export collection"
+    ]
+  }
+}

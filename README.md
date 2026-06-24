@@ -6,6 +6,11 @@ layout, sent to Painter for mesh-map baking and texturing, and the resulting
 maps are loaded back onto the Blender materials. Changes are tracked per
 Texture Set so only what actually changed is re-baked.
 
+Shared conventions for the Blender, Painter, and Unreal handoff are documented
+in [docs/pipeline_contract.md](docs/pipeline_contract.md). Treat that contract
+and `pipeline_contract.json` as the source of truth before changing collection
+names, texture/material prefixes, JSON request files, or Unreal path anchors.
+
 > Originally derived from
 > [passivestar/substance-tools](https://github.com/passivestar/substance-tools)
 > and licensed under GPLv3. It has since been almost entirely rewritten through
