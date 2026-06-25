@@ -429,6 +429,34 @@ def _enum_value_containing(prop, *needles):
     return None
 
 
+def _antialiasing_property(properties):
+    return (
+        _find_property_containing_all(properties, "anti", "alias")
+        or _find_property(properties, "antialias", "supersampling", "subsampling")
+    )
+
+
+def _antialiasing_value(prop, requested):
+    requested = str(requested or "NONE").upper()
+    if prop is None:
+        return None
+    if requested == "NONE":
+        for needles in (
+            ("none",),
+            ("no", "anti"),
+            ("no", "sub"),
+            ("disabled",),
+            ("off",),
+            ("1",),
+        ):
+            value = _enum_value_containing(prop, *needles)
+            if value is not None:
+                return value
+        return None
+    samples = requested[1:] if requested.startswith("X") else requested
+    return _enum_value_containing(prop, samples)
+
+
 def _mesh_map_usages(names):
     usages = []
     entries = substance_painter.textureset.MeshMapUsage.__entries
@@ -657,6 +685,19 @@ def _configure_baking(request):
             if match_value is not None:
                 changes[match] = match_value
 
+        antialiasing = _antialiasing_property(common)
+        antialiasing_value = _antialiasing_value(
+            antialiasing,
+            settings.get("antialiasing", "NONE"),
+        )
+        if antialiasing_value is not None:
+            changes[antialiasing] = antialiasing_value
+        elif settings.get("antialiasing", "NONE") != "NONE":
+            _log(
+                f"Texture Set '{texture_set_name}': could not find "
+                f"antialiasing value {settings.get('antialiasing')}"
+            )
+
         id_params = params.baker(substance_painter.textureset.MeshMapUsage.ID)
         id_source_property = _find_property(
             id_params, "colorsource", "idsource", "sourcecolor"
@@ -686,7 +727,8 @@ def _configure_baking(request):
 
     _log(
         f"Configured {len(texture_sets)} Texture Set(s), "
-        f"{resolution}px, match={settings.get('match')}"
+        f"{resolution}px, antialiasing={settings.get('antialiasing', 'NONE')}, "
+        f"match={settings.get('match')}"
     )
     _log_timing(f"configure baking total {_elapsed_ms(configure_started):.1f} ms")
 

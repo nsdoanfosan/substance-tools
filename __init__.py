@@ -549,6 +549,16 @@ def _alpha_gate_name(principled):
   return f'__SubstanceToolsAlphaGate_{principled.name}'
 
 
+def _alpha_image_node_name(material):
+  return f'__SubstanceToolsAlpha_{clean_name(stripped_material_name(material.name))}'
+
+
+def replace_socket_link(node_tree, from_socket, to_socket):
+  for link in list(to_socket.links):
+    node_tree.links.remove(link)
+  node_tree.links.new(from_socket, to_socket)
+
+
 def _ensure_alpha_mix(material, principled, alpha_image=None):
   node_tree = material.node_tree
   base_color = principled.inputs.get('Base Color')
@@ -566,17 +576,16 @@ def _ensure_alpha_mix(material, principled, alpha_image=None):
     mix.inputs[0].default_value = 0.0
     mix.inputs[1].default_value = previous_color
     if previous_socket is not None:
-      node_tree.links.new(previous_socket, mix.inputs[1])
-    node_tree.links.new(mix.outputs['Color'], base_color)
+      replace_socket_link(node_tree, previous_socket, mix.inputs[1])
+    replace_socket_link(node_tree, mix.outputs['Color'], base_color)
+  elif not any(
+    link.from_node == mix and link.to_socket == base_color
+    for link in base_color.links
+  ):
+    replace_socket_link(node_tree, mix.outputs['Color'], base_color)
+
   if alpha_image is not None:
-    image_name = f'__SubstanceToolsAlpha_{clean_name(stripped_material_name(material.name))}'
-    image_node = node_tree.nodes.get(image_name)
-    if image_node is None or image_node.type != 'TEX_IMAGE':
-      image_node = node_tree.nodes.new('ShaderNodeTexImage')
-      image_node.name = image_name
-    image_node.label = 'Baked Alpha Detail'
-    image_node.image = alpha_image
-    image_node.interpolation = 'Linear'
+    image_node = _ensure_alpha_bake_image_node(material, alpha_image)
     gate_name = _alpha_gate_name(principled)
     gate = node_tree.nodes.get(gate_name)
     if gate is None or gate.type != 'MATH':
@@ -584,20 +593,51 @@ def _ensure_alpha_mix(material, principled, alpha_image=None):
       gate.name = gate_name
       gate.label = 'Substance Tools Alpha Visibility'
       gate.operation = 'MULTIPLY'
-      gate.inputs[1].default_value = 1.0
-    node_tree.links.new(image_node.outputs['Alpha'], gate.inputs[0])
-    node_tree.links.new(gate.outputs['Value'], mix.inputs[0])
-    node_tree.links.new(image_node.outputs['Color'], mix.inputs[2])
+      gate.inputs[1].default_value = 0.0
+    replace_socket_link(node_tree, image_node.outputs['Alpha'], gate.inputs[0])
+    replace_socket_link(node_tree, gate.outputs['Value'], mix.inputs[0])
+    replace_socket_link(node_tree, image_node.outputs['Color'], mix.inputs[2])
   return mix
+
+def _ensure_alpha_bake_image_node(material, alpha_image):
+  node_tree = material.node_tree
+  image_name = _alpha_image_node_name(material)
+  image_node = node_tree.nodes.get(image_name)
+  if image_node is None or image_node.type != 'TEX_IMAGE':
+    image_node = node_tree.nodes.new('ShaderNodeTexImage')
+    image_node.name = image_name
+  image_node.label = 'Baked Alpha Detail'
+  image_node.image = alpha_image
+  image_node.interpolation = 'Linear'
+  return image_node
 
 
 def set_material_alpha_overlay_enabled(material, enabled):
   if material is None or material.node_tree is None:
     return
   value = 1.0 if enabled else 0.0
-  for node in material.node_tree.nodes:
+  for node in list(material.node_tree.nodes):
     if node.type == 'MATH' and node.name.startswith('__SubstanceToolsAlphaGate_'):
       node.inputs[1].default_value = value
+
+
+def clear_principled_emission(material, principled):
+  if material is None or material.node_tree is None:
+    return
+  node_tree = material.node_tree
+  emission = principled.inputs.get('Emission Color') or principled.inputs.get('Emission')
+  if emission is not None:
+    for link in list(emission.links):
+      node_tree.links.remove(link)
+    try:
+      emission.default_value = (0.0, 0.0, 0.0, 1.0)
+    except (TypeError, ValueError):
+      pass
+  strength = principled.inputs.get('Emission Strength')
+  if strength is not None:
+    for link in list(strength.links):
+      node_tree.links.remove(link)
+    strength.default_value = 0.0
 
 
 def connect_alpha_bake_to_material(material, image, enabled=True):
@@ -646,7 +686,7 @@ def connect_base_color_bake_to_low_materials(low_objects, image):
         continue
       mix = _ensure_alpha_mix(material, principled)
       target = mix.inputs[1] if mix is not None else base_color
-      node_tree.links.new(image_node.outputs['Color'], target)
+      replace_socket_link(node_tree, image_node.outputs['Color'], target)
       set_material_alpha_overlay_enabled(material, True)
       connected += 1
   return connected
@@ -672,9 +712,32 @@ def set_material_base_color_image(material, image):
     if base_color is not None:
       mix = _ensure_alpha_mix(material, principled)
       target = mix.inputs[1] if mix is not None else base_color
-      node_tree.links.new(image_node.outputs['Color'], target)
+      replace_socket_link(node_tree, image_node.outputs['Color'], target)
       connected += 1
   return connected
+
+
+def ensure_black_base_color_bake(texture_set, texture_dir, resolution):
+  image_name = base_color_bake_name(texture_set)
+  image_path = Path(texture_dir) / f'{image_name}.png'
+  image_path.parent.mkdir(parents=True, exist_ok=True)
+  image = bpy.data.images.get(image_name)
+  if image is None:
+    image = bpy.data.images.new(
+      image_name,
+      width=resolution,
+      height=resolution,
+      alpha=False,
+      float_buffer=False,
+    )
+  elif list(image.size) != [resolution, resolution]:
+    image.scale(resolution, resolution)
+  image.generated_color = (0.0, 0.0, 0.0, 1.0)
+  image.filepath_raw = str(image_path)
+  image.file_format = 'PNG'
+  _fill_image(image, (0.0, 0.0, 0.0, 1.0))
+  image.save()
+  return image_path
 
 
 def force_material_opaque(material):
@@ -769,6 +832,9 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
         emission = principled.inputs.get('Emission Color') or principled.inputs.get('Emission')
         if emission is not None:
           node_tree.links.new(image_node.outputs['Color'], emission)
+    else:
+      for principled in principled_nodes:
+        clear_principled_emission(material, principled)
     if images.get('Height') is not None:
       height_image = images['Height']
       height_image.colorspace_settings.name = 'Non-Color'
@@ -803,7 +869,7 @@ def canonicalize_painter_export_files(result):
   return canonical_paths
 
 
-def add_high_id_colors(mesh, object_name):
+def add_high_id_colors(mesh, object_name, attribute_name='Color'):
   face_set_attribute = next(
     (
       mesh.attributes.get(name)
@@ -813,11 +879,10 @@ def add_high_id_colors(mesh, object_name):
     ),
     None,
   )
-  color_attribute = mesh.color_attributes.get('Color')
-  if color_attribute is not None:
+  for color_attribute in list(mesh.color_attributes):
     mesh.color_attributes.remove(color_attribute)
   color_attribute = mesh.color_attributes.new(
-    name='Color',
+    name=attribute_name,
     type='BYTE_COLOR',
     domain='CORNER',
   )
@@ -833,6 +898,13 @@ def add_high_id_colors(mesh, object_name):
       color_attribute.data[loop_index].color = color
   mesh.color_attributes.active_color = color_attribute
   mesh.color_attributes.render_color_index = mesh.color_attributes.find(color_attribute.name)
+
+
+def add_high_id_preview_colors(source_objects):
+  for source in source_objects:
+    if source.type != 'MESH' or source.data is None:
+      continue
+    add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
 
 
 def duplicate_for_export(source_objects, collection, strip_material_prefix=False, id_source='NONE'):
@@ -874,6 +946,7 @@ def duplicate_for_export(source_objects, collection, strip_material_prefix=False
         mesh.materials[index] = copied
 
     if id_source == 'FACE_SETS':
+      add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
       add_high_id_colors(mesh, source.name)
     duplicates.append(duplicate)
   return duplicates, temporary_materials, renamed_materials
@@ -1102,6 +1175,26 @@ def _keep_only_material_faces(mesh, material_index):
     editable.free()
 
 
+def _painter_color_socket(material, principled):
+  expected_name = f'T_{clean_name(stripped_material_name(material.name))}_Color'
+  fallback = None
+  for node in material.node_tree.nodes:
+    if node.type != 'TEX_IMAGE' or node.image is None:
+      continue
+    image_name = node.image.name
+    if image_name == expected_name:
+      return node.outputs.get('Color')
+    if (
+      fallback is None
+      and image_name.startswith('T_')
+      and image_name.endswith('_Color')
+      and '_Color_baking' not in image_name
+      and '_Color_alpha' not in image_name
+    ):
+      fallback = node.outputs.get('Color')
+  return fallback
+
+
 def _make_emission_material(material, channel, temporary_materials):
   copied = material.copy()
   copied.use_nodes = True
@@ -1118,7 +1211,10 @@ def _make_emission_material(material, channel, temporary_materials):
     raise RuntimeError(
       f"Alpha material needs Principled BSDF and Material Output: {material.name}"
     )
-  source = principled.inputs.get('Base Color' if channel == 'COLOR' else 'Alpha')
+  if channel == 'COLOR':
+    source = _painter_color_socket(copied, principled) or principled.inputs.get('Base Color')
+  else:
+    source = principled.inputs.get('Alpha')
   emission = node_tree.nodes.new('ShaderNodeEmission')
   emission.name = f'__SubstanceToolsAlpha{channel}'
   if source is not None and source.is_linked:
@@ -1273,19 +1369,13 @@ def bake_alpha_details_to_low(
   alpha_objects,
   texture_dir,
   resolution,
+  cage_extrusion,
+  max_ray_distance,
 ):
   if not alpha_objects:
     return {}
   entries_by_texture_set = defaultdict(list)
   for alpha_object in alpha_objects:
-    if not any(
-      material_has_alpha_texture(material)
-      for material in alpha_object.data.materials
-      if material is not None
-    ):
-      raise RuntimeError(
-        f"No image texture is connected to Principled Alpha on {alpha_object.name}"
-      )
     matching_lows, target_material = resolve_alpha_target(
       alpha_object,
       low_objects,
@@ -1316,9 +1406,8 @@ def bake_alpha_details_to_low(
     bpy.context.scene.render.engine = 'CYCLES'
     bake.use_selected_to_active = True
     bake.use_clear = False
-    bounds = [obj.dimensions.length for obj in low_objects + alpha_objects]
-    bake.cage_extrusion = max(bounds, default=1.0) * 0.01
-    bake.max_ray_distance = 0.0
+    bake.cage_extrusion = max(0.0, float(cage_extrusion))
+    bake.max_ray_distance = max(0.0, float(max_ray_distance))
     for texture_set, entries in entries_by_texture_set.items():
       image_name = alpha_color_bake_name(texture_set)
       image_path = texture_dir / f'{image_name}.png'
@@ -2326,6 +2415,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
 
     settings = {
       'resolution': int(props.resolution),
+      'antialiasing': props.antialiasing,
       'match': props.match,
       'cage': 'AUTOMATIC',
       'id_source': props.id_source,
@@ -2822,6 +2912,7 @@ def send_painter_bake_request(context, selected=None):
 
   settings = {
     'resolution': int(props.resolution),
+    'antialiasing': props.antialiasing,
     'match': props.match,
     'cage': 'AUTOMATIC',
     'id_source': props.id_source,
@@ -3074,6 +3165,8 @@ class BakeAlphaDetailsToLowOperator(bpy.types.Operator):
         alpha_objects,
         paths['texture_dir'],
         int(props.resolution),
+        props.alpha_cage_extrusion,
+        props.alpha_max_ray_distance,
       )
     except Exception as error:
       self.report({'ERROR'}, f'Alpha detail bake failed: {error}')
@@ -3311,41 +3404,64 @@ class ToggleBaseColorSourceOperator(bpy.types.Operator):
   def execute(self, context):
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
     low_objects = collection_meshes(low_collection)
-    texture_sets = low_texture_set_names(low_objects)
-    if len(texture_sets) != 1:
-      self.report({'ERROR'}, 'Base Color switching requires one Low Texture Set')
-      return {'CANCELLED'}
     props = context.scene.substance_tools_baking
     target = 'BAKING' if props.base_color_source == 'PAINTER' else 'PAINTER'
-    texture_set = clean_name(texture_sets[0])
-    filename = (
-      f'{base_color_bake_name(texture_set)}.png'
-      if target == 'BAKING'
-      else f'T_{texture_set}_Color.png'
-    )
-    path = baking_paths()['texture_dir'] / filename
-    if not path.is_file():
-      self.report({'ERROR'}, f'Texture does not exist: {path.name}')
-      return {'CANCELLED'}
-    image = load_or_reload_image(path)
-    connected = sum(
-      set_material_base_color_image(material, image)
-      for material in {
-        slot.material
-        for obj in low_objects
-        for slot in obj.material_slots
-        if slot.material
-      }
-    )
-    for material in {
+    texture_dir = baking_paths()['texture_dir']
+    resolution = int(props.resolution)
+    materials = {
       slot.material
       for obj in low_objects
       for slot in obj.material_slots
       if slot.material
-    }:
-      set_material_alpha_overlay_enabled(material, target == 'BAKING')
+    }
+    connected = 0
+    applied_sets = set()
+    missing_sets = set()
+    for material in materials:
+      material_texture_set = clean_name(stripped_material_name(material.name))
+      filename = (
+        f'{base_color_bake_name(material_texture_set)}.png'
+        if target == 'BAKING'
+        else f'T_{material_texture_set}_Color.png'
+      )
+      path = texture_dir / filename
+      if not path.is_file():
+        if target == 'BAKING':
+          path = ensure_black_base_color_bake(
+            material_texture_set,
+            texture_dir,
+            resolution,
+          )
+        else:
+          missing_sets.add(material_texture_set)
+          continue
+      image = load_or_reload_image(path)
+      connected += set_material_base_color_image(material, image)
+      applied_sets.add(material_texture_set)
+      alpha_path = (
+        texture_dir / f'{alpha_color_bake_name(material_texture_set)}.png'
+      )
+      if target == 'BAKING' and alpha_path.is_file():
+        alpha_image = load_or_reload_image(alpha_path)
+        connect_alpha_bake_to_material(material, alpha_image, enabled=True)
+      else:
+        set_material_alpha_overlay_enabled(material, target == 'BAKING')
+    if connected == 0:
+      missing = ', '.join(sorted(missing_sets))
+      self.report(
+        {'ERROR'},
+        f'No {target.title()} Base Color textures found'
+        + (f' ({missing})' if missing else ''),
+      )
+      return {'CANCELLED'}
     props.base_color_source = target
-    self.report({'INFO'}, f'Base Color source: {target.title()} ({connected} shader(s))')
+    message = (
+      f'Base Color source: {target.title()} '
+      f'({connected} shader(s), {len(applied_sets)} texture set(s))'
+    )
+    if missing_sets:
+      message += f"; skipped missing: {', '.join(sorted(missing_sets))}"
+    self.report({'INFO'}, message)
     return {'FINISHED'}
 
 
@@ -3399,6 +3515,16 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
     ],
     default='BY_MESH_NAME',
   )
+  antialiasing: bpy.props.EnumProperty(
+    name='Antialiasing',
+    items=[
+      ('NONE', 'None', 'Do not supersample baked mesh maps'),
+      ('X2', 'x2', 'Bake mesh maps with 2x antialiasing'),
+      ('X4', 'x4', 'Bake mesh maps with 4x antialiasing'),
+      ('X8', 'x8', 'Bake mesh maps with 8x antialiasing'),
+    ],
+    default='NONE',
+  )
   id_source: bpy.props.EnumProperty(
     name='ID Source',
     items=[
@@ -3419,6 +3545,24 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
       ),
     ],
     default='FACE_SETS',
+  )
+  alpha_cage_extrusion: bpy.props.FloatProperty(
+    name='Alpha Cage',
+    description='Selected-to-active cage extrusion used only for Bake Alpha Details',
+    default=0.004,
+    min=0.0,
+    soft_max=0.02,
+    precision=4,
+    unit='LENGTH',
+  )
+  alpha_max_ray_distance: bpy.props.FloatProperty(
+    name='Alpha Ray',
+    description='Maximum ray distance used only for Bake Alpha Details; use a small value to avoid projection bleed',
+    default=0.02,
+    min=0.0,
+    soft_max=0.05,
+    precision=4,
+    unit='LENGTH',
   )
   base_color_source: bpy.props.EnumProperty(
     name='Base Color Source',
@@ -3459,6 +3603,7 @@ class SubstanceToolsPanel(bpy.types.Panel):
       icon='LINKED',
     )
     baking_box.prop(baking, 'resolution')
+    baking_box.prop(baking, 'antialiasing')
     baking_box.prop(baking, 'match')
     baking_box.prop(baking, 'id_source')
     _, low_collection, high_collection, alpha_collection = get_baking_collections()
@@ -3475,6 +3620,9 @@ class SubstanceToolsPanel(bpy.types.Panel):
       text='Bake Base Color',
       icon='IMAGE_DATA',
     )
+    row = baking_box.row(align=True)
+    row.prop(baking, 'alpha_cage_extrusion')
+    row.prop(baking, 'alpha_max_ray_distance')
     baking_box.operator(
       'st.bake_alpha_details_to_low',
       text='Bake Alpha Details',

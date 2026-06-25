@@ -13,8 +13,8 @@ names, texture/material prefixes, JSON request files, or Unreal path anchors.
 
 > Originally derived from
 > [passivestar/substance-tools](https://github.com/passivestar/substance-tools)
-> and licensed under GPLv3. It has since been almost entirely rewritten through
-> 3.0.0 (2026): the original collection-based workflow (`Export and Open in
+> and has since been almost entirely rewritten through 3.0.0 (2026): the
+> original collection-based workflow (`Export and Open in
 > Painter` / `Load Painter Textures`, Node Wrangler dependency, custom Textures
 > Path) was removed, and the only workflow now is the `Baking` collection
 > pipeline described below.
