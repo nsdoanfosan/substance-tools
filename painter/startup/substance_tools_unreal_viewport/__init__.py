@@ -108,7 +108,7 @@ def _load_request():
         if not path.is_file():
             continue
         try:
-            request = json.loads(path.read_text(encoding="utf-8"))
+            request = json.loads(path.read_text(encoding="utf-8-sig"))
             project_path = substance_painter.project.file_path()
             if project_path and request.get("spp"):
                 if _normalized_path(project_path) != _normalized_path(request["spp"]):
@@ -128,7 +128,7 @@ def _load_pending_request():
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         _log(f"Could not read pending project request: {error}")
         return None
@@ -167,6 +167,44 @@ def _export_preset_url(request):
     return f"resource://your_assets/{requested_name}"
 
 
+def _strip_texture_set_prefixes():
+    texture_sets = substance_painter.textureset.all_texture_sets()
+    current_names = {str(texture_set.name) for texture_set in texture_sets}
+    renamed = []
+    for texture_set in texture_sets:
+        current_name = str(texture_set.name)
+        if not current_name.startswith("M_"):
+            continue
+        target_name = current_name[2:]
+        if target_name in current_names:
+            raise RuntimeError(
+                f"Cannot rename Texture Set '{current_name}' to '{target_name}': "
+                "target name already exists"
+            )
+        texture_set.name = target_name
+        current_names.remove(current_name)
+        current_names.add(target_name)
+        renamed.append((current_name, target_name))
+    if renamed:
+        _log(
+            "Renamed Painter Texture Set(s): "
+            + ", ".join(f"{old} -> {new}" for old, new in renamed)
+        )
+    return renamed
+
+
+def _normalize_texture_set_names():
+    """Drop the M_ prefix from Texture Sets, logging (not raising) on failure.
+
+    Called right before saving so the names that get persisted, exported, and
+    matched against Blender's (already M_-stripped) Texture Set names are clean.
+    """
+    try:
+        _strip_texture_set_prefixes()
+    except Exception as error:
+        _log(f"Could not normalize Painter Texture Set names: {error}")
+
+
 def _mark_request_failed(request, message):
     request_path = request.get("_request_path")
     if not request_path:
@@ -174,6 +212,13 @@ def _mark_request_failed(request, message):
     try:
         saved = dict(request)
         saved.pop("_request_path", None)
+        saved.pop("_loaded_perf", None)
+        saved.pop("_accepted_perf", None)
+        saved.pop("_reload_started_perf", None)
+        saved.pop("_bake_started_perf", None)
+        saved.pop("_needs_bake", None)
+        saved.pop("_low_reloaded", None)
+        saved.pop("_save_retry_count", None)
         saved["status"] = "FAILED"
         saved["failure"] = message
         _write_json(Path(request_path), saved)
@@ -235,7 +280,7 @@ def _process_export_request():
     except OSError:
         return
     try:
-        request = json.loads(claimed_request_path.read_text(encoding="utf-8"))
+        request = json.loads(claimed_request_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         _log(f"Could not read Painter export request: {error}")
         claimed_request_path.unlink(missing_ok=True)
@@ -256,6 +301,7 @@ def _process_export_request():
     result_path = Path(request["texture_dir"]) / EXPORT_RESULT_FILENAME
     try:
         preset_url = _export_preset_url(request)
+        _normalize_texture_set_names()
         export_list = []
         for texture_set in substance_painter.textureset.all_texture_sets():
             for stack in texture_set.all_stacks():
@@ -329,6 +375,9 @@ def _create_pending_project():
             template_file_path=str(template_path),
             settings=settings,
         )
+        # The M_ prefix is dropped later (in the save step, once the project is
+        # in edition state). project.create() returns before the Texture Sets
+        # exist, so renaming here would be a no-op.
         _pending_request_path().unlink(missing_ok=True)
         _log(f"Project created from Painter's Unreal Engine template: {request['spp']}")
     except Exception as error:
@@ -808,6 +857,7 @@ def _save_successful_request():
     saved = False
     started = time.perf_counter()
     try:
+        _normalize_texture_set_names()
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
@@ -855,6 +905,7 @@ def _save_reimported_request():
         return
     started = time.perf_counter()
     try:
+        _normalize_texture_set_names()
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
@@ -878,6 +929,50 @@ def _save_reimported_request():
         _log_timing(f"reload-only layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Low-poly mesh was reimported, but the update could not be saved: {error}")
+    _active_request = None
+    _processing = False
+
+
+def _save_normalized_request():
+    global _processing, _active_request
+    request = _active_request
+    if request is None:
+        _processing = False
+        return
+    started = time.perf_counter()
+    try:
+        _normalize_texture_set_names()
+        substance_painter.project.save()
+        _mark_request_success(request)
+        substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
+        _log("Texture Set names normalized and project saved")
+        _log_timing(f"normalize/save took {_elapsed_ms(started):.1f} ms")
+    except Exception as error:
+        _log(f"Could not normalize Texture Set names and save the project: {error}")
+        _mark_request_failed(request, str(error))
+    _active_request = None
+    _processing = False
+
+
+def _save_applied_maps_request():
+    global _processing, _active_request
+    request = _active_request
+    if request is None:
+        _processing = False
+        return
+    started = time.perf_counter()
+    try:
+        _normalize_texture_set_names()
+        _apply_base_color_layers(request)
+        _apply_alpha_color_layers(request)
+        substance_painter.project.save()
+        _mark_request_success(request)
+        substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
+        _log("Base Color / Alpha maps applied and project saved")
+        _log_timing(f"apply-maps save took {_elapsed_ms(started):.1f} ms")
+    except Exception as error:
+        _log(f"Could not apply Base Color / Alpha maps: {error}")
+        _mark_request_failed(request, str(error))
     _active_request = None
     _processing = False
 
@@ -984,6 +1079,33 @@ def _after_reload(status):
         _start_bake(_active_request)
 
 
+def _after_reload_only(status):
+    """Reload Mesh callback: persist the reloaded mesh.
+
+    Existing Texture Sets keep their names: Painter matches the reloaded
+    materials to existing Texture Sets by their imported (original) name, so a
+    set that was already renamed on create stays renamed. Texture Sets newly
+    introduced by the reload still carry the M_ prefix; that prefix is dropped
+    in _save_reloaded_request, just before the project is saved.
+    """
+    global _processing, _active_request
+    if status != substance_painter.project.ReloadMeshStatus.SUCCESS:
+        message = "Low-poly mesh reload failed"
+        _log(message)
+        if _active_request is not None:
+            _mark_request_failed(_active_request, message)
+        _active_request = None
+        _processing = False
+        return
+    reload_started = (
+        _active_request.get("_reload_started_perf") if _active_request else None
+    )
+    if reload_started:
+        _log_timing(f"reload_mesh callback after {_elapsed_ms(reload_started):.1f} ms")
+    _log("Low-poly mesh reloaded for Reload Mesh request")
+    substance_painter.project.execute_when_not_busy(_save_normalized_request)
+
+
 def _on_project_ready(_event=None):
     global _processing, _active_request, _last_polled_pipeline_hash
     global _last_busy_log_time
@@ -1016,6 +1138,46 @@ def _on_project_ready(_event=None):
         f"request accepted in {_elapsed_ms(started):.1f} ms "
         f"(load_to_accept={load_to_accept:.1f} ms{age_text})"
     )
+
+    if request.get("action") == "RELOAD_MESH":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        reload_settings = substance_painter.project.MeshReloadingSettings(
+            import_cameras=False,
+            preserve_strokes=True,
+        )
+        try:
+            request["_reload_started_perf"] = time.perf_counter()
+            substance_painter.project.reload_mesh(
+                request["low_fbx"],
+                reload_settings,
+                _after_reload_only,
+            )
+        except Exception as error:
+            _processing = False
+            _active_request = None
+            _last_polled_pipeline_hash = None
+            if "busy" in str(error).lower():
+                _log("Painter is still loading; mesh reload will retry")
+                return
+            _log(f"Could not reload the low-poly mesh: {error}")
+            _mark_request_failed(request, str(error))
+        return
+
+    if request.get("action") == "STRIP_PREFIX":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        substance_painter.project.execute_when_not_busy(_save_normalized_request)
+        return
+
+    if request.get("action") == "APPLY_MAPS":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        substance_painter.project.execute_when_not_busy(_save_applied_maps_request)
+        return
 
     decision_started = time.perf_counter()
     metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
