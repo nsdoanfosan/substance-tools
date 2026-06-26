@@ -87,6 +87,18 @@ wrong path.
 
 When debugging "nothing happened", check the contract before changing behavior.
 
+## Unreal Handoff Sidecar Contract
+
+`ue-unique-export-names-addon` writes per-mesh or per-Empty JSON sidecars for
+Send to Unreal and the Unreal material setup script. The current sidecar schema
+is version 2 and includes material entries plus a `cleanup` object.
+
+The `cleanup.source_material_names` and `cleanup.source_texture_names` arrays
+are precomputed by the producer. They describe FBX-import source assets that may
+be removed from the imported mesh folder after Unreal material instances and
+canonical textures are set up. Consumers should prefer these arrays when present
+and fall back to deriving cleanup names from `materials` only for older sidecars.
+
 ## Path Mapping Contract
 
 The current Unreal handoff has historically assumed a simple anchor:

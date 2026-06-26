@@ -112,6 +112,7 @@
       "mesh_name": "mesh or Empty asset name this sidecar is intended to match",
       "asset_prefix": "cleaned blend-file/prefix value used by the handoff",
       "materials": "array of material slot pipeline entries",
+      "cleanup": "object with precomputed source asset names that Send2UE/Unreal may delete from the imported mesh folder after material setup",
       "validation": "optional per-mesh validation row for individual mesh sidecars",
       "validation_children": "optional array of validation rows for Empty/group sidecars",
       "transfer_source": "optional per-mesh transfer postprocess request",
@@ -130,6 +131,10 @@
       "asset_name": "Texture asset name to import/create in Unreal",
       "file": "absolute texture file path written with forward slashes",
       "source_param": "optional original Blender role when param was remapped"
+    },
+    "cleanup_fields": {
+      "source_material_names": "deduplicated source material asset names that FBX import may create in the mesh folder and that can be removed after material instances are assigned",
+      "source_texture_names": "deduplicated source texture asset names that FBX import may create in the mesh folder and that can be removed after textures are imported to the canonical texture folder"
     },
     "transfer_request_fields": {
       "target": "Blender target mesh object name",
