@@ -2,7 +2,7 @@
   "schema_version": 1,
   "owner": "substance-tools",
   "status": "documented_contract_not_yet_runtime_enforced",
-  "verified_against_code": "2026-06-24",
+  "verified_against_code": "2026-06-26",
   "repositories": {
     "substance_tools": "https://github.com/nsdoanfosan/substance-tools",
     "ue_unique_export_names_addon": "https://github.com/nsdoanfosan/ue-unique-export-names-addon",
@@ -89,6 +89,66 @@
       "note": "Genuine gaps only. NOT written by the code today - do not assume present.",
       "status_values": ["PENDING", "RUNNING"],
       "fields": ["created_at", "updated_at"]
+    }
+  },
+  "unreal_handoff_sidecar": {
+    "producer": "ue_unique_export_names_addon",
+    "consumers": [
+      "BlenderTools send2ue material_pipeline extension",
+      "UE_Blender_Pipeline/ue_material_setup.py"
+    ],
+    "location": "<base>/texture/<mesh_or_empty_name>.json",
+    "purpose": "Bridge UE Unique validation/material data to Send to Unreal and Unreal material post-import setup. Users are not expected to edit these files manually.",
+    "schema_version": 2,
+    "matching": {
+      "individual_mesh": "When Send to Unreal imports meshes individually, the sidecar name matches the mesh object/imported asset name.",
+      "empty_combined_mesh": "When Send to Unreal combines child meshes under an Empty, the sidecar name matches the Empty/imported asset name.",
+      "reason_for_multiple_files": "The producer writes both mesh-name and Empty-name sidecars so the pipeline survives either Send to Unreal export mode."
+    },
+    "top_level_fields": {
+      "schema_version": "integer, currently 2",
+      "material_pipeline": "string, currently 'surface_layers'",
+      "material_master": "default material master preset for the sidecar, currently 'prop'",
+      "mesh_name": "mesh or Empty asset name this sidecar is intended to match",
+      "asset_prefix": "cleaned blend-file/prefix value used by the handoff",
+      "materials": "array of material slot pipeline entries",
+      "validation": "optional per-mesh validation row for individual mesh sidecars",
+      "validation_children": "optional array of validation rows for Empty/group sidecars",
+      "transfer_source": "optional per-mesh transfer postprocess request",
+      "transfer_sources": "optional array of transfer postprocess requests for Empty/group sidecars"
+    },
+    "material_entry_fields": {
+      "name": "Blender material name, expected to start with M_ when processed by Unreal",
+      "slot_index": "best-effort material slot index; Unreal also matches by material name where possible",
+      "translucent": "boolean; translucent entries may use the shared glass material path in Unreal",
+      "textures": "legacy flat texture array; may be empty",
+      "layers": "surface-layer texture array; may be empty",
+      "master_preset": "optional preset key such as prop, cloth, layer, asset_surface, or coat"
+    },
+    "texture_entry_fields": {
+      "param": "Unreal material parameter name such as Albedo, Extra, Normal, Transmission, Emissive",
+      "asset_name": "Texture asset name to import/create in Unreal",
+      "file": "absolute texture file path written with forward slashes",
+      "source_param": "optional original Blender role when param was remapped"
+    },
+    "transfer_request_fields": {
+      "target": "Blender target mesh object name",
+      "source": "Blender transfer source object name from Vertex Data Tools",
+      "shape_keys": "boolean, request Shape Key transfer before mesh export",
+      "weights": "boolean, request robust weight transfer before mesh export",
+      "enabled": "boolean, true only when a source exists and at least one transfer operation is requested"
+    },
+    "validation_policy": {
+      "textureless_materials": "Allowed. They produce warnings in UE Unique but do not block JSON; Unreal can still create/assign an MI with empty texture parameters.",
+      "blocking_errors": [
+        "missing Export collection",
+        "no mesh objects in scope",
+        "no materials in scope",
+        "unclean target/material names that would change on write",
+        "duplicate JSON target names",
+        "empty material slots",
+        "missing texture file paths or missing texture files when textures are present"
+      ]
     }
   },
   "unreal_path_mapping": {
