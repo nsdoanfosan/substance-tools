@@ -57,6 +57,14 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
     ],
     default='FACE_SETS',
   )
+  painter_low_hide_solidify_rim: bpy.props.BoolProperty(
+    name='Hide Solidify Rim in Painter Low',
+    description=(
+      'Export Solidify Plus shells to Painter without filled rim faces. '
+      'The final Export collection keeps the normal Blender rim state.'
+    ),
+    default=True,
+  )
   alpha_cage_extrusion: bpy.props.FloatProperty(
     name='Alpha Cage',
     description='Selected-to-active cage extrusion used only for Bake Alpha Details',

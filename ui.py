@@ -32,6 +32,7 @@ class SubstanceToolsPanel(bpy.types.Panel):
     baking_box.prop(baking, 'antialiasing')
     baking_box.prop(baking, 'match')
     baking_box.prop(baking, 'id_source')
+    baking_box.prop(baking, 'painter_low_hide_solidify_rim')
     _, low_collection, high_collection, alpha_collection = get_baking_collections()
     low_objects = collection_meshes(low_collection) if low_collection else []
     alpha_objects = collection_meshes(alpha_collection) if alpha_collection else []

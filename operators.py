@@ -311,6 +311,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     props = context.scene.substance_tools_baking
+    hide_solidify_rim = bool(props.painter_low_hide_solidify_rim)
     low_as_high_texture_sets = low_as_high_texture_set_names(
       low_objects,
       high_objects,
@@ -347,6 +348,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'match': props.match,
       'cage': 'AUTOMATIC',
       'id_source': props.id_source,
+      'painter_low_hide_solidify_rim': hide_solidify_rim,
       'low_as_high_texture_sets': low_as_high_texture_sets,
       'back_normal_mesh_maps': back_normal_mesh_map_plan(
         low_texture_set_names(low_objects),
@@ -395,6 +397,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
             objects,
             strip_material_prefix=True,
             id_source=props.id_source if not high_objects else 'NONE',
+            normalize_solidify_plus_fill_rim=hide_solidify_rim,
           )
           low_hashes[texture_set] = texture_low_hash
           if texture_low_hash != previous_low_hashes.get(texture_set):
@@ -413,6 +416,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
           paths['low_fbx'],
           strip_material_prefix=False,
           id_source=props.id_source if not high_objects else 'NONE',
+          solidify_plus_fill_rim=False if hide_solidify_rim else None,
         )
       high_entries = []
       if high_objects:
@@ -726,11 +730,15 @@ class ReloadMeshOperator(bpy.types.Operator):
 
     paths = baking_paths()
     paths['low_dir'].mkdir(parents=True, exist_ok=True)
+    props = context.scene.substance_tools_baking
     try:
       export_objects_to_fbx(
         low_objects,
         paths['low_fbx'],
         strip_material_prefix=False,
+        solidify_plus_fill_rim=(
+          False if props.painter_low_hide_solidify_rim else None
+        ),
       )
     except Exception as error:
       self.report({'ERROR'}, f'Could not export Low FBX: {error}')
@@ -826,6 +834,7 @@ def send_painter_bake_request(context, selected=None):
   ]
 
   props = context.scene.substance_tools_baking
+  hide_solidify_rim = bool(props.painter_low_hide_solidify_rim)
   all_texture_sets = low_texture_set_names(low_objects)
   if selected is None:
     bake_texture_sets = list(all_texture_sets)
@@ -844,6 +853,7 @@ def send_painter_bake_request(context, selected=None):
     'match': props.match,
     'cage': 'AUTOMATIC',
     'id_source': props.id_source,
+    'painter_low_hide_solidify_rim': hide_solidify_rim,
     'low_as_high_texture_sets': low_as_high_texture_set_names(low_objects, high_objects),
     'back_normal_mesh_maps': back_normal_mesh_map_plan(all_texture_sets, paths['texture_dir']),
     'mesh_maps': [
@@ -857,6 +867,7 @@ def send_painter_bake_request(context, selected=None):
     paths['low_fbx'],
     strip_material_prefix=False,
     id_source=props.id_source if not high_objects else 'NONE',
+    solidify_plus_fill_rim=False if hide_solidify_rim else None,
   )
   high_entries = []
   if high_objects:

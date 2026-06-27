@@ -213,6 +213,38 @@ Important behavior:
 
 If this behavior changes, update the contract and run a real Painter round trip.
 
+## Solidify Plus Rim Handling
+
+Current behavior. Low meshes may use `Solidify Plus 1.41` to generate an
+inner/back shell plus rim faces for the final Unreal export. Painter should not
+receive the final rim faces for baking, because those side faces can change the
+low-poly surface used by ray projection and mesh-map generation. That can move
+curvature/AO/normal-driven smart material masks and make seam-based texturing
+look different from the intended low source.
+
+Do not solve this by exporting the Low mesh with Solidify disabled. Disabling
+the modifier removes the generated inner/back shell as well as the rim, which
+is a different mesh than the intended Painter target. The `Hide Solidify Rim in
+Painter Low` toggle is enabled by default; when enabled, the Painter Low export
+evaluates Solidify Plus with the shell intact but temporarily sets `Fill Rim` to
+`False` for the export copy only, then restores the user's modifier settings
+immediately after export.
+
+Final Blender-to-Unreal export keeps the normal user-facing state, including
+`Fill Rim=True`, so the shipped mesh still contains the rim. This split exists
+to avoid a human-maintained pair of "Painter Low without rim" and "Final Low
+with rim" objects per asset. The one editable source object remains the truth;
+the export mode decides whether rim faces are included.
+
+Implementation rule:
+
+- Substance/Painter Low FBX with the default toggle enabled: Solidify Plus
+  evaluated, `Fill Rim=False`.
+- Substance/Painter Low FBX with the toggle disabled: current Blender state.
+- Final/Send to Unreal FBX: current Blender state, usually `Fill Rim=True`.
+- Never use "disable all modifiers" as the rimless Painter path; it drops the
+  back shell and changes the baking target.
+
 ## Validation Requirements
 
 Any large rewrite of protection logic, bake-plan logic, JSON request handling,
@@ -227,6 +259,9 @@ or Send to Unreal handoff logic needs at least one real end-to-end test:
 7. Confirm the expected `T_<texture_set>_<map>.png` maps are applied.
 8. Confirm the `Baking/low` hierarchy is linked into `Export` for Send to
    Unreal without duplicating or renaming Painter Low data.
+9. For any Low object using `Solidify Plus 1.41`, confirm the Painter Low FBX
+   has the inner/back shell but no filled rim faces, and the final Export path
+   still keeps the rim.
 
 This is especially important after large commits that rewrite protection logic.
 For example, if a branch contains a `d0f438c`-style rewrite, do not trust static

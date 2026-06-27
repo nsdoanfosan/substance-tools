@@ -147,8 +147,7 @@ def _normalized_resource_name(name):
     return str(name or "").lower().replace(" ", "").replace("_", "")
 
 
-def _export_preset_url(request):
-    requested_name = request.get("preset", "Unreal_V2")
+def _find_export_preset_url(requested_name):
     normalized_name = _normalized_resource_name(requested_name)
     preset = next(
         (
@@ -160,11 +159,48 @@ def _export_preset_url(request):
     )
     if preset is not None:
         return preset.resource_id.url()
+    return None
+
+
+def _export_preset_url(request):
+    requested_name = request.get("preset", "Unreal_V2")
+    preset_url = _find_export_preset_url(requested_name)
+    if preset_url:
+        return preset_url
 
     preset_path = Path(request.get("preset_path", ""))
     if preset_path.is_file():
-        return f"resource://your_assets/{preset_path.stem}"
-    return f"resource://your_assets/{requested_name}"
+        try:
+            substance_painter.resource.Shelves.refresh_all()
+            preset_url = _find_export_preset_url(requested_name)
+            if preset_url:
+                return preset_url
+        except Exception as error:
+            _log(f"Could not refresh Painter shelves for {requested_name}: {error}")
+
+        try:
+            resource = substance_painter.resource.import_session_resource(
+                str(preset_path),
+                substance_painter.resource.Usage.EXPORT,
+                name=requested_name,
+                group="SubstanceTools",
+            )
+            preset_url = resource.identifier().url()
+            _log(
+                f"Imported export preset {requested_name} into Painter session "
+                f"from {preset_path}"
+            )
+            return preset_url
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not load Painter export preset {requested_name} "
+                f"from {preset_path}: {error}"
+            ) from error
+
+    raise RuntimeError(
+        f"Painter export preset {requested_name} was not found, and preset_path "
+        f"is missing or invalid: {preset_path}"
+    )
 
 
 def _strip_texture_set_prefixes():

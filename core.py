@@ -22,6 +22,8 @@ PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
 EXPORT_PRESET_NAME = 'Unreal_V2'
 BACK_TEXTURE_SET_SUFFIX = '_back'
+SOLIDIFY_PLUS_NAME_PREFIX = 'Solidify Plus'
+SOLIDIFY_PLUS_FILL_RIM_SOCKET = 'Fill Rim'
 
 
 def clean_name(value):
@@ -550,6 +552,44 @@ def replace_socket_link(node_tree, from_socket, to_socket):
   node_tree.links.new(from_socket, to_socket)
 
 
+def node_has_links(node):
+  return any(socket.links for socket in node.inputs) or any(
+    socket.links for socket in node.outputs
+  )
+
+
+def image_path_exists(image):
+  source = image.filepath_raw or image.filepath
+  return bool(source and Path(bpy.path.abspath(source)).is_file())
+
+
+def stale_unlinked_image_nodes(material, preserve_images=None):
+  if material is None or material.node_tree is None:
+    return []
+  preserve_images = set(preserve_images or ())
+  stale_nodes = []
+  for node in material.node_tree.nodes:
+    if node.type != 'TEX_IMAGE' or node.image is None:
+      continue
+    if node.image in preserve_images:
+      continue
+    if node_has_links(node):
+      continue
+    if image_path_exists(node.image):
+      continue
+    stale_nodes.append(node)
+  return stale_nodes
+
+
+def remove_stale_unlinked_image_nodes(material, preserve_images=None):
+  if material is None or material.node_tree is None:
+    return 0
+  stale_nodes = stale_unlinked_image_nodes(material, preserve_images)
+  for node in stale_nodes:
+    material.node_tree.nodes.remove(node)
+  return len(stale_nodes)
+
+
 def _ensure_alpha_mix(material, principled, alpha_image=None):
   node_tree = material.node_tree
   base_color = principled.inputs.get('Base Color')
@@ -799,9 +839,9 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       image_node.image = normal_image
       normal_node = node_tree.nodes.get('Painter Normal') or node_tree.nodes.new('ShaderNodeNormalMap')
       normal_node.name = 'Painter Normal'
-      node_tree.links.new(image_node.outputs['Color'], normal_node.inputs['Color'])
+      replace_socket_link(node_tree, image_node.outputs['Color'], normal_node.inputs['Color'])
       for principled in principled_nodes:
-        node_tree.links.new(normal_node.outputs['Normal'], principled.inputs['Normal'])
+        replace_socket_link(node_tree, normal_node.outputs['Normal'], principled.inputs['Normal'])
     if images.get('Extra') is not None:
       extra_image = images['Extra']
       extra_image.colorspace_settings.name = 'Non-Color'
@@ -810,10 +850,10 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       image_node.image = extra_image
       separate = node_tree.nodes.get('Painter Extra Channels') or node_tree.nodes.new('ShaderNodeSeparateColor')
       separate.name = 'Painter Extra Channels'
-      node_tree.links.new(image_node.outputs['Color'], separate.inputs['Color'])
+      replace_socket_link(node_tree, image_node.outputs['Color'], separate.inputs['Color'])
       for principled in principled_nodes:
-        node_tree.links.new(separate.outputs['Green'], principled.inputs['Roughness'])
-        node_tree.links.new(separate.outputs['Blue'], principled.inputs['Metallic'])
+        replace_socket_link(node_tree, separate.outputs['Green'], principled.inputs['Roughness'])
+        replace_socket_link(node_tree, separate.outputs['Blue'], principled.inputs['Metallic'])
     if images.get('Emissive') is not None:
       emissive_image = images['Emissive']
       image_node = node_tree.nodes.get(emissive_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
@@ -822,7 +862,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       for principled in principled_nodes:
         emission = principled.inputs.get('Emission Color') or principled.inputs.get('Emission')
         if emission is not None:
-          node_tree.links.new(image_node.outputs['Color'], emission)
+          replace_socket_link(node_tree, image_node.outputs['Color'], emission)
     else:
       for principled in principled_nodes:
         clear_principled_emission(material, principled)
@@ -834,6 +874,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       image_node.image = height_image
       image_node.label = 'Painter Height'
     force_material_opaque(material)
+    remove_stale_unlinked_image_nodes(material, preserve_images=images.values())
   return applied
 
 
@@ -898,52 +939,125 @@ def add_high_id_preview_colors(source_objects):
     add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
 
 
-def duplicate_for_export(source_objects, collection, strip_material_prefix=False, id_source='NONE'):
+def solidify_plus_fill_rim_socket_id(modifier):
+  if modifier.type != 'NODES' or not modifier.name.startswith(SOLIDIFY_PLUS_NAME_PREFIX):
+    return None
+  node_group = getattr(modifier, 'node_group', None)
+  interface = getattr(node_group, 'interface', None)
+  items = getattr(interface, 'items_tree', ()) if interface is not None else ()
+  for item in items:
+    if (
+      getattr(item, 'item_type', None) == 'SOCKET'
+      and getattr(item, 'in_out', None) == 'INPUT'
+      and getattr(item, 'socket_type', None) == 'NodeSocketBool'
+      and item.name == SOLIDIFY_PLUS_FILL_RIM_SOCKET
+    ):
+      return getattr(item, 'identifier', None)
+  return None
+
+
+def set_solidify_plus_fill_rim(source_objects, enabled):
+  restore = []
+  for obj in source_objects:
+    for modifier in getattr(obj, 'modifiers', ()):
+      socket_id = solidify_plus_fill_rim_socket_id(modifier)
+      if not socket_id:
+        continue
+      had_value = socket_id in modifier.keys()
+      old_value = modifier.get(socket_id)
+      restore.append((obj, modifier, socket_id, had_value, old_value))
+      modifier[socket_id] = bool(enabled)
+      obj.update_tag(refresh={'DATA'})
+  if restore:
+    bpy.context.view_layer.update()
+  return restore
+
+
+def refresh_solidify_plus_modifier(obj, modifier):
+  obj.update_tag(refresh={'DATA'})
+  if modifier.show_viewport:
+    modifier.show_viewport = False
+    bpy.context.view_layer.update()
+    modifier.show_viewport = True
+  obj.update_tag(refresh={'DATA'})
+
+
+def restore_solidify_plus_fill_rim(restore):
+  for obj, modifier, socket_id, had_value, old_value in reversed(restore):
+    if had_value:
+      modifier[socket_id] = old_value
+    elif socket_id in modifier.keys():
+      del modifier[socket_id]
+    refresh_solidify_plus_modifier(obj, modifier)
+  if restore:
+    bpy.context.view_layer.update()
+
+
+def duplicate_for_export(
+  source_objects,
+  collection,
+  strip_material_prefix=False,
+  id_source='NONE',
+  solidify_plus_fill_rim=None,
+):
   depsgraph = bpy.context.evaluated_depsgraph_get()
   duplicates = []
   temporary_materials = []
   renamed_materials = []
   material_copies = {}
-  for source in source_objects:
-    evaluated = source.evaluated_get(depsgraph)
-    mesh = bpy.data.meshes.new_from_object(
-      evaluated,
-      preserve_all_data_layers=True,
-      depsgraph=depsgraph,
-    )
-    mesh.name = source.data.name
-    duplicate = bpy.data.objects.new(source.name, mesh)
-    duplicate.matrix_world = source.matrix_world.copy()
-    collection.objects.link(duplicate)
+  rim_restore = []
+  try:
+    if solidify_plus_fill_rim is not None:
+      rim_restore = set_solidify_plus_fill_rim(source_objects, solidify_plus_fill_rim)
+      depsgraph = bpy.context.evaluated_depsgraph_get()
+    for source in source_objects:
+      evaluated = source.evaluated_get(depsgraph)
+      mesh = bpy.data.meshes.new_from_object(
+        evaluated,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+      )
+      mesh.name = source.data.name
+      duplicate = bpy.data.objects.new(source.name, mesh)
+      duplicate.matrix_world = source.matrix_world.copy()
+      collection.objects.link(duplicate)
 
-    if strip_material_prefix:
-      for index, material in enumerate(list(mesh.materials)):
-        if material is None:
-          continue
-        if not material.name.startswith('M_'):
-          continue
-        copied = material_copies.get(material)
-        if copied is None:
-          target_name = stripped_material_name(material.name)
-          blocker = bpy.data.materials.get(target_name)
-          if blocker is not None and blocker is not material:
-            original_name = blocker.name
-            blocker.name = f'__SubstanceToolsBackup_{blocker.name}'
-            renamed_materials.append((blocker, original_name))
-          copied = material.copy()
-          copied.name = target_name
-          material_copies[material] = copied
-          temporary_materials.append(copied)
-        mesh.materials[index] = copied
+      if strip_material_prefix:
+        for index, material in enumerate(list(mesh.materials)):
+          if material is None:
+            continue
+          if not material.name.startswith('M_'):
+            continue
+          copied = material_copies.get(material)
+          if copied is None:
+            target_name = stripped_material_name(material.name)
+            blocker = bpy.data.materials.get(target_name)
+            if blocker is not None and blocker is not material:
+              original_name = blocker.name
+              blocker.name = f'__SubstanceToolsBackup_{blocker.name}'
+              renamed_materials.append((blocker, original_name))
+            copied = material.copy()
+            copied.name = target_name
+            material_copies[material] = copied
+            temporary_materials.append(copied)
+          mesh.materials[index] = copied
 
-    if id_source == 'FACE_SETS':
-      add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
-      add_high_id_colors(mesh, source.name)
-    duplicates.append(duplicate)
+      if id_source == 'FACE_SETS':
+        add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
+        add_high_id_colors(mesh, source.name)
+      duplicates.append(duplicate)
+  finally:
+    restore_solidify_plus_fill_rim(rim_restore)
   return duplicates, temporary_materials, renamed_materials
 
 
-def export_objects_to_fbx(source_objects, filepath, strip_material_prefix=False, id_source='NONE'):
+def export_objects_to_fbx(
+  source_objects,
+  filepath,
+  strip_material_prefix=False,
+  id_source='NONE',
+  solidify_plus_fill_rim=None,
+):
   filepath.parent.mkdir(parents=True, exist_ok=True)
   temporary_collection = bpy.data.collections.new('__SubstanceToolsExport')
   bpy.context.scene.collection.children.link(temporary_collection)
@@ -958,6 +1072,7 @@ def export_objects_to_fbx(source_objects, filepath, strip_material_prefix=False,
       temporary_collection,
       strip_material_prefix=strip_material_prefix,
       id_source=id_source,
+      solidify_plus_fill_rim=solidify_plus_fill_rim,
     )
     bpy.ops.object.select_all(action='DESELECT')
     for duplicate in duplicates:
@@ -1562,7 +1677,7 @@ def _hash_attribute_data(digest, attribute):
       break
 
 
-def _hash_modifier_summary(digest, obj):
+def _hash_modifier_summary(digest, obj, normalize_solidify_plus_fill_rim=False):
   for modifier in obj.modifiers:
     _hash_update_value(
       digest,
@@ -1585,6 +1700,23 @@ def _hash_modifier_summary(digest, obj):
         _hash_update_value(digest, (prop.identifier, value))
       elif hasattr(value, 'name'):
         _hash_update_value(digest, (prop.identifier, value.name))
+    fill_rim_socket = (
+      solidify_plus_fill_rim_socket_id(modifier)
+      if normalize_solidify_plus_fill_rim
+      else None
+    )
+    try:
+      id_property_keys = sorted(modifier.keys())
+    except TypeError:
+      id_property_keys = []
+    for key in id_property_keys:
+      value = False if key == fill_rim_socket else modifier[key]
+      if not isinstance(value, (str, int, float, bool)):
+        try:
+          value = list(value)
+        except TypeError:
+          value = str(value)
+      _hash_update_value(digest, ('id_property', key, value))
 
 
 def _hash_source_mesh_object(
@@ -1661,6 +1793,7 @@ def _hash_fast_mesh_signature(
   obj,
   strip_material_prefix=False,
   id_source='NONE',
+  normalize_solidify_plus_fill_rim=False,
 ):
   mesh = obj.data
   _hash_update_value(digest, ('object', obj.name, obj.type, id_source))
@@ -1763,18 +1896,34 @@ def _hash_fast_mesh_signature(
         attribute.data.foreach_get('value', values)
         digest.update(b'face_set_value\0')
         digest.update(values.tobytes())
-  _hash_modifier_summary(digest, obj)
+  _hash_modifier_summary(
+    digest,
+    obj,
+    normalize_solidify_plus_fill_rim=normalize_solidify_plus_fill_rim,
+  )
 
 
-def fast_content_hash(source_objects, strip_material_prefix=False, id_source='NONE'):
+def fast_content_hash(
+  source_objects,
+  strip_material_prefix=False,
+  id_source='NONE',
+  normalize_solidify_plus_fill_rim=False,
+):
   digest = hashlib.sha256()
-  for obj in sorted(source_objects, key=lambda item: item.name_full):
-    _hash_fast_mesh_signature(
-      digest,
-      obj,
-      strip_material_prefix=strip_material_prefix,
-      id_source=id_source,
-    )
+  rim_restore = []
+  try:
+    if normalize_solidify_plus_fill_rim:
+      rim_restore = set_solidify_plus_fill_rim(source_objects, False)
+    for obj in sorted(source_objects, key=lambda item: item.name_full):
+      _hash_fast_mesh_signature(
+        digest,
+        obj,
+        strip_material_prefix=strip_material_prefix,
+        id_source=id_source,
+        normalize_solidify_plus_fill_rim=normalize_solidify_plus_fill_rim,
+      )
+  finally:
+    restore_solidify_plus_fill_rim(rim_restore)
   return digest.hexdigest()
 
 

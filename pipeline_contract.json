@@ -42,6 +42,15 @@
       "note": "This suffix exists for PAIRING across roles, not for deciding which collection an object belongs to (that is collection membership)."
     }
   },
+  "solidify_plus_rim_handling": {
+    "status": "implemented_for_painter_low_export_with_default_on_toggle",
+    "modifier_name_pattern": "Solidify Plus 1.41",
+    "ui_toggle": "Scene.substance_tools_baking.painter_low_hide_solidify_rim / Hide Solidify Rim in Painter Low, default True",
+    "painter_low_fbx_rule": "When the toggle is enabled, evaluate Solidify Plus so the generated inner/back shell remains, but temporarily export the copy with Fill Rim set to False so rim side faces are not sent to Painter. When disabled, export the current Blender state.",
+    "final_export_rule": "Keep the current Blender/user-facing state for final Send to Unreal export, normally including Fill Rim=True.",
+    "do_not": "Do not disable Solidify/modifiers as the Painter rimless path. That removes the generated inner/back shell and changes the intended baking target.",
+    "reason": "Filled rim faces can affect ray projection and mesh-map/smart-material masks in Painter. The final asset still needs the rim, so the export mode must split rim inclusion automatically instead of requiring separate manually maintained Low meshes."
+  },
   "json_ipc": {
     "poll_interval_seconds": 0.5,
     "atomic_write": "each file is written to a '.<name>.tmp' sibling then os.replace()d into place",

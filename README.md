@@ -143,6 +143,13 @@ FBX file bytes), so editing one asset doesn't force a full re-bake.
     required Low reimport.
 
   If Painter is closed it is launched on the existing project first.
+
+  The default **Hide Solidify Rim in Painter Low** toggle handles `Solidify Plus
+  1.41` shells by sending Painter the evaluated shell without filled rim faces;
+  final Send to Unreal export still keeps the rim. Do not disable Solidify for
+  Painter just to remove the rim, because that also removes the generated
+  inner/back shell. See [Solidify Plus Rim Handling](docs/pipeline_contract.md#solidify-plus-rim-handling)
+  for the rationale.
 - **Export Painter Textures & Apply** (enabled once the project exists) — asks
   the open project to export with the `Unreal_V2` preset, waits (5-minute
   timeout), reloads the maps, and connects **Color, Normal, packed Extra,
