@@ -339,6 +339,20 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       )
       return {'CANCELLED'}
 
+    painter_path = get_preferences(context)['painter_path']
+    if not painter_path or not Path(painter_path).is_file():
+      self.report({'ERROR'}, 'Set a valid Substance Painter executable in add-on preferences')
+      return {'CANCELLED'}
+    template_path = None
+    if self.action == 'CREATE':
+      template_path = unreal_template_path(painter_path)
+      if not template_path.is_file():
+        self.report(
+          {'ERROR'},
+          f'Painter Unreal Engine template was not found: {template_path}',
+        )
+        return {'CANCELLED'}
+
     for directory in (paths['low_dir'], paths['high_dir'], paths['texture_dir']):
       directory.mkdir(parents=True, exist_ok=True)
 
@@ -644,20 +658,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     for request_path in request_paths:
       write_json(request_path, request)
 
-    painter_path = get_preferences(context)['painter_path']
-    if not painter_path or not Path(painter_path).is_file():
-      self.report({'ERROR'}, 'Set a valid Substance Painter executable in add-on preferences')
-      return {'CANCELLED'}
-
     try:
       if self.action == 'CREATE':
-        template_path = unreal_template_path(painter_path)
-        if not template_path.is_file():
-          self.report(
-            {'ERROR'},
-            f'Painter Unreal Engine template was not found: {template_path}',
-          )
-          return {'CANCELLED'}
         request['template'] = str(template_path)
         for request_path in request_paths:
           write_json(request_path, request)
@@ -669,6 +671,10 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       elif not painter_is_running(painter_path):
         subprocess.Popen([painter_path, str(paths['spp'])])
     except Exception as error:
+      for request_path in request_paths:
+        request_path.unlink(missing_ok=True)
+      if self.action == 'CREATE':
+        pending_request_path().unlink(missing_ok=True)
       self.report({'ERROR'}, f'Error opening Substance Painter: {error}')
       return {'CANCELLED'}
 
@@ -1231,6 +1237,10 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if not collection_meshes(low_collection):
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
+    painter_path = get_preferences(context)['painter_path']
+    if not painter_path or not Path(painter_path).is_file():
+      self.report({'ERROR'}, 'Set a valid Substance Painter executable')
+      return {'CANCELLED'}
     props = context.scene.substance_tools_baking
     preset_name = painter_export_preset_name(props.painter_export_preset)
     try:
@@ -1255,12 +1265,13 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       'inline_presets': painter_inline_export_preset_variants(preset_name),
     })
 
-    painter_path = get_preferences(context)['painter_path']
-    if not painter_path or not Path(painter_path).is_file():
-      self.report({'ERROR'}, 'Set a valid Substance Painter executable')
-      return {'CANCELLED'}
     if not painter_is_running(painter_path):
-      subprocess.Popen([painter_path, str(paths['spp'])])
+      try:
+        subprocess.Popen([painter_path, str(paths['spp'])])
+      except Exception as error:
+        request_path.unlink(missing_ok=True)
+        self.report({'ERROR'}, f'Could not open Substance Painter: {error}')
+        return {'CANCELLED'}
 
     self._deadline = time.time() + self.TIMEOUT_SECONDS
     self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
