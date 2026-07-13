@@ -24,6 +24,12 @@ REQUEST_FILENAME = ".substance_tools_request.json"
 PENDING_REQUEST_FILENAME = "pending_request.json"
 EXPORT_REQUEST_FILENAME = ".substance_tools_export_request.json"
 EXPORT_RESULT_FILENAME = ".substance_tools_export_result.json"
+CLOTH_EXPORT_PRESET_NAME = "Unreal_V2_Cloth"
+CLOTH_EXPORT_CHANNELS = (
+    ("SheenColor", "sRGB8"),
+    ("SheenOpacity", "L8"),
+    ("SheenRoughness", "L8"),
+)
 METADATA_CONTEXT = "SubstanceToolsBlender"
 _started = False
 _processing = False
@@ -203,6 +209,131 @@ def _export_preset_url(request):
     )
 
 
+def _export_preset_candidates(request):
+    inline_presets = request.get("inline_presets") or []
+    inline_candidates = [
+        preset
+        for preset in inline_presets
+        if isinstance(preset, dict) and preset.get("maps")
+    ]
+    candidates = []
+    try:
+        candidates.append(_export_preset_url(request))
+    except RuntimeError:
+        if not inline_candidates:
+            raise
+    candidates.extend(inline_candidates)
+    return candidates
+
+
+def _export_textures_with_preset(request, export_list, preset):
+    config = {
+        "exportShaderParams": False,
+        "exportPath": request["texture_dir"],
+        "exportList": export_list,
+        "exportParameters": [{
+            "parameters": {
+                "fileFormat": "png",
+                "bitDepth": "8",
+                "dithering": False,
+                "paddingAlgorithm": "infinite",
+            }
+        }],
+    }
+    if isinstance(preset, dict):
+        preset_name = str(preset.get("name") or request.get("preset") or "SubstanceToolsExport")
+        config["defaultExportPreset"] = preset_name
+        config["exportPresets"] = [preset]
+    else:
+        config["defaultExportPreset"] = preset
+    return substance_painter.export.export_project_textures(config)
+
+
+def _is_cloth_export_request(request):
+    if str(request.get("preset") or "") == CLOTH_EXPORT_PRESET_NAME:
+        return True
+    for preset in request.get("inline_presets") or []:
+        if isinstance(preset, dict) and str(preset.get("name") or "") == CLOTH_EXPORT_PRESET_NAME:
+            return True
+    return False
+
+
+def _enum_member(enum_type, name):
+    value = getattr(enum_type, name, None)
+    if value is None:
+        members = getattr(enum_type, "__members__", {})
+        value = members.get(name)
+    if value is None:
+        raise RuntimeError(f"Painter enum member is missing: {enum_type}.{name}")
+    return value
+
+
+def _stack_root_path(texture_set, stack):
+    stack_name = stack.name()
+    return f"{texture_set.name}/{stack_name}" if stack_name else str(texture_set.name)
+
+
+def _ensure_cloth_export_channels(request):
+    if not _is_cloth_export_request(request):
+        return None
+
+    audit = {
+        "preset": CLOTH_EXPORT_PRESET_NAME,
+        "required": [name for name, _format_name in CLOTH_EXPORT_CHANNELS],
+        "added": [],
+        "already_enabled": [],
+    }
+    errors = []
+
+    for texture_set in substance_painter.textureset.all_texture_sets():
+        for stack in texture_set.all_stacks():
+            root_path = _stack_root_path(texture_set, stack)
+            for channel_name, format_name in CLOTH_EXPORT_CHANNELS:
+                try:
+                    channel_type = _enum_member(
+                        substance_painter.textureset.ChannelType,
+                        channel_name,
+                    )
+                    if stack.has_channel(channel_type):
+                        audit["already_enabled"].append({
+                            "rootPath": root_path,
+                            "channel": channel_name,
+                        })
+                        continue
+                    channel_format = _enum_member(
+                        substance_painter.textureset.ChannelFormat,
+                        format_name,
+                    )
+                    stack.add_channel(channel_type, channel_format)
+                    audit["added"].append({
+                        "rootPath": root_path,
+                        "channel": channel_name,
+                        "format": format_name,
+                    })
+                except Exception as error:
+                    errors.append(f"{root_path}:{channel_name}: {error}")
+
+    if errors:
+        audit["errors"] = errors
+        raise RuntimeError(
+            "Could not enable required Painter cloth channels: "
+            + "; ".join(errors)
+        )
+
+    if audit["added"]:
+        substance_painter.project.save()
+        _log(
+            "Enabled Painter cloth channel(s): "
+            + ", ".join(
+                f"{item['rootPath']}:{item['channel']}"
+                for item in audit["added"]
+            )
+        )
+    else:
+        _log("Painter cloth channels already enabled")
+    return audit
+
+
 def _strip_texture_set_prefixes():
     texture_sets = substance_painter.textureset.all_texture_sets()
     current_names = {str(texture_set.name) for texture_set in texture_sets}
@@ -336,8 +467,8 @@ def _process_export_request():
     _export_processing = True
     result_path = Path(request["texture_dir"]) / EXPORT_RESULT_FILENAME
     try:
-        preset_url = _export_preset_url(request)
         _normalize_texture_set_names()
+        channel_audit = _ensure_cloth_export_channels(request)
         export_list = []
         for texture_set in substance_painter.textureset.all_texture_sets():
             for stack in texture_set.all_stacks():
@@ -348,17 +479,20 @@ def _process_export_request():
                     else texture_set.name
                 )
                 export_list.append({"rootPath": root_path})
-        result = substance_painter.export.export_project_textures({
-            "exportShaderParams": False,
-            "exportPath": request["texture_dir"],
-            "defaultExportPreset": preset_url,
-            "exportList": export_list,
-            "exportParameters": [{
-                "parameters": {
-                    "paddingAlgorithm": "infinite",
-                }
-            }],
-        })
+        errors = []
+        result = None
+        for preset in _export_preset_candidates(request):
+            try:
+                result = _export_textures_with_preset(request, export_list, preset)
+            except Exception as error:
+                errors.append(str(error))
+                continue
+            status_name = getattr(result.status, "name", str(result.status))
+            if status_name.lower() == "success":
+                break
+            errors.append(result.message)
+        if result is None:
+            raise RuntimeError("; ".join(errors) or "No Painter export preset candidate worked")
         status_name = getattr(result.status, "name", str(result.status))
         success = status_name.lower() == "success"
         _write_json(result_path, {
@@ -369,6 +503,7 @@ def _process_export_request():
                 "/".join(key): value
                 for key, value in result.textures.items()
             },
+            "channel_audit": channel_audit,
         })
         _log(
             f"Unreal_V2 texture export {'completed' if success else 'failed'}"

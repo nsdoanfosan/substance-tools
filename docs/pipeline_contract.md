@@ -10,7 +10,7 @@ hardest kind of bug to debug. Treat this file and `pipeline_contract.json` as
 the source of truth before changing any pipeline-facing names.
 
 Sections below separate **Current behavior** (verified against the code on
-2026-06-24) from **Target direction** (what we want but have not built yet).
+2026-06-27) from **Target direction** (what we want but have not built yet).
 Do not read a target as if it were current behavior. When the code changes,
 re-verify and update this file and `pipeline_contract.json` together.
 
@@ -27,7 +27,7 @@ two.
 
 ## Shared Conventions (Current behavior)
 
-Verified against the code on 2026-06-24.
+Verified against the code on 2026-06-27.
 
 Collections. Role is decided by COLLECTION MEMBERSHIP, not by object name:
 
@@ -142,7 +142,7 @@ files. Painter polls every `0.5` seconds (`QTimer.setInterval(500)`). Every file
 is written to a `.<name>.tmp` sibling and then `os.replace()`d into place, so a
 reader never sees a half-written file.
 
-### Current behavior (verified 2026-06-24)
+### Current behavior (verified 2026-06-27)
 
 The files are NOT all in one folder:
 

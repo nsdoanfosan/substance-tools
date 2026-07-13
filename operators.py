@@ -1231,11 +1231,15 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if not collection_meshes(low_collection):
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
+    props = context.scene.substance_tools_baking
+    preset_name = painter_export_preset_name(props.painter_export_preset)
     try:
-      preset_path = ensure_painter_export_preset()
+      preset_path = ensure_painter_export_preset(preset_name)
     except Exception as error:
-      self.report({'ERROR'}, f'Painter export preset install failed: {error}')
-      return {'CANCELLED'}
+      preset_path = None
+      if not painter_inline_export_preset_variants(preset_name):
+        self.report({'ERROR'}, f'Painter export preset install failed: {error}')
+        return {'CANCELLED'}
 
     self._request_id = str(time.time_ns())
     request_path = paths['texture_dir'] / PAINTER_EXPORT_REQUEST
@@ -1246,8 +1250,9 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       'request_id': self._request_id,
       'spp': str(paths['spp'].resolve()),
       'texture_dir': str(paths['texture_dir'].resolve()),
-      'preset': EXPORT_PRESET_NAME,
-      'preset_path': str(preset_path.resolve()),
+      'preset': preset_name,
+      'preset_path': str(preset_path.resolve()) if preset_path else '',
+      'inline_presets': painter_inline_export_preset_variants(preset_name),
     })
 
     painter_path = get_preferences(context)['painter_path']

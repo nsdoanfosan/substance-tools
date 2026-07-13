@@ -14,6 +14,7 @@ from .core import (
   alpha_target_material_items,
   ensure_baking_collections_deferred,
   ensure_baking_collections_on_load,
+  sync_exclusive_baking_roles_on_depsgraph,
 )
 from .operators import (
   BakeAllInPainterOperator,
@@ -63,6 +64,17 @@ classes = (
 )
 
 
+def remove_handler_by_name(handler_list, handler):
+  handler_name = getattr(handler, '__name__', '')
+  handler_module = getattr(handler, '__module__', '')
+  for existing in list(handler_list):
+    if (
+      getattr(existing, '__name__', '') == handler_name
+      and getattr(existing, '__module__', '') == handler_module
+    ):
+      handler_list.remove(existing)
+
+
 def register():
   for c in classes:
     bpy.utils.register_class(c)
@@ -77,8 +89,16 @@ def register():
   bpy.types.Scene.substance_tools_bake_selection = bpy.props.CollectionProperty(
     type=TextureSetBakeItem
   )
-  if ensure_baking_collections_on_load not in bpy.app.handlers.load_post:
-    bpy.app.handlers.load_post.append(ensure_baking_collections_on_load)
+  remove_handler_by_name(
+    bpy.app.handlers.load_post,
+    ensure_baking_collections_on_load,
+  )
+  bpy.app.handlers.load_post.append(ensure_baking_collections_on_load)
+  remove_handler_by_name(
+    bpy.app.handlers.depsgraph_update_post,
+    sync_exclusive_baking_roles_on_depsgraph,
+  )
+  bpy.app.handlers.depsgraph_update_post.append(sync_exclusive_baking_roles_on_depsgraph)
   if not bpy.app.timers.is_registered(ensure_baking_collections_deferred):
     bpy.app.timers.register(ensure_baking_collections_deferred, first_interval=0.0)
 
@@ -86,8 +106,14 @@ def register():
 def unregister():
   if bpy.app.timers.is_registered(ensure_baking_collections_deferred):
     bpy.app.timers.unregister(ensure_baking_collections_deferred)
-  if ensure_baking_collections_on_load in bpy.app.handlers.load_post:
-    bpy.app.handlers.load_post.remove(ensure_baking_collections_on_load)
+  remove_handler_by_name(
+    bpy.app.handlers.depsgraph_update_post,
+    sync_exclusive_baking_roles_on_depsgraph,
+  )
+  remove_handler_by_name(
+    bpy.app.handlers.load_post,
+    ensure_baking_collections_on_load,
+  )
   if hasattr(bpy.types.Scene, 'substance_tools_bake_selection'):
     del bpy.types.Scene.substance_tools_bake_selection
   if hasattr(bpy.types.Scene, 'substance_tools_baking'):

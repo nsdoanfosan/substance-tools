@@ -128,6 +128,9 @@ class SubstanceToolsPanel(bpy.types.Panel):
       text='Strip M_ Prefix',
       icon='SORTALPHA',
     )
+    preset_row = baking_box.row()
+    preset_row.enabled = painter_project_exists
+    preset_row.prop(baking, 'painter_export_preset')
     export_row = baking_box.row()
     export_row.enabled = painter_project_exists
     export_row.operator(

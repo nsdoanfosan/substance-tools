@@ -1,6 +1,6 @@
 import bpy
 
-from .core import ADDON_MODULE_NAME, _DETECTED_PAINTER_PATH
+from .core import ADDON_MODULE_NAME, _DETECTED_PAINTER_PATH, painter_export_preset_items
 class TextureSetBakeItem(bpy.types.PropertyGroup):
   name: bpy.props.StringProperty()
   bake: bpy.props.BoolProperty(name='Bake', default=True)
@@ -90,6 +90,12 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
       ('BAKING', 'Baking', 'Use the High-to-Low baked Base Color'),
     ],
     default='BAKING',
+  )
+  painter_export_preset: bpy.props.EnumProperty(
+    name='Export Preset',
+    description='Painter export preset used by Export Painter Textures & Apply',
+    items=painter_export_preset_items(),
+    default='UNREAL_V2',
   )
 
 class SubstanceToolsPreferences(bpy.types.AddonPreferences):

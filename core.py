@@ -5,25 +5,47 @@ import json
 from array import array
 from collections import defaultdict
 from pathlib import Path
+from .pipeline_contract import collection_name, naming_value
 
 ADDON_MODULE_NAME = __package__.split('.')[0] if __package__ else __name__
 # @Util
 
-BAKING_COLLECTION = 'Baking'
-LOW_COLLECTION = 'low'
-HIGH_COLLECTION = 'high'
-ALPHA_COLLECTION = 'alpha'
+BAKING_COLLECTION = collection_name('baking_root', 'Baking')
+LOW_COLLECTION = collection_name('low', 'low')
+HIGH_COLLECTION = collection_name('high', 'high')
+ALPHA_COLLECTION = collection_name('alpha', 'alpha')
 # Send to Unreal (send2ue) export set: ToolInfo.EXPORT_COLLECTION = 'Export'.
-SEND2UE_EXPORT_COLLECTION = 'Export'
+SEND2UE_EXPORT_COLLECTION = collection_name('send_to_unreal_export', 'Export')
+COLLECTION_ROLE_PROPERTY = 'substance_tools_role'
 PAINTER_REQUEST = '.substance_tools_request.json'
 BAKE_PLAN = '.substance_tools_bake_plan.json'
 PENDING_REQUEST = 'pending_request.json'
 PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
-EXPORT_PRESET_NAME = 'Unreal_V2'
-BACK_TEXTURE_SET_SUFFIX = '_back'
+EXPORT_PRESET_NAME = naming_value('painter_export_preset', 'Unreal_V2')
+CLOTH_EXPORT_PRESET_NAME = naming_value('painter_cloth_export_preset', 'Unreal_V2_Cloth')
+MATERIAL_PREFIX = naming_value('material_prefix', 'M_')
+TEXTURE_PREFIX = naming_value('texture_prefix', 'T_')
+BACK_TEXTURE_SET_SUFFIX = naming_value('back_texture_set_suffix', '_back')
 SOLIDIFY_PLUS_NAME_PREFIX = 'Solidify Plus'
 SOLIDIFY_PLUS_FILL_RIM_SOCKET = 'Fill Rim'
+PAINTER_EXPORT_PRESET_ITEMS = (
+  ('UNREAL_V2', EXPORT_PRESET_NAME, 'Color, Normal, packed Extra, Emissive, Height'),
+  (
+    'UNREAL_V2_CLOTH',
+    CLOTH_EXPORT_PRESET_NAME,
+    'Unreal V2 plus Sheen Color, Sheen Opacity, Sheen Roughness',
+  ),
+)
+PAINTER_TEXTURE_ROLES = ('Color', 'Extra', 'Normal', 'Emissive', 'Height')
+PAINTER_CLOTH_TEXTURE_ROLES = PAINTER_TEXTURE_ROLES + (
+  'SheenColor',
+  'SheenOpacity',
+  'SheenRoughness',
+)
+BAKING_ROLE_COLLECTIONS = (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION)
+_BAKING_ROLE_MEMBERSHIP = {}
+_BAKING_ROLE_SYNCING = False
 
 
 def clean_name(value):
@@ -35,6 +57,45 @@ def fbx_filename_from_object_name(value):
   value = re.sub(r'[<>:"/\\|?*]+', '_', str(value or '')).strip()
   value = value.rstrip('. ')
   return value or 'Object'
+
+
+def collection_role(collection):
+  if collection is None:
+    return None
+  role = collection.get(COLLECTION_ROLE_PROPERTY)
+  if role in BAKING_ROLE_COLLECTIONS:
+    return role
+  name = collection.name.casefold()
+  for role_name in BAKING_ROLE_COLLECTIONS:
+    if name == role_name.casefold():
+      return role_name
+  return None
+
+
+def find_baking_role_child(root, role_name):
+  if root is None:
+    return None
+  for child in root.children:
+    if collection_role(child) == role_name:
+      child[COLLECTION_ROLE_PROPERTY] = role_name
+      return child
+  return None
+
+
+def ensure_baking_role_child(root, role_name):
+  child = find_baking_role_child(root, role_name)
+  if child is not None:
+    return child
+
+  existing = bpy.data.collections.get(role_name)
+  if existing is not None and existing.users == 0:
+    child = existing
+  else:
+    child = bpy.data.collections.new(role_name)
+  child[COLLECTION_ROLE_PROPERTY] = role_name
+  if child.name not in {collection.name for collection in root.children}:
+    root.children.link(child)
+  return child
 
 
 def ensure_baking_collections(scene=None):
@@ -52,12 +113,7 @@ def ensure_baking_collections(scene=None):
 
   children = {}
   for name in (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION):
-    collection = bpy.data.collections.get(name)
-    if collection is None:
-      collection = bpy.data.collections.new(name)
-    if collection.name not in {child.name for child in root.children}:
-      root.children.link(collection)
-    children[name] = collection
+    children[name] = ensure_baking_role_child(root, name)
   return (
     root,
     children[LOW_COLLECTION],
@@ -66,12 +122,132 @@ def ensure_baking_collections(scene=None):
   )
 
 
+def baking_role_children(scene=None):
+  root, low_collection, high_collection, alpha_collection = get_baking_collections()
+  if root is None and scene is not None:
+    root = bpy.data.collections.get(BAKING_COLLECTION)
+  if root is None:
+    return None, {}
+
+  roles = {
+    LOW_COLLECTION: [],
+    HIGH_COLLECTION: [],
+    ALPHA_COLLECTION: [],
+  }
+  for child in root.children:
+    role = collection_role(child)
+    if role in roles:
+      child[COLLECTION_ROLE_PROPERTY] = role
+      roles[role].append(child)
+  for role, collection in (
+    (LOW_COLLECTION, low_collection),
+    (HIGH_COLLECTION, high_collection),
+    (ALPHA_COLLECTION, alpha_collection),
+  ):
+    if collection is not None and collection not in roles[role]:
+      roles[role].append(collection)
+  return root, roles
+
+
+def object_baking_roles(obj, roles):
+  memberships = set()
+  object_collections = set(obj.users_collection)
+  for role, collections in roles.items():
+    for collection in collections:
+      if collection in object_collections:
+        memberships.add(role)
+        break
+  return memberships
+
+
+def unlink_from_export_preserving_visibility(obj, export_collection, scene=None):
+  if export_collection is None or export_collection not in obj.users_collection:
+    return False
+  if scene is None:
+    scene = getattr(bpy.context, 'scene', None)
+  if len(obj.users_collection) <= 1 and scene is not None:
+    scene.collection.objects.link(obj)
+  try:
+    export_collection.objects.unlink(obj)
+    return True
+  except RuntimeError:
+    return False
+
+
+def remember_baking_role_membership(scene=None):
+  global _BAKING_ROLE_MEMBERSHIP
+  _, roles = baking_role_children(scene)
+  if not roles:
+    _BAKING_ROLE_MEMBERSHIP = {}
+    return
+  tracked = {}
+  for obj in bpy.data.objects:
+    memberships = object_baking_roles(obj, roles)
+    if memberships:
+      tracked[obj.as_pointer()] = memberships
+  _BAKING_ROLE_MEMBERSHIP = tracked
+
+
+def sync_exclusive_baking_roles(scene=None):
+  global _BAKING_ROLE_MEMBERSHIP, _BAKING_ROLE_SYNCING
+  if _BAKING_ROLE_SYNCING:
+    return
+  _, roles = baking_role_children(scene)
+  if not roles:
+    return
+
+  role_priority = (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION)
+  export_collection = bpy.data.collections.get(SEND2UE_EXPORT_COLLECTION)
+  _BAKING_ROLE_SYNCING = True
+  try:
+    next_membership = {}
+    for obj in bpy.data.objects:
+      previous = _BAKING_ROLE_MEMBERSHIP.get(obj.as_pointer(), set())
+      memberships = object_baking_roles(obj, roles)
+      if len(memberships) > 1:
+        new_roles = [role for role in role_priority if role in memberships - previous]
+        if new_roles:
+          keep_role = new_roles[-1]
+        else:
+          keep_role = next(
+            role for role in reversed(role_priority)
+            if role in memberships
+          )
+        for role, collections in roles.items():
+          if role == keep_role:
+            continue
+          for collection in collections:
+            if collection in obj.users_collection and len(obj.users_collection) > 1:
+              try:
+                collection.objects.unlink(obj)
+              except RuntimeError:
+                pass
+        memberships = object_baking_roles(obj, roles)
+      if (
+        export_collection is not None
+        and export_collection in obj.users_collection
+        and (
+          HIGH_COLLECTION in memberships
+          or ALPHA_COLLECTION in memberships
+          or (LOW_COLLECTION in previous and LOW_COLLECTION not in memberships)
+        )
+      ):
+        unlink_from_export_preserving_visibility(obj, export_collection, scene)
+      if memberships:
+        next_membership[obj.as_pointer()] = memberships
+    _BAKING_ROLE_MEMBERSHIP = next_membership
+  finally:
+    _BAKING_ROLE_SYNCING = False
+
+
 @bpy.app.handlers.persistent
 def ensure_baking_collections_on_load(_unused):
   for scene in bpy.data.scenes:
     _, low_collection, _, _ = ensure_baking_collections(scene)
     if low_collection is not None:
       sync_bake_selection(scene, low_texture_set_names(collection_meshes(low_collection)))
+    sync_exclusive_baking_roles(scene)
+  remember_baking_role_membership()
 
 
 def ensure_baking_collections_deferred():
@@ -79,7 +255,14 @@ def ensure_baking_collections_deferred():
     _, low_collection, _, _ = ensure_baking_collections(scene)
     if low_collection is not None:
       sync_bake_selection(scene, low_texture_set_names(collection_meshes(low_collection)))
+    sync_exclusive_baking_roles(scene)
+  remember_baking_role_membership()
   return None
+
+
+@bpy.app.handlers.persistent
+def sync_exclusive_baking_roles_on_depsgraph(_scene, _depsgraph):
+  sync_exclusive_baking_roles(_scene)
 
 
 def get_baking_collections():
@@ -88,11 +271,18 @@ def get_baking_collections():
   Use this in UI draw code: a load handler and a deferred timer already create
   the collections, and Blender discourages modifying data during draw().
   """
+  root = bpy.data.collections.get(BAKING_COLLECTION)
+  children = {}
+  if root is not None:
+    for child in root.children:
+      role = collection_role(child)
+      if role in BAKING_ROLE_COLLECTIONS and role not in children:
+        children[role] = child
   return (
-    bpy.data.collections.get(BAKING_COLLECTION),
-    bpy.data.collections.get(LOW_COLLECTION),
-    bpy.data.collections.get(HIGH_COLLECTION),
-    bpy.data.collections.get(ALPHA_COLLECTION),
+    root,
+    children.get(LOW_COLLECTION),
+    children.get(HIGH_COLLECTION),
+    children.get(ALPHA_COLLECTION),
   )
 
 
@@ -100,15 +290,7 @@ def painter_low_export_hierarchy():
   """Return the low meshes, parent chains, and Armature modifier rigs."""
   low_objects = set()
   baking_collection = bpy.data.collections.get(BAKING_COLLECTION)
-  low_collection = None
-  if baking_collection is not None:
-    low_collection = next(
-      (
-        child for child in baking_collection.children
-        if child.name == LOW_COLLECTION
-      ),
-      None,
-    )
+  low_collection = find_baking_role_child(baking_collection, LOW_COLLECTION)
 
   if low_collection is not None:
     for obj in low_collection.all_objects:
@@ -176,6 +358,90 @@ def baking_paths():
     'spp': texture_dir / f'{asset}_SP.spp',
     'bake_plan': texture_dir / BAKE_PLAN,
   }
+
+
+def painter_export_preset_items():
+  return tuple(
+    (identifier, name, description)
+    for identifier, name, description in PAINTER_EXPORT_PRESET_ITEMS
+  )
+
+
+def painter_export_preset_name(identifier):
+  for item_identifier, name, _description in PAINTER_EXPORT_PRESET_ITEMS:
+    if identifier == item_identifier:
+      return name
+  return EXPORT_PRESET_NAME
+
+
+def _export_channel(dest_channel, src_map_name, src_channel=None, src_map_type='documentMap'):
+  return {
+    'destChannel': dest_channel,
+    'srcChannel': src_channel or dest_channel,
+    'srcMapType': src_map_type,
+    'srcMapName': src_map_name,
+  }
+
+
+def _export_map_parameters():
+  return {
+    'fileFormat': 'png',
+    'bitDepth': '8',
+    'dithering': False,
+  }
+
+
+def _export_rgb_map(file_name, src_map_name, src_map_type='documentMap'):
+  return {
+    'fileName': file_name,
+    'parameters': _export_map_parameters(),
+    'channels': [
+      _export_channel('R', src_map_name, src_map_type=src_map_type),
+      _export_channel('G', src_map_name, src_map_type=src_map_type),
+      _export_channel('B', src_map_name, src_map_type=src_map_type),
+    ],
+  }
+
+
+def _export_luminance_map(file_name, src_map_name, src_map_type='documentMap'):
+  return {
+    'fileName': file_name,
+    'parameters': _export_map_parameters(),
+    'channels': [
+      _export_channel('L', src_map_name, src_channel='L', src_map_type=src_map_type),
+    ],
+  }
+
+
+def _unreal_v2_inline_maps():
+  return [
+    _export_rgb_map('$textureSet_Color', 'baseColor'),
+    _export_rgb_map('$textureSet_Normal', 'Normal_DirectX', src_map_type='virtualMap'),
+    {
+      'fileName': '$textureSet_Extra',
+      'parameters': _export_map_parameters(),
+      'channels': [
+        _export_channel('R', 'AO_Mixed', src_channel='L', src_map_type='virtualMap'),
+        _export_channel('G', 'roughness', src_channel='L'),
+        _export_channel('B', 'metallic', src_channel='L'),
+      ],
+    },
+    _export_rgb_map('$textureSet_Emissive', 'emissive'),
+    _export_luminance_map('$textureSet_Height', 'height'),
+  ]
+
+
+def painter_inline_export_preset_variants(name):
+  if name != CLOTH_EXPORT_PRESET_NAME:
+    return ()
+  return ({
+    'name': name,
+    'maps': _unreal_v2_inline_maps() + [
+      _export_rgb_map('$textureSet_SheenColor', 'sheencolor'),
+      _export_luminance_map('$textureSet_SheenOpacity', 'sheenopacity'),
+      _export_luminance_map('$textureSet_SheenRoughness', 'sheenroughness'),
+    ],
+  },)
 
 
 def bundled_export_preset_path(name=EXPORT_PRESET_NAME):
@@ -269,7 +535,7 @@ def collection_meshes(collection):
 
 
 def stripped_material_name(name):
-  return name[2:] if name.startswith('M_') else name
+  return name[len(MATERIAL_PREFIX):] if name.startswith(MATERIAL_PREFIX) else name
 
 
 def stable_color(value):
@@ -810,8 +1076,8 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
   for material in materials:
     texture_set = clean_name(stripped_material_name(material.name))
     paths = {
-      role: texture_dir / f'T_{texture_set}_{role}.png'
-      for role in ('Color', 'Extra', 'Normal', 'Emissive', 'Height')
+      role: texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png'
+      for role in PAINTER_CLOTH_TEXTURE_ROLES
     }
     images = {
       role: load_or_reload_image(path)
@@ -873,6 +1139,51 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       image_node.name = height_image.name
       image_node.image = height_image
       image_node.label = 'Painter Height'
+    if images.get('SheenColor') is not None:
+      sheen_color_image = images['SheenColor']
+      image_node = node_tree.nodes.get(sheen_color_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = sheen_color_image.name
+      image_node.image = sheen_color_image
+      image_node.label = 'Painter Sheen Color'
+      for principled in principled_nodes:
+        sheen_color = (
+          principled.inputs.get('Sheen Tint')
+          or principled.inputs.get('Sheen Color')
+          or principled.inputs.get('Sheen')
+        )
+        if sheen_color is not None:
+          replace_socket_link(node_tree, image_node.outputs['Color'], sheen_color)
+    if images.get('SheenOpacity') is not None:
+      sheen_opacity_image = images['SheenOpacity']
+      sheen_opacity_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(sheen_opacity_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = sheen_opacity_image.name
+      image_node.image = sheen_opacity_image
+      image_node.label = 'Painter Sheen Opacity'
+      separate = node_tree.nodes.get('Painter Sheen Opacity Channel') or node_tree.nodes.new('ShaderNodeSeparateColor')
+      separate.name = 'Painter Sheen Opacity Channel'
+      replace_socket_link(node_tree, image_node.outputs['Color'], separate.inputs['Color'])
+      for principled in principled_nodes:
+        sheen_opacity = (
+          principled.inputs.get('Sheen Weight')
+          or principled.inputs.get('Sheen Opacity')
+        )
+        if sheen_opacity is not None:
+          replace_socket_link(node_tree, separate.outputs['Red'], sheen_opacity)
+    if images.get('SheenRoughness') is not None:
+      sheen_roughness_image = images['SheenRoughness']
+      sheen_roughness_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(sheen_roughness_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = sheen_roughness_image.name
+      image_node.image = sheen_roughness_image
+      image_node.label = 'Painter Sheen Roughness'
+      separate = node_tree.nodes.get('Painter Sheen Roughness Channel') or node_tree.nodes.new('ShaderNodeSeparateColor')
+      separate.name = 'Painter Sheen Roughness Channel'
+      replace_socket_link(node_tree, image_node.outputs['Color'], separate.inputs['Color'])
+      for principled in principled_nodes:
+        sheen_roughness = principled.inputs.get('Sheen Roughness')
+        if sheen_roughness is not None:
+          replace_socket_link(node_tree, separate.outputs['Red'], sheen_roughness)
     force_material_opaque(material)
     remove_stale_unlinked_image_nodes(material, preserve_images=images.values())
   return applied
@@ -886,14 +1197,15 @@ def canonicalize_painter_export_files(result):
       if not source.is_file():
         continue
       stem = source.stem
-      if stem.startswith('T_M_'):
-        canonical_stem = f'T_{stem[4:]}'
-      elif stem.startswith('M_'):
-        canonical_stem = f'T_{stem[2:]}'
-      elif stem.startswith('T_'):
+      if stem.startswith(f'{TEXTURE_PREFIX}{MATERIAL_PREFIX}'):
+        prefix_length = len(TEXTURE_PREFIX) + len(MATERIAL_PREFIX)
+        canonical_stem = f'{TEXTURE_PREFIX}{stem[prefix_length:]}'
+      elif stem.startswith(MATERIAL_PREFIX):
+        canonical_stem = f'{TEXTURE_PREFIX}{stem[len(MATERIAL_PREFIX):]}'
+      elif stem.startswith(TEXTURE_PREFIX):
         canonical_stem = stem
       else:
-        canonical_stem = f'T_{stem}'
+        canonical_stem = f'{TEXTURE_PREFIX}{stem}'
       target = source.with_name(f'{canonical_stem}{source.suffix.lower()}')
       if source.resolve() != target.resolve():
         os.replace(source, target)
@@ -1026,7 +1338,7 @@ def duplicate_for_export(
         for index, material in enumerate(list(mesh.materials)):
           if material is None:
             continue
-          if not material.name.startswith('M_'):
+          if not material.name.startswith(MATERIAL_PREFIX):
             continue
           copied = material_copies.get(material)
           if copied is None:
@@ -1292,7 +1604,7 @@ def _painter_color_socket(material, principled):
       return node.outputs.get('Color')
     if (
       fallback is None
-      and image_name.startswith('T_')
+      and image_name.startswith(TEXTURE_PREFIX)
       and image_name.endswith('_Color')
       and '_Color_baking' not in image_name
       and '_Color_alpha' not in image_name

@@ -155,6 +155,15 @@ FBX file bytes), so editing one asset doesn't force a full re-bake.
   timeout), reloads the maps, and connects **Color, Normal, packed Extra,
   Emissive, and Height** to the Low materials. The packed Extra texture uses
   **Green = Roughness, Blue = Metallic**.
+- **Export Preset** selects the Painter output template used by that button.
+  `Unreal_V2_Cloth` also exports and reconnects **SheenColor, SheenOpacity, and
+  SheenRoughness** for cloth material instances. Before exporting, the Painter
+  plugin verifies the real Texture Set stack channels and enables missing
+  SheenColor, SheenOpacity, and SheenRoughness channels.
+  In the Unreal handoff sidecar those maps stay named **Sheen Color**,
+  **Sheen Opacity**, and **Sheen Roughness**; Send2UE remaps them through
+  `pipeline_contract.json` to the cloth master texture parameters
+  **Fuzz Color Map**, **Fuzz Mask**, and **Fuzz Roughness Map**.
 - **Base Color Source** — `Use Painter Base Color` / `Use Baked Base Color`
   switches only the Low material connection; both source files stay untouched.
   The Painter Base Color already contains the alpha-overlay result, so the
