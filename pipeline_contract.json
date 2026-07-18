@@ -121,8 +121,10 @@
   "unreal_handoff_sidecar": {
     "producer": "ue_unique_export_names_addon",
     "consumers": [
-      "BlenderTools send2ue material_pipeline extension",
-      "UE_Blender_Pipeline/ue_material_setup.py"
+      "BlenderTools send2ue material_pipeline extension"
+    ],
+    "legacy_consumers": [
+      "UE_Blender_Pipeline/ue_material_setup.py (inactive compatibility copy; does not implement the versioned SpeedTree handoff contract)"
     ],
     "location": "<base>/texture/<mesh_or_empty_name>.json",
     "purpose": "Bridge UE Unique validation/material data to Send to Unreal and Unreal material post-import setup. Users are not expected to edit these files manually.",
@@ -135,7 +137,7 @@
     "top_level_fields": {
       "schema_version": "integer, currently 3",
       "material_pipeline": "string, currently 'surface_layers'",
-      "material_master": "default material master preset for the sidecar, currently 'prop'",
+      "material_master": "default material master preset for the sidecar. Tree-only sidecars use 'tree'; mixed or ordinary sidecars keep the safe 'prop' default while each material entry may override it.",
       "mesh_name": "mesh or Empty asset name this sidecar is intended to match",
       "asset_prefix": "cleaned blend-file/prefix value used by the handoff",
       "materials": "array of material slot pipeline entries",
@@ -151,8 +153,12 @@
       "translucent": "boolean; translucent entries may use the shared glass material path in Unreal",
       "textures": "legacy flat texture array; may be empty",
       "layers": "surface-layer texture array; may be empty",
-      "master_preset": "optional preset key such as prop, cloth, layer, asset_surface, or coat",
-      "material_layer": "optional object used when the preset must create/update a MYI Material Layer Instance and assign it as the MI background layer instead of writing texture overrides onto the MI"
+      "master_preset": "optional preset key such as prop, cloth, layer, asset_surface, coat, or tree",
+      "tree_part": "optional explicit UV/material-layer role: bark, branch, or leaf. Consumers must prefer this field over material-name heuristics.",
+      "tree_shading": "optional explicit shading/master role: wood, foliage, or stem. This axis is independent from tree_part; for example a standalone stem uses tree_part=branch and tree_shading=stem.",
+      "material_layer": "optional object used when the preset must create/update a MYI Material Layer Instance and assign it as the MI background layer instead of writing texture overrides onto the MI",
+      "instance_profile": "optional SpeedTree model-wide management key copied from Tree Generator > SpeedTree SDK > User data. It is never inferred from material names.",
+      "material_instance_mode": "when instance_profile is present this is 'create_or_reuse': create the resolved child MI only when absent, otherwise preserve and reuse the existing user-managed instance"
     },
     "material_layer_fields": {
       "assignment": "currently 'background'; Send2UE assigns this MYI as the single Background layer on the target MI",
@@ -161,7 +167,7 @@
       "texture_remap": "map from sidecar layer texture params to MYI parameter names; params not listed here are intentionally left out of the MYI"
     },
     "texture_entry_fields": {
-      "param": "Surface-domain texture parameter name such as Albedo, Extra, Normal, Transmission, Emissive, Sheen Color, Sheen Opacity, or Sheen Roughness",
+      "param": "Surface-domain texture parameter name such as Albedo, Extra, Normal, Transmission, Subsurface, Emissive, Sheen Color, Sheen Opacity, or Sheen Roughness",
       "asset_name": "Texture asset name to import/create in Unreal",
       "file": "absolute texture file path written with forward slashes",
       "source_param": "optional original Blender role when param was remapped"
@@ -200,6 +206,54 @@
       },
       "reason": "Cloth source-domain texture data is stored in a MYI background layer. BaseColor/ORM/Normal and the Sheen/Fuzz texture set are owned by MY_Cloth/MYI. The cloth master keeps the Substrate cloth slab and wires layer attributes into DiffuseAlbedo, Roughness, Anisotropy, Normal, FuzzColor, FuzzAmount, and FuzzRoughness."
     },
+    "tree_material_layer_contract": {
+      "material_master_preset": "tree",
+      "masters": {
+        "wood": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master",
+        "foliage": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Foliage_Master",
+        "stem": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Stem_Master"
+      },
+      "master_subsurface_types": {
+        "wood": "none",
+        "foliage": "MSS_TWO_SIDED_WRAP",
+        "stem": "MSS_WRAP"
+      },
+      "assignment": "material_layer_instance",
+      "instance_folder": "/Game/Material/Tree/AssetTree/MYI",
+      "parts": {
+        "bark": {
+          "parent": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Bark",
+          "texture_params": ["Albedo", "Extra", "Normal", "Height"]
+        },
+        "branch": {
+          "parent": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Branch",
+          "texture_params": ["Albedo", "Extra", "Normal", "Height"]
+        },
+        "leaf": {
+          "parent": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Leaf",
+          "texture_params": ["Albedo", "Extra", "Normal", "Height"]
+        }
+      },
+      "classification": {
+        "tree_part_axis": "tree_part selects the UV/material-layer contract only: bark, branch, or leaf.",
+        "tree_shading_axis": "tree_shading independently selects the master/shading contract: wood, foliage, or stem.",
+        "priority": "Explicit tree_part/tree_shading wins. In name fallback, a leaf-atlas or leaf-family scope wins over a stem/twig subgroup label, so M_leaf_*_stem and M_leaf_*_twig remain tree_part=leaf and tree_shading=foliage. Standalone M_stem_common_* materials use tree_part=branch and tree_shading=stem. Other branch/twig materials use branch/wood; bark/trunk/stump materials use bark/wood.",
+        "custom_properties": "Blender material custom properties unreal_tree_part and unreal_tree_shading may explicitly set their respective axes."
+      },
+      "opacity_policy": "Tree handoff excludes Alpha, Opacity, Opacity Map, and Transmission before texture import; these parameters are never emitted or assigned to tree MYIs.",
+      "subsurface_policy": "Subsurface is controlled by tree_shading, not tree_part. Only wood excludes Subsurface. Foliage and stem may resolve an explicit or sibling *_subsurface map (including a Megascans-style *_Translucency source) and assign it to the MYI. Foliage uses MSS_TWO_SIDED_WRAP; stem uses MSS_WRAP.",
+      "master_selection": "The entry-level preset remains 'tree'. Consumers select the master by tree_shading: wood=M_TreeAsset_Master, foliage=M_TreeAsset_Foliage_Master (TwoSidedWrap), and stem=M_TreeAsset_Stem_Master (Wrap). A stem therefore combines the Branch material layer with the stem master and Subsurface.",
+      "legacy_normalization": "Before an active export, legacy M_stem_05 references are normalized to M_stem_common_01. The legacy material, textures, backups, and historical data remain preserved and are not renamed or deleted."
+    },
+    "speedtree_instance_profiles": {
+      "source_field": "SpeedTree 10.1 Tree Generator > SpeedTree SDK > User data",
+      "blender_property": "unreal_instance_profile",
+      "sidecar_field": "instance_profile",
+      "mode": "create_or_reuse",
+      "target_rule": "<tree mi_folder>/MI_<base material name>_<literal profile>; for example M_stem_common_01 plus dead resolves to MI_stem_common_01_dead",
+      "ownership": "The pipeline may update the base MI and MYI. If the resolved child MI is absent, create it once as a child of the base MI. If it already exists, reuse it without checkout, save, reparenting, duplication, or parameter changes so user Tint overrides remain intact.",
+      "literal_rule": "The validated Tree User Data key is appended literally and case-insensitively. It is never inferred from material names. Atlas Leaf Mesh Builder Green/Yellow group names are production metadata only and must never become instance profiles."
+    },
     "cleanup_fields": {
       "source_material_names": "deduplicated source material asset names that FBX import may create in the mesh folder and that can be removed after material instances are assigned",
       "source_texture_names": "deduplicated source texture asset names that FBX import may create in the mesh folder and that can be removed after textures are imported to the canonical texture folder"
@@ -222,6 +276,118 @@
         "empty material slots",
         "missing texture file paths or missing texture files when textures are present"
       ]
+    }
+  },
+  "speedtree_handoff_rules": {
+    "contract_version": 1,
+    "sidecar_kind": "speedtree",
+    "material_name": {
+      "blender_duplicate_suffix_pattern": "\\.\\d{3}$",
+      "stmat_suffixes": ["_Mat"],
+      "instance_prefixes": ["MI_", "M_"],
+      "production_group_tokens": ["green", "yellow", "twig", "twigs", "stem", "stems", "dead"]
+    },
+    "tree_part": {
+      "aliases": {
+        "leaf": "leaf",
+        "leaves": "leaf",
+        "foliage": "leaf",
+        "cluster": "leaf",
+        "branch": "branch",
+        "branches": "branch",
+        "twig": "branch",
+        "twigs": "branch",
+        "stem": "branch",
+        "stems": "branch",
+        "bark": "bark",
+        "trunk": "bark",
+        "stump": "bark"
+      },
+      "tokens": {
+        "leaf": ["leaf", "leaves", "foliage", "cluster"],
+        "branch": ["branch", "branches", "twig", "twigs", "stem", "stems"],
+        "bark": ["bark", "trunk", "stump"]
+      },
+      "precedence": ["leaf", "branch", "bark"],
+      "branch_suffixes": ["branch", "twig"]
+    },
+    "tree_shading": {
+      "aliases": {
+        "wood": "wood",
+        "opaque": "wood",
+        "foliage": "foliage",
+        "subsurface": "foliage",
+        "sss": "foliage",
+        "stem": "stem",
+        "wrap": "stem"
+      },
+      "leaf_default": "foliage",
+      "stem_tokens": ["stem", "stems"],
+      "default": "wood"
+    },
+    "pcg_atlas_auto_split": {
+      "tokens": ["green", "green_light", "yellow", "dead", "flower", "bud", "stem", "twig", "cluster", "flower_leaf"],
+      "requires_provenance_and_matching_source_signature": true,
+      "namespace_note": "Atlas builder production groups are independent from Tree instance_profile even when both values happen to be 'dead'."
+    },
+    "instance_profile": {
+      "pattern": "[A-Za-z0-9][A-Za-z0-9_-]{0,63}",
+      "normalization": "casefold",
+      "mode": "create_or_reuse"
+    },
+    "preflight_report": {
+      "envelope_field": "speedtree_pipeline_contract",
+      "kind": "speedtree_material_preflight",
+      "schema_version": 1,
+      "outcomes": ["ok", "blocked", "error"],
+      "required_source_identity_fields": ["canonical_path", "sha256"],
+      "diagnostic_source_identity_fields": ["size", "mtime_ns"],
+      "new_schema_policy": "strict_before_mutation",
+      "legacy_policy": "existing_fallback"
+    },
+    "asset_ownership": {
+      "base_mi": "pipeline_managed",
+      "material_layer_instance": "pipeline_managed",
+      "profile_mi": "user_managed_create_once_then_immutable",
+      "shared_glass": "shared_read_only",
+      "hair_mi": "hair_workflow_specific"
+    },
+    "texture_policy": {
+      "required_roles": ["color", "normal", "extra", "height", "opacity", "subsurface"],
+      "excluded_params": ["alpha", "opacity", "opacity map", "transmission"],
+      "excluded_by_shading": {
+        "wood": ["subsurface"]
+      }
+    },
+    "dynamic_wind": {
+      "filename_suffix": "_dynamic_wind_import_from_megaplant_groups.json",
+      "sidecar_fields": ["dynamic_wind_json", "dynamic_wind_json_path", "wind_json", "wind_json_path"],
+      "asset_kind": "speedtree",
+      "mesh_types": ["skeletal_mesh"],
+      "legacy_suffix_search": true
+    },
+    "unreal": {
+      "preset": "tree",
+      "mi_folder": "/Game/Material/Tree/AssetTree/MI",
+      "layer_instance_folder": "/Game/Material/Tree/AssetTree/MYI",
+      "masters_by_shading": {
+        "wood": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master",
+        "foliage": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Foliage_Master",
+        "stem": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Stem_Master"
+      },
+      "layer_parents_by_part": {
+        "bark": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Bark",
+        "branch": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Branch",
+        "leaf": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Leaf"
+      },
+      "layer_texture_remap": {
+        "Albedo": "Albedo",
+        "Extra": "Extra",
+        "Normal": "Normal",
+        "Height": "Height",
+        "Subsurface": "Subsurface"
+      },
+      "virtual_textures": true
     }
   },
   "unreal_path_mapping": {
