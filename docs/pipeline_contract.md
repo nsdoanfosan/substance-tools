@@ -99,6 +99,38 @@ be removed from the imported mesh folder after Unreal material instances and
 canonical textures are set up. Consumers should prefer these arrays when present
 and fall back to deriving cleanup names from `materials` only for older sidecars.
 
+## SpeedTree Production Group Naming Contract
+
+SpeedTree handoff contract version 2 derives production groups from material
+structure, not from a hardcoded list such as `green`, `yellow`, or `dead`.
+After Blender duplicate and `.stmat` suffix cleanup, the parser finds the last
+independent numeric segment. When a non-empty suffix follows that segment through
+an allowed separator, the name through the number is the production-group base
+and the entire remaining suffix is one case-folded group value.
+
+| Material | Base | Production group |
+| --- | --- | --- |
+| `M_Leaf_common_grass_01_green` | `M_Leaf_common_grass_01` | `green` |
+| `M_Leaf_common_grass_01_dead` | `M_Leaf_common_grass_01` | `dead` |
+| `M_Leaf_common_grass_01_winter_dry` | `M_Leaf_common_grass_01` | `winter_dry` |
+| `M_stem_common_01` | `M_stem_common_01` | none |
+| `M_Branch_deadbranch_01` | `M_Branch_deadbranch_01` | none |
+
+The compatibility field `production_group_tokens` remains an array, but it now
+contains either no value or exactly one complete suffix. Words before the final
+number are never stripped, and suffixes are accepted regardless of whether an
+Atlas Leaf Mesh Builder generated them or a user supplied a collection name.
+The regex, separators, normalization, cardinality, and safety boundary live in
+`pipeline_contract.json`; consumers must not recreate a token allowlist.
+
+This is a pure material-name parser only. Its result does not establish SPM or
+STMAT provenance, does not compare a source signature, and does not authorize an
+atlas split or source mutation. Application runtimes must separately enforce
+`pcg_atlas_auto_split.requires_provenance_and_matching_source_signature` before
+using parsed production groups for those operations. Atlas Builder's automatic
+classifier labels do not restrict user collection names, and SpeedTree
+`instance_profile` is a separate namespace.
+
 ## Path Mapping Contract
 
 The current Unreal handoff has historically assumed a simple anchor:

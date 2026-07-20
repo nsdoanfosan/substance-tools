@@ -3,7 +3,8 @@
 This module deliberately has no Blender or Unreal dependency.  Callers pass
 plain strings/dicts and receive JSON-serializable values.  Application code is
 still responsible for reading bpy data, parsing production SPM structures, or
-mutating Unreal assets.
+mutating Unreal assets.  In particular, name parsing does not establish source
+provenance or a matching source signature and never authorizes source mutation.
 """
 from __future__ import annotations
 
@@ -98,6 +99,30 @@ def _material_rules():
     return rules().get("material_name") or {}
 
 
+def _production_group_rules():
+    config = _material_rules().get("production_group_suffix")
+    if not isinstance(config, dict):
+        raise RuntimeError(
+            "pipeline_contract.json has no material_name.production_group_suffix"
+        )
+    for field in (
+        "numeric_segment_pattern",
+        "suffix_separator_pattern",
+        "suffix_normalization",
+        "result_cardinality",
+    ):
+        if not str(config.get(field) or ""):
+            raise RuntimeError(
+                "pipeline_contract.json production_group_suffix has no " + field
+            )
+    if str(config["result_cardinality"]) != "zero_or_one_complete_suffix":
+        raise RuntimeError(
+            "unsupported production-group result cardinality: "
+            f"{config['result_cardinality']!r}"
+        )
+    return config
+
+
 def _duplicate_suffix_re():
     pattern = str(
         _material_rules().get("blender_duplicate_suffix_pattern") or r"\.\d{3}$"
@@ -145,36 +170,52 @@ def _name_tokens(values):
     return result
 
 
+def _production_group_parts(value):
+    """Return ``(base, suffix)`` from the contract-defined numeric boundary."""
+    name = normalize_material_name(value)
+    config = _production_group_rules()
+    try:
+        numeric_re = re.compile(str(config["numeric_segment_pattern"]))
+        separator_re = re.compile(
+            r"^(?:" + str(config["suffix_separator_pattern"]) + r")(.+)$"
+        )
+    except re.error as exc:
+        raise RuntimeError(
+            "pipeline_contract.json has an invalid production-group pattern"
+        ) from exc
+
+    numeric_segments = list(numeric_re.finditer(name))
+    if not numeric_segments:
+        return name, ""
+
+    last_numeric = numeric_segments[-1]
+    suffix_match = separator_re.fullmatch(name[last_numeric.end():])
+    if not suffix_match:
+        return name, ""
+
+    suffix = suffix_match.group(1).strip()
+    if not suffix:
+        return name, ""
+    normalization = str(config["suffix_normalization"])
+    if normalization == "casefold":
+        suffix = suffix.casefold()
+    elif normalization != "preserve":
+        raise RuntimeError(
+            "unsupported production-group suffix normalization: "
+            f"{normalization!r}"
+        )
+    return name[: last_numeric.end()], suffix
+
+
 def production_group_tokens(value):
-    allowed = {
-        str(item).casefold()
-        for item in _material_rules().get("production_group_tokens") or []
-    }
-    result = []
-    for token in _name_tokens(value):
-        if token not in allowed:
-            continue
-        canonical = "twig" if token == "twigs" else "stem" if token == "stems" else token
-        if canonical not in result:
-            result.append(canonical)
-    return result
+    """Return zero or one complete collection suffix for compatibility."""
+    _base, suffix = _production_group_parts(value)
+    return [suffix] if suffix else []
 
 
 def production_group_base_name(value):
-    name = normalize_material_name(value)
-    allowed = {
-        str(item).casefold()
-        for item in _material_rules().get("production_group_tokens") or []
-    }
-    parts = [part for part in re.split(r"[^A-Za-z0-9]+", name) if part]
-    return "_".join(part for part in parts if part.casefold() not in allowed)
-
-
-def pcg_atlas_auto_split_tokens():
-    return tuple(
-        str(item).casefold()
-        for item in (rules().get("pcg_atlas_auto_split") or {}).get("tokens") or []
-    )
+    base, _suffix = _production_group_parts(value)
+    return base
 
 
 def normalize_tree_part(value):
@@ -478,7 +519,6 @@ __all__ = [
     "normalize_material_name",
     "normalize_tree_part",
     "normalize_tree_shading",
-    "pcg_atlas_auto_split_tokens",
     "preflight_report_rules",
     "production_group_base_name",
     "production_group_tokens",

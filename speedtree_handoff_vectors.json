@@ -1,5 +1,5 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "tree_axes": [
     {"name": "M_leaf_parsley_atlas_02_stem", "tree_part": "leaf", "tree_shading": "foliage"},
     {"name": "M_leaf_oak_01_twig", "tree_part": "leaf", "tree_shading": "foliage"},
@@ -20,7 +20,13 @@
   "production_groups": [
     {"material": "M_Leaf_common_grass_01_green", "base": "M_Leaf_common_grass_01", "tokens": ["green"]},
     {"material": "M_Leaf_common_grass_01_dead", "base": "M_Leaf_common_grass_01", "tokens": ["dead"]},
-    {"material": "M_stem_common_01", "base": "M_common_01", "tokens": ["stem"]}
+    {"material": "M_Leaf_common_grass_01_winter_dry", "base": "M_Leaf_common_grass_01", "tokens": ["winter_dry"]},
+    {"material": "M_Leaf_common_grass_01_CustomCollection", "base": "M_Leaf_common_grass_01", "tokens": ["customcollection"]},
+    {"material": "M_Leaf_common_grass_01_green.001", "base": "M_Leaf_common_grass_01", "tokens": ["green"]},
+    {"material": "M_Leaf_common_01_green_02_dead", "base": "M_Leaf_common_01_green_02", "tokens": ["dead"]},
+    {"material": "M_stem_common_01", "base": "M_stem_common_01", "tokens": []},
+    {"material": "M_Branch_deadbranch_01", "base": "M_Branch_deadbranch_01", "tokens": []},
+    {"material": "M_Leaf_v2_common_dead", "base": "M_Leaf_v2_common_dead", "tokens": []}
   ],
   "tree_texture_policy": [
     {"param": "Alpha", "tree_shading": "foliage", "allowed": false},

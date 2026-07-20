@@ -279,13 +279,23 @@
     }
   },
   "speedtree_handoff_rules": {
-    "contract_version": 1,
+    "contract_version": 2,
     "sidecar_kind": "speedtree",
     "material_name": {
       "blender_duplicate_suffix_pattern": "\\.\\d{3}$",
       "stmat_suffixes": ["_Mat"],
       "instance_prefixes": ["MI_", "M_"],
-      "production_group_tokens": ["green", "yellow", "twig", "twigs", "stem", "stems", "dead"]
+      "production_group_suffix": {
+        "verified_against_code": "2026-07-19",
+        "numeric_segment_pattern": "(?<![A-Za-z0-9])\\d+(?![A-Za-z0-9])",
+        "suffix_separator_pattern": "[_. -]+",
+        "suffix_normalization": "casefold",
+        "result_cardinality": "zero_or_one_complete_suffix",
+        "rule": "After normal material-name cleanup, the last independent numeric segment is the boundary. If a non-empty suffix follows it through a configured separator, the base is the full name through that numeric segment and the production group is the entire remaining suffix. Names without such a suffix keep the full name as their base and have no production group. No token allowlist is used.",
+        "compatibility_field": "material_intent.production_group_tokens remains an array for existing consumers, but contract version 2 emits either [] or one complete normalized suffix such as ['winter_dry']; it no longer emits every recognized word found anywhere in the name.",
+        "scope": "pure_material_name_parser_only",
+        "safety_boundary": "This parser derives grouping metadata only. It does not prove SPM/STMAT provenance, compare source signatures, or authorize atlas splitting or source mutation. Application runtimes must enforce pcg_atlas_auto_split.requires_provenance_and_matching_source_signature before acting on parsed groups."
+      }
     },
     "tree_part": {
       "aliases": {
@@ -326,9 +336,9 @@
       "default": "wood"
     },
     "pcg_atlas_auto_split": {
-      "tokens": ["green", "green_light", "yellow", "dead", "flower", "bud", "stem", "twig", "cluster", "flower_leaf"],
+      "eligibility": "any non-empty material_name.production_group_suffix; no label allowlist",
       "requires_provenance_and_matching_source_signature": true,
-      "namespace_note": "Atlas builder production groups are independent from Tree instance_profile even when both values happen to be 'dead'."
+      "namespace_note": "Atlas Builder production groups are independent from Tree instance_profile even when both values happen to be 'dead'. Automatic collection-classifier labels belong to Atlas Leaf Mesh Builder and do not restrict user collection names."
     },
     "instance_profile": {
       "pattern": "[A-Za-z0-9][A-Za-z0-9_-]{0,63}",

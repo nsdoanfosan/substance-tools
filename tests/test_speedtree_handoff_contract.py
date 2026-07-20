@@ -27,11 +27,13 @@ class SpeedTreeHandoffContractTests(unittest.TestCase):
                 )
 
     def test_production_groups_and_instance_profile_are_separate_namespaces(self):
-        dead_material = contract.build_material_intent(
-            "M_Leaf_common_grass_01_dead"
-        )
-        self.assertEqual(dead_material["production_group_tokens"], ["dead"])
-        self.assertEqual(dead_material["production_group_base"], "M_Leaf_common_grass_01")
+        for row in contract.golden_vectors()["production_groups"]:
+            with self.subTest(material=row["material"]):
+                intent = contract.build_material_intent(row["material"])
+                self.assertEqual(intent["production_group_base"], row["base"])
+                self.assertEqual(intent["production_group_tokens"], row["tokens"])
+
+        dead_material = contract.build_material_intent("M_Leaf_common_grass_01_dead")
         self.assertEqual(dead_material["instance_profile"], "")
         self.assertNotIn("profile_target_name", dead_material)
 
@@ -53,6 +55,8 @@ class SpeedTreeHandoffContractTests(unittest.TestCase):
                 )
 
     def test_profile_validation_and_contract_revision(self):
+        self.assertEqual(contract.contract_version(), 2)
+        self.assertEqual(contract.golden_vectors()["contract_version"], 2)
         self.assertEqual(contract.normalize_instance_profile("Dead"), "dead")
         with self.assertRaises(ValueError):
             contract.normalize_instance_profile("../dead")
@@ -96,11 +100,32 @@ class SpeedTreeHandoffContractTests(unittest.TestCase):
             "user_managed_create_once_then_immutable",
         )
 
-    def test_atlas_auto_split_tokens_are_not_production_group_tokens(self):
-        self.assertIn("flower", contract.pcg_atlas_auto_split_tokens())
+    def test_production_group_suffix_has_no_token_allowlist(self):
+        material_rules = contract.rules()["material_name"]
+        self.assertNotIn("production_group_tokens", material_rules)
         self.assertNotIn(
-            "flower",
-            set(contract.rules()["material_name"]["production_group_tokens"]),
+            "tokens", contract.rules()["pcg_atlas_auto_split"]
+        )
+        self.assertEqual(
+            contract.production_group_tokens("M_Leaf_common_grass_01_flower"),
+            ["flower"],
+        )
+        self.assertEqual(
+            contract.production_group_tokens(
+                "M_Leaf_common_grass_01_user_defined_winter"
+            ),
+            ["user_defined_winter"],
+        )
+
+    def test_production_group_parser_safety_boundary_is_explicit(self):
+        suffix_rules = contract.rules()["material_name"]["production_group_suffix"]
+        self.assertEqual(suffix_rules["scope"], "pure_material_name_parser_only")
+        self.assertIn("provenance", suffix_rules["safety_boundary"])
+        self.assertIn("source signatures", suffix_rules["safety_boundary"])
+        self.assertTrue(
+            contract.rules()["pcg_atlas_auto_split"][
+                "requires_provenance_and_matching_source_signature"
+            ]
         )
 
     def test_preflight_envelope_validates_descriptor_source_and_intents(self):
