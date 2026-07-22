@@ -1,0 +1,8 @@
+{
+  "metadata_format_version": "1",
+  "name": "substance_designer_mcp_bridge",
+  "version": "0.1.0",
+  "author": "PARK",
+  "min_designer_version": "14.0",
+  "platform": "win"
+}

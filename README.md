@@ -1,5 +1,8 @@
 # Substance Import-Export Tools
 
+> Adobe Substance 3D Designer live MCP support is available in
+> [`designer_mcp/`](designer_mcp/README.md).
+
 A Blender add-on that drives a **Blender → Substance Painter → Unreal** baking
 and texturing pipeline. Meshes are organised in a fixed `Baking` collection
 layout, sent to Painter for mesh-map baking and texturing, and the resulting
