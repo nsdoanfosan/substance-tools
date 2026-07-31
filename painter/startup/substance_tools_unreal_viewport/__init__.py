@@ -24,6 +24,12 @@ REQUEST_FILENAME = ".substance_tools_request.json"
 PENDING_REQUEST_FILENAME = "pending_request.json"
 EXPORT_REQUEST_FILENAME = ".substance_tools_export_request.json"
 EXPORT_RESULT_FILENAME = ".substance_tools_export_result.json"
+CLOTH_EXPORT_PRESET_NAME = "Unreal_V2_Cloth"
+CLOTH_EXPORT_CHANNELS = (
+    ("SheenColor", "sRGB8"),
+    ("SheenOpacity", "L8"),
+    ("SheenRoughness", "L8"),
+)
 METADATA_CONTEXT = "SubstanceToolsBlender"
 _started = False
 _processing = False
@@ -108,7 +114,7 @@ def _load_request():
         if not path.is_file():
             continue
         try:
-            request = json.loads(path.read_text(encoding="utf-8"))
+            request = json.loads(path.read_text(encoding="utf-8-sig"))
             project_path = substance_painter.project.file_path()
             if project_path and request.get("spp"):
                 if _normalized_path(project_path) != _normalized_path(request["spp"]):
@@ -128,7 +134,7 @@ def _load_pending_request():
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         _log(f"Could not read pending project request: {error}")
         return None
@@ -147,8 +153,7 @@ def _normalized_resource_name(name):
     return str(name or "").lower().replace(" ", "").replace("_", "")
 
 
-def _export_preset_url(request):
-    requested_name = request.get("preset", "Unreal_V2")
+def _find_export_preset_url(requested_name):
     normalized_name = _normalized_resource_name(requested_name)
     preset = next(
         (
@@ -160,11 +165,211 @@ def _export_preset_url(request):
     )
     if preset is not None:
         return preset.resource_id.url()
+    return None
+
+
+def _export_preset_url(request):
+    requested_name = request.get("preset", "Unreal_V2")
+    preset_url = _find_export_preset_url(requested_name)
+    if preset_url:
+        return preset_url
 
     preset_path = Path(request.get("preset_path", ""))
     if preset_path.is_file():
-        return f"resource://your_assets/{preset_path.stem}"
-    return f"resource://your_assets/{requested_name}"
+        try:
+            substance_painter.resource.Shelves.refresh_all()
+            preset_url = _find_export_preset_url(requested_name)
+            if preset_url:
+                return preset_url
+        except Exception as error:
+            _log(f"Could not refresh Painter shelves for {requested_name}: {error}")
+
+        try:
+            resource = substance_painter.resource.import_session_resource(
+                str(preset_path),
+                substance_painter.resource.Usage.EXPORT,
+                name=requested_name,
+                group="SubstanceTools",
+            )
+            preset_url = resource.identifier().url()
+            _log(
+                f"Imported export preset {requested_name} into Painter session "
+                f"from {preset_path}"
+            )
+            return preset_url
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not load Painter export preset {requested_name} "
+                f"from {preset_path}: {error}"
+            ) from error
+
+    raise RuntimeError(
+        f"Painter export preset {requested_name} was not found, and preset_path "
+        f"is missing or invalid: {preset_path}"
+    )
+
+
+def _export_preset_candidates(request):
+    inline_presets = request.get("inline_presets") or []
+    inline_candidates = [
+        preset
+        for preset in inline_presets
+        if isinstance(preset, dict) and preset.get("maps")
+    ]
+    candidates = []
+    try:
+        candidates.append(_export_preset_url(request))
+    except RuntimeError:
+        if not inline_candidates:
+            raise
+    candidates.extend(inline_candidates)
+    return candidates
+
+
+def _export_textures_with_preset(request, export_list, preset):
+    config = {
+        "exportShaderParams": False,
+        "exportPath": request["texture_dir"],
+        "exportList": export_list,
+        "exportParameters": [{
+            "parameters": {
+                "fileFormat": "png",
+                "bitDepth": "8",
+                "dithering": False,
+                "paddingAlgorithm": "infinite",
+            }
+        }],
+    }
+    if isinstance(preset, dict):
+        preset_name = str(preset.get("name") or request.get("preset") or "SubstanceToolsExport")
+        config["defaultExportPreset"] = preset_name
+        config["exportPresets"] = [preset]
+    else:
+        config["defaultExportPreset"] = preset
+    return substance_painter.export.export_project_textures(config)
+
+
+def _is_cloth_export_request(request):
+    if str(request.get("preset") or "") == CLOTH_EXPORT_PRESET_NAME:
+        return True
+    for preset in request.get("inline_presets") or []:
+        if isinstance(preset, dict) and str(preset.get("name") or "") == CLOTH_EXPORT_PRESET_NAME:
+            return True
+    return False
+
+
+def _enum_member(enum_type, name):
+    value = getattr(enum_type, name, None)
+    if value is None:
+        members = getattr(enum_type, "__members__", {})
+        value = members.get(name)
+    if value is None:
+        raise RuntimeError(f"Painter enum member is missing: {enum_type}.{name}")
+    return value
+
+
+def _stack_root_path(texture_set, stack):
+    stack_name = stack.name()
+    return f"{texture_set.name}/{stack_name}" if stack_name else str(texture_set.name)
+
+
+def _ensure_cloth_export_channels(request):
+    if not _is_cloth_export_request(request):
+        return None
+
+    audit = {
+        "preset": CLOTH_EXPORT_PRESET_NAME,
+        "required": [name for name, _format_name in CLOTH_EXPORT_CHANNELS],
+        "added": [],
+        "already_enabled": [],
+    }
+    errors = []
+
+    for texture_set in substance_painter.textureset.all_texture_sets():
+        for stack in texture_set.all_stacks():
+            root_path = _stack_root_path(texture_set, stack)
+            for channel_name, format_name in CLOTH_EXPORT_CHANNELS:
+                try:
+                    channel_type = _enum_member(
+                        substance_painter.textureset.ChannelType,
+                        channel_name,
+                    )
+                    if stack.has_channel(channel_type):
+                        audit["already_enabled"].append({
+                            "rootPath": root_path,
+                            "channel": channel_name,
+                        })
+                        continue
+                    channel_format = _enum_member(
+                        substance_painter.textureset.ChannelFormat,
+                        format_name,
+                    )
+                    stack.add_channel(channel_type, channel_format)
+                    audit["added"].append({
+                        "rootPath": root_path,
+                        "channel": channel_name,
+                        "format": format_name,
+                    })
+                except Exception as error:
+                    errors.append(f"{root_path}:{channel_name}: {error}")
+
+    if errors:
+        audit["errors"] = errors
+        raise RuntimeError(
+            "Could not enable required Painter cloth channels: "
+            + "; ".join(errors)
+        )
+
+    if audit["added"]:
+        substance_painter.project.save()
+        _log(
+            "Enabled Painter cloth channel(s): "
+            + ", ".join(
+                f"{item['rootPath']}:{item['channel']}"
+                for item in audit["added"]
+            )
+        )
+    else:
+        _log("Painter cloth channels already enabled")
+    return audit
+
+
+def _strip_texture_set_prefixes():
+    texture_sets = substance_painter.textureset.all_texture_sets()
+    current_names = {str(texture_set.name) for texture_set in texture_sets}
+    renamed = []
+    for texture_set in texture_sets:
+        current_name = str(texture_set.name)
+        if not current_name.startswith("M_"):
+            continue
+        target_name = current_name[2:]
+        if target_name in current_names:
+            raise RuntimeError(
+                f"Cannot rename Texture Set '{current_name}' to '{target_name}': "
+                "target name already exists"
+            )
+        texture_set.name = target_name
+        current_names.remove(current_name)
+        current_names.add(target_name)
+        renamed.append((current_name, target_name))
+    if renamed:
+        _log(
+            "Renamed Painter Texture Set(s): "
+            + ", ".join(f"{old} -> {new}" for old, new in renamed)
+        )
+    return renamed
+
+
+def _normalize_texture_set_names():
+    """Drop the M_ prefix from Texture Sets, logging (not raising) on failure.
+
+    Called right before saving so the names that get persisted, exported, and
+    matched against Blender's (already M_-stripped) Texture Set names are clean.
+    """
+    try:
+        _strip_texture_set_prefixes()
+    except Exception as error:
+        _log(f"Could not normalize Painter Texture Set names: {error}")
 
 
 def _mark_request_failed(request, message):
@@ -174,6 +379,13 @@ def _mark_request_failed(request, message):
     try:
         saved = dict(request)
         saved.pop("_request_path", None)
+        saved.pop("_loaded_perf", None)
+        saved.pop("_accepted_perf", None)
+        saved.pop("_reload_started_perf", None)
+        saved.pop("_bake_started_perf", None)
+        saved.pop("_needs_bake", None)
+        saved.pop("_low_reloaded", None)
+        saved.pop("_save_retry_count", None)
         saved["status"] = "FAILED"
         saved["failure"] = message
         _write_json(Path(request_path), saved)
@@ -235,7 +447,7 @@ def _process_export_request():
     except OSError:
         return
     try:
-        request = json.loads(claimed_request_path.read_text(encoding="utf-8"))
+        request = json.loads(claimed_request_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         _log(f"Could not read Painter export request: {error}")
         claimed_request_path.unlink(missing_ok=True)
@@ -255,7 +467,8 @@ def _process_export_request():
     _export_processing = True
     result_path = Path(request["texture_dir"]) / EXPORT_RESULT_FILENAME
     try:
-        preset_url = _export_preset_url(request)
+        _normalize_texture_set_names()
+        channel_audit = _ensure_cloth_export_channels(request)
         export_list = []
         for texture_set in substance_painter.textureset.all_texture_sets():
             for stack in texture_set.all_stacks():
@@ -266,17 +479,20 @@ def _process_export_request():
                     else texture_set.name
                 )
                 export_list.append({"rootPath": root_path})
-        result = substance_painter.export.export_project_textures({
-            "exportShaderParams": False,
-            "exportPath": request["texture_dir"],
-            "defaultExportPreset": preset_url,
-            "exportList": export_list,
-            "exportParameters": [{
-                "parameters": {
-                    "paddingAlgorithm": "infinite",
-                }
-            }],
-        })
+        errors = []
+        result = None
+        for preset in _export_preset_candidates(request):
+            try:
+                result = _export_textures_with_preset(request, export_list, preset)
+            except Exception as error:
+                errors.append(str(error))
+                continue
+            status_name = getattr(result.status, "name", str(result.status))
+            if status_name.lower() == "success":
+                break
+            errors.append(result.message)
+        if result is None:
+            raise RuntimeError("; ".join(errors) or "No Painter export preset candidate worked")
         status_name = getattr(result.status, "name", str(result.status))
         success = status_name.lower() == "success"
         _write_json(result_path, {
@@ -287,6 +503,7 @@ def _process_export_request():
                 "/".join(key): value
                 for key, value in result.textures.items()
             },
+            "channel_audit": channel_audit,
         })
         _log(
             f"Unreal_V2 texture export {'completed' if success else 'failed'}"
@@ -329,6 +546,9 @@ def _create_pending_project():
             template_file_path=str(template_path),
             settings=settings,
         )
+        # The M_ prefix is dropped later (in the save step, once the project is
+        # in edition state). project.create() returns before the Texture Sets
+        # exist, so renaming here would be a no-op.
         _pending_request_path().unlink(missing_ok=True)
         _log(f"Project created from Painter's Unreal Engine template: {request['spp']}")
     except Exception as error:
@@ -378,6 +598,34 @@ def _enum_value_containing(prop, *needles):
         if all(needle in normalized_label for needle in normalized_needles):
             return value
     return None
+
+
+def _antialiasing_property(properties):
+    return (
+        _find_property_containing_all(properties, "anti", "alias")
+        or _find_property(properties, "antialias", "supersampling", "subsampling")
+    )
+
+
+def _antialiasing_value(prop, requested):
+    requested = str(requested or "NONE").upper()
+    if prop is None:
+        return None
+    if requested == "NONE":
+        for needles in (
+            ("none",),
+            ("no", "anti"),
+            ("no", "sub"),
+            ("disabled",),
+            ("off",),
+            ("1",),
+        ):
+            value = _enum_value_containing(prop, *needles)
+            if value is not None:
+                return value
+        return None
+    samples = requested[1:] if requested.startswith("X") else requested
+    return _enum_value_containing(prop, samples)
 
 
 def _mesh_map_usages(names):
@@ -608,6 +856,19 @@ def _configure_baking(request):
             if match_value is not None:
                 changes[match] = match_value
 
+        antialiasing = _antialiasing_property(common)
+        antialiasing_value = _antialiasing_value(
+            antialiasing,
+            settings.get("antialiasing", "NONE"),
+        )
+        if antialiasing_value is not None:
+            changes[antialiasing] = antialiasing_value
+        elif settings.get("antialiasing", "NONE") != "NONE":
+            _log(
+                f"Texture Set '{texture_set_name}': could not find "
+                f"antialiasing value {settings.get('antialiasing')}"
+            )
+
         id_params = params.baker(substance_painter.textureset.MeshMapUsage.ID)
         id_source_property = _find_property(
             id_params, "colorsource", "idsource", "sourcecolor"
@@ -637,7 +898,8 @@ def _configure_baking(request):
 
     _log(
         f"Configured {len(texture_sets)} Texture Set(s), "
-        f"{resolution}px, match={settings.get('match')}"
+        f"{resolution}px, antialiasing={settings.get('antialiasing', 'NONE')}, "
+        f"match={settings.get('match')}"
     )
     _log_timing(f"configure baking total {_elapsed_ms(configure_started):.1f} ms")
 
@@ -808,6 +1070,7 @@ def _save_successful_request():
     saved = False
     started = time.perf_counter()
     try:
+        _normalize_texture_set_names()
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
@@ -855,6 +1118,7 @@ def _save_reimported_request():
         return
     started = time.perf_counter()
     try:
+        _normalize_texture_set_names()
         _apply_base_color_layers(request)
         _apply_alpha_color_layers(request)
         metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
@@ -878,6 +1142,50 @@ def _save_reimported_request():
         _log_timing(f"reload-only layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Low-poly mesh was reimported, but the update could not be saved: {error}")
+    _active_request = None
+    _processing = False
+
+
+def _save_normalized_request():
+    global _processing, _active_request
+    request = _active_request
+    if request is None:
+        _processing = False
+        return
+    started = time.perf_counter()
+    try:
+        _normalize_texture_set_names()
+        substance_painter.project.save()
+        _mark_request_success(request)
+        substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
+        _log("Texture Set names normalized and project saved")
+        _log_timing(f"normalize/save took {_elapsed_ms(started):.1f} ms")
+    except Exception as error:
+        _log(f"Could not normalize Texture Set names and save the project: {error}")
+        _mark_request_failed(request, str(error))
+    _active_request = None
+    _processing = False
+
+
+def _save_applied_maps_request():
+    global _processing, _active_request
+    request = _active_request
+    if request is None:
+        _processing = False
+        return
+    started = time.perf_counter()
+    try:
+        _normalize_texture_set_names()
+        _apply_base_color_layers(request)
+        _apply_alpha_color_layers(request)
+        substance_painter.project.save()
+        _mark_request_success(request)
+        substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
+        _log("Base Color / Alpha maps applied and project saved")
+        _log_timing(f"apply-maps save took {_elapsed_ms(started):.1f} ms")
+    except Exception as error:
+        _log(f"Could not apply Base Color / Alpha maps: {error}")
+        _mark_request_failed(request, str(error))
     _active_request = None
     _processing = False
 
@@ -984,6 +1292,33 @@ def _after_reload(status):
         _start_bake(_active_request)
 
 
+def _after_reload_only(status):
+    """Reload Mesh callback: persist the reloaded mesh.
+
+    Existing Texture Sets keep their names: Painter matches the reloaded
+    materials to existing Texture Sets by their imported (original) name, so a
+    set that was already renamed on create stays renamed. Texture Sets newly
+    introduced by the reload still carry the M_ prefix; that prefix is dropped
+    in _save_reloaded_request, just before the project is saved.
+    """
+    global _processing, _active_request
+    if status != substance_painter.project.ReloadMeshStatus.SUCCESS:
+        message = "Low-poly mesh reload failed"
+        _log(message)
+        if _active_request is not None:
+            _mark_request_failed(_active_request, message)
+        _active_request = None
+        _processing = False
+        return
+    reload_started = (
+        _active_request.get("_reload_started_perf") if _active_request else None
+    )
+    if reload_started:
+        _log_timing(f"reload_mesh callback after {_elapsed_ms(reload_started):.1f} ms")
+    _log("Low-poly mesh reloaded for Reload Mesh request")
+    substance_painter.project.execute_when_not_busy(_save_normalized_request)
+
+
 def _on_project_ready(_event=None):
     global _processing, _active_request, _last_polled_pipeline_hash
     global _last_busy_log_time
@@ -1016,6 +1351,46 @@ def _on_project_ready(_event=None):
         f"request accepted in {_elapsed_ms(started):.1f} ms "
         f"(load_to_accept={load_to_accept:.1f} ms{age_text})"
     )
+
+    if request.get("action") == "RELOAD_MESH":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        reload_settings = substance_painter.project.MeshReloadingSettings(
+            import_cameras=False,
+            preserve_strokes=True,
+        )
+        try:
+            request["_reload_started_perf"] = time.perf_counter()
+            substance_painter.project.reload_mesh(
+                request["low_fbx"],
+                reload_settings,
+                _after_reload_only,
+            )
+        except Exception as error:
+            _processing = False
+            _active_request = None
+            _last_polled_pipeline_hash = None
+            if "busy" in str(error).lower():
+                _log("Painter is still loading; mesh reload will retry")
+                return
+            _log(f"Could not reload the low-poly mesh: {error}")
+            _mark_request_failed(request, str(error))
+        return
+
+    if request.get("action") == "STRIP_PREFIX":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        substance_painter.project.execute_when_not_busy(_save_normalized_request)
+        return
+
+    if request.get("action") == "APPLY_MAPS":
+        _processing = True
+        _active_request = request
+        _last_polled_pipeline_hash = request_marker
+        substance_painter.project.execute_when_not_busy(_save_applied_maps_request)
+        return
 
     decision_started = time.perf_counter()
     metadata = substance_painter.project.Metadata(METADATA_CONTEXT)

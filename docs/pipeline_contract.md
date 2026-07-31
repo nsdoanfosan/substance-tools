@@ -10,7 +10,7 @@ hardest kind of bug to debug. Treat this file and `pipeline_contract.json` as
 the source of truth before changing any pipeline-facing names.
 
 Sections below separate **Current behavior** (verified against the code on
-2026-06-24) from **Target direction** (what we want but have not built yet).
+2026-06-27) from **Target direction** (what we want but have not built yet).
 Do not read a target as if it were current behavior. When the code changes,
 re-verify and update this file and `pipeline_contract.json` together.
 
@@ -27,7 +27,7 @@ two.
 
 ## Shared Conventions (Current behavior)
 
-Verified against the code on 2026-06-24.
+Verified against the code on 2026-06-27.
 
 Collections. Role is decided by COLLECTION MEMBERSHIP, not by object name:
 
@@ -87,6 +87,50 @@ wrong path.
 
 When debugging "nothing happened", check the contract before changing behavior.
 
+## Unreal Handoff Sidecar Contract
+
+`ue-unique-export-names-addon` writes per-mesh or per-Empty JSON sidecars for
+Send to Unreal and the Unreal material setup script. The current sidecar schema
+is version 2 and includes material entries plus a `cleanup` object.
+
+The `cleanup.source_material_names` and `cleanup.source_texture_names` arrays
+are precomputed by the producer. They describe FBX-import source assets that may
+be removed from the imported mesh folder after Unreal material instances and
+canonical textures are set up. Consumers should prefer these arrays when present
+and fall back to deriving cleanup names from `materials` only for older sidecars.
+
+## SpeedTree Production Group Naming Contract
+
+SpeedTree handoff contract version 2 derives production groups from material
+structure, not from a hardcoded list such as `green`, `yellow`, or `dead`.
+After Blender duplicate and `.stmat` suffix cleanup, the parser finds the last
+independent numeric segment. When a non-empty suffix follows that segment through
+an allowed separator, the name through the number is the production-group base
+and the entire remaining suffix is one case-folded group value.
+
+| Material | Base | Production group |
+| --- | --- | --- |
+| `M_Leaf_common_grass_01_green` | `M_Leaf_common_grass_01` | `green` |
+| `M_Leaf_common_grass_01_dead` | `M_Leaf_common_grass_01` | `dead` |
+| `M_Leaf_common_grass_01_winter_dry` | `M_Leaf_common_grass_01` | `winter_dry` |
+| `M_stem_common_01` | `M_stem_common_01` | none |
+| `M_Branch_deadbranch_01` | `M_Branch_deadbranch_01` | none |
+
+The compatibility field `production_group_tokens` remains an array, but it now
+contains either no value or exactly one complete suffix. Words before the final
+number are never stripped, and suffixes are accepted regardless of whether an
+Atlas Leaf Mesh Builder generated them or a user supplied a collection name.
+The regex, separators, normalization, cardinality, and safety boundary live in
+`pipeline_contract.json`; consumers must not recreate a token allowlist.
+
+This is a pure material-name parser only. Its result does not establish SPM or
+STMAT provenance, does not compare a source signature, and does not authorize an
+atlas split or source mutation. Application runtimes must separately enforce
+`pcg_atlas_auto_split.requires_provenance_and_matching_source_signature` before
+using parsed production groups for those operations. Atlas Builder's automatic
+classifier labels do not restrict user collection names, and SpeedTree
+`instance_profile` is a separate namespace.
+
 ## Path Mapping Contract
 
 The current Unreal handoff has historically assumed a simple anchor:
@@ -130,7 +174,7 @@ files. Painter polls every `0.5` seconds (`QTimer.setInterval(500)`). Every file
 is written to a `.<name>.tmp` sibling and then `os.replace()`d into place, so a
 reader never sees a half-written file.
 
-### Current behavior (verified 2026-06-24)
+### Current behavior (verified 2026-06-27)
 
 The files are NOT all in one folder:
 
@@ -201,6 +245,38 @@ Important behavior:
 
 If this behavior changes, update the contract and run a real Painter round trip.
 
+## Solidify Plus Rim Handling
+
+Current behavior. Low meshes may use `Solidify Plus 1.41` to generate an
+inner/back shell plus rim faces for the final Unreal export. Painter should not
+receive the final rim faces for baking, because those side faces can change the
+low-poly surface used by ray projection and mesh-map generation. That can move
+curvature/AO/normal-driven smart material masks and make seam-based texturing
+look different from the intended low source.
+
+Do not solve this by exporting the Low mesh with Solidify disabled. Disabling
+the modifier removes the generated inner/back shell as well as the rim, which
+is a different mesh than the intended Painter target. The `Hide Solidify Rim in
+Painter Low` toggle is enabled by default; when enabled, the Painter Low export
+evaluates Solidify Plus with the shell intact but temporarily sets `Fill Rim` to
+`False` for the export copy only, then restores the user's modifier settings
+immediately after export.
+
+Final Blender-to-Unreal export keeps the normal user-facing state, including
+`Fill Rim=True`, so the shipped mesh still contains the rim. This split exists
+to avoid a human-maintained pair of "Painter Low without rim" and "Final Low
+with rim" objects per asset. The one editable source object remains the truth;
+the export mode decides whether rim faces are included.
+
+Implementation rule:
+
+- Substance/Painter Low FBX with the default toggle enabled: Solidify Plus
+  evaluated, `Fill Rim=False`.
+- Substance/Painter Low FBX with the toggle disabled: current Blender state.
+- Final/Send to Unreal FBX: current Blender state, usually `Fill Rim=True`.
+- Never use "disable all modifiers" as the rimless Painter path; it drops the
+  back shell and changes the baking target.
+
 ## Validation Requirements
 
 Any large rewrite of protection logic, bake-plan logic, JSON request handling,
@@ -215,6 +291,9 @@ or Send to Unreal handoff logic needs at least one real end-to-end test:
 7. Confirm the expected `T_<texture_set>_<map>.png` maps are applied.
 8. Confirm the `Baking/low` hierarchy is linked into `Export` for Send to
    Unreal without duplicating or renaming Painter Low data.
+9. For any Low object using `Solidify Plus 1.41`, confirm the Painter Low FBX
+   has the inner/back shell but no filled rim faces, and the final Export path
+   still keeps the rim.
 
 This is especially important after large commits that rewrite protection logic.
 For example, if a branch contains a `d0f438c`-style rewrite, do not trust static

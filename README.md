@@ -1,5 +1,8 @@
 # Substance Import-Export Tools
 
+> Adobe Substance 3D Designer live MCP support is available in
+> [`designer_mcp/`](designer_mcp/README.md).
+
 A Blender add-on that drives a **Blender → Substance Painter → Unreal** baking
 and texturing pipeline. Meshes are organised in a fixed `Baking` collection
 layout, sent to Painter for mesh-map baking and texturing, and the resulting
@@ -13,8 +16,8 @@ names, texture/material prefixes, JSON request files, or Unreal path anchors.
 
 > Originally derived from
 > [passivestar/substance-tools](https://github.com/passivestar/substance-tools)
-> and licensed under GPLv3. It has since been almost entirely rewritten through
-> 3.0.0 (2026): the original collection-based workflow (`Export and Open in
+> and has since been almost entirely rewritten through 3.0.0 (2026): the
+> original collection-based workflow (`Export and Open in
 > Painter` / `Load Painter Textures`, Node Wrangler dependency, custom Textures
 > Path) was removed, and the only workflow now is the `Baking` collection
 > pipeline described below.
@@ -143,11 +146,27 @@ FBX file bytes), so editing one asset doesn't force a full re-bake.
     required Low reimport.
 
   If Painter is closed it is launched on the existing project first.
+
+  The default **Hide Solidify Rim in Painter Low** toggle handles `Solidify Plus
+  1.41` shells by sending Painter the evaluated shell without filled rim faces;
+  final Send to Unreal export still keeps the rim. Do not disable Solidify for
+  Painter just to remove the rim, because that also removes the generated
+  inner/back shell. See [Solidify Plus Rim Handling](docs/pipeline_contract.md#solidify-plus-rim-handling)
+  for the rationale.
 - **Export Painter Textures & Apply** (enabled once the project exists) — asks
   the open project to export with the `Unreal_V2` preset, waits (5-minute
   timeout), reloads the maps, and connects **Color, Normal, packed Extra,
   Emissive, and Height** to the Low materials. The packed Extra texture uses
   **Green = Roughness, Blue = Metallic**.
+- **Export Preset** selects the Painter output template used by that button.
+  `Unreal_V2_Cloth` also exports and reconnects **SheenColor, SheenOpacity, and
+  SheenRoughness** for cloth material instances. Before exporting, the Painter
+  plugin verifies the real Texture Set stack channels and enables missing
+  SheenColor, SheenOpacity, and SheenRoughness channels.
+  In the Unreal handoff sidecar those maps stay named **Sheen Color**,
+  **Sheen Opacity**, and **Sheen Roughness**; Send2UE remaps them through
+  `pipeline_contract.json` to the cloth master texture parameters
+  **Fuzz Color Map**, **Fuzz Mask**, and **Fuzz Roughness Map**.
 - **Base Color Source** — `Use Painter Base Color` / `Use Baked Base Color`
   switches only the Low material connection; both source files stay untouched.
   The Painter Base Color already contains the alpha-overlay result, so the
