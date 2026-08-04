@@ -1,5 +1,5 @@
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "tree_axes": [
     {"name": "M_leaf_parsley_atlas_02_stem", "tree_part": "leaf", "tree_shading": "foliage"},
     {"name": "M_leaf_oak_01_twig", "tree_part": "leaf", "tree_shading": "foliage"},
@@ -29,9 +29,10 @@
     {"material": "M_Leaf_v2_common_dead", "base": "M_Leaf_v2_common_dead", "tokens": []}
   ],
   "tree_texture_policy": [
-    {"param": "Alpha", "tree_shading": "foliage", "allowed": false},
-    {"param": "Opacity", "tree_shading": "foliage", "allowed": false},
-    {"param": "Opacity Map", "tree_shading": "foliage", "allowed": false},
+    {"param": "Alpha", "tree_shading": "foliage", "allowed": true},
+    {"param": "Opacity", "tree_shading": "foliage", "allowed": true},
+    {"param": "Opacity Map", "tree_shading": "foliage", "allowed": true},
+    {"param": "Opacity Map", "tree_shading": "wood", "allowed": true},
     {"param": "Transmission", "tree_shading": "foliage", "allowed": false},
     {"param": "Subsurface", "tree_shading": "wood", "allowed": false},
     {"param": "Subsurface", "tree_shading": "foliage", "allowed": true},

@@ -55,8 +55,8 @@ class SpeedTreeHandoffContractTests(unittest.TestCase):
                 )
 
     def test_profile_validation_and_contract_revision(self):
-        self.assertEqual(contract.contract_version(), 2)
-        self.assertEqual(contract.golden_vectors()["contract_version"], 2)
+        self.assertEqual(contract.contract_version(), 3)
+        self.assertEqual(contract.golden_vectors()["contract_version"], 3)
         self.assertEqual(contract.normalize_instance_profile("Dead"), "dead")
         with self.assertRaises(ValueError):
             contract.normalize_instance_profile("../dead")

@@ -240,7 +240,7 @@
         "priority": "Explicit tree_part/tree_shading wins. In name fallback, a leaf-atlas or leaf-family scope wins over a stem/twig subgroup label, so M_leaf_*_stem and M_leaf_*_twig remain tree_part=leaf and tree_shading=foliage. Standalone M_stem_common_* materials use tree_part=branch and tree_shading=stem. Other branch/twig materials use branch/wood; bark/trunk/stump materials use bark/wood.",
         "custom_properties": "Blender material custom properties unreal_tree_part and unreal_tree_shading may explicitly set their respective axes."
       },
-      "opacity_policy": "Tree handoff excludes Alpha, Opacity, Opacity Map, and Transmission before texture import; these parameters are never emitted or assigned to tree MYIs.",
+      "opacity_policy": "Tree cutout opacity is handed off as one canonical non-virtual-texture parameter named Opacity Map. Alpha and Opacity source aliases normalize to Opacity Map; Transmission remains excluded because it is not the cutout contract.",
       "subsurface_policy": "Subsurface is controlled by tree_shading, not tree_part. Only wood excludes Subsurface. Foliage and stem may resolve an explicit or sibling *_subsurface map (including a Megascans-style *_Translucency source) and assign it to the MYI. Foliage uses MSS_TWO_SIDED_WRAP; stem uses MSS_WRAP.",
       "master_selection": "The entry-level preset remains 'tree'. Consumers select the master by tree_shading: wood=M_TreeAsset_Master, foliage=M_TreeAsset_Foliage_Master (TwoSidedWrap), and stem=M_TreeAsset_Stem_Master (Wrap). A stem therefore combines the Branch material layer with the stem master and Subsurface.",
       "legacy_normalization": "Before an active export, legacy M_stem_05 references are normalized to M_stem_common_01. The legacy material, textures, backups, and historical data remain preserved and are not renamed or deleted."
@@ -279,7 +279,7 @@
     }
   },
   "speedtree_handoff_rules": {
-    "contract_version": 2,
+    "contract_version": 3,
     "sidecar_kind": "speedtree",
     "material_name": {
       "blender_duplicate_suffix_pattern": "\\.\\d{3}$",
@@ -364,7 +364,7 @@
     },
     "texture_policy": {
       "required_roles": ["color", "normal", "extra", "height", "opacity", "subsurface"],
-      "excluded_params": ["alpha", "opacity", "opacity map", "transmission"],
+      "excluded_params": ["transmission"],
       "excluded_by_shading": {
         "wood": ["subsurface"]
       }
