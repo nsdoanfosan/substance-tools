@@ -45,6 +45,7 @@ PAINTER_CLOTH_TEXTURE_ROLES = PAINTER_TEXTURE_ROLES + (
 )
 BAKING_ROLE_COLLECTIONS = (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION)
 _BAKING_ROLE_MEMBERSHIP = {}
+_BAKING_ROLE_COLLECTION_SIGNATURE = ()
 _BAKING_ROLE_SYNCING = False
 
 
@@ -160,6 +161,41 @@ def object_baking_roles(obj, roles):
   return memberships
 
 
+def baking_role_collection_signature(roles):
+  """Return the role membership state without scanning unrelated objects."""
+  entries = set()
+  for role, collections in roles.items():
+    for collection in collections:
+      collection_pointer = collection.as_pointer()
+      for obj in collection.objects:
+        entries.add((role, collection_pointer, obj.as_pointer()))
+  return tuple(sorted(entries))
+
+
+def depsgraph_requires_baking_role_sync(scene, depsgraph):
+  """Only request a full role sync when baking collection membership changed."""
+  if _BAKING_ROLE_SYNCING:
+    return False
+
+  _, roles = baking_role_children(scene)
+  if not roles:
+    return False
+
+  collection_or_scene_updated = False
+  for update in depsgraph.updates:
+    id_data = getattr(update.id, 'original', None) or update.id
+    if isinstance(id_data, bpy.types.Object):
+      previous = _BAKING_ROLE_MEMBERSHIP.get(id_data.as_pointer(), set())
+      if object_baking_roles(id_data, roles) != previous:
+        return True
+    elif isinstance(id_data, (bpy.types.Collection, bpy.types.Scene)):
+      collection_or_scene_updated = True
+
+  if not collection_or_scene_updated:
+    return False
+  return baking_role_collection_signature(roles) != _BAKING_ROLE_COLLECTION_SIGNATURE
+
+
 def unlink_from_export_preserving_visibility(obj, export_collection, scene=None):
   if export_collection is None or export_collection not in obj.users_collection:
     return False
@@ -175,21 +211,23 @@ def unlink_from_export_preserving_visibility(obj, export_collection, scene=None)
 
 
 def remember_baking_role_membership(scene=None):
-  global _BAKING_ROLE_MEMBERSHIP
+  global _BAKING_ROLE_MEMBERSHIP, _BAKING_ROLE_COLLECTION_SIGNATURE
   _, roles = baking_role_children(scene)
   if not roles:
     _BAKING_ROLE_MEMBERSHIP = {}
+    _BAKING_ROLE_COLLECTION_SIGNATURE = ()
     return
   tracked = {}
-  for obj in bpy.data.objects:
-    memberships = object_baking_roles(obj, roles)
-    if memberships:
-      tracked[obj.as_pointer()] = memberships
+  for role, collections in roles.items():
+    for collection in collections:
+      for obj in collection.objects:
+        tracked.setdefault(obj.as_pointer(), set()).add(role)
   _BAKING_ROLE_MEMBERSHIP = tracked
+  _BAKING_ROLE_COLLECTION_SIGNATURE = baking_role_collection_signature(roles)
 
 
 def sync_exclusive_baking_roles(scene=None):
-  global _BAKING_ROLE_MEMBERSHIP, _BAKING_ROLE_SYNCING
+  global _BAKING_ROLE_MEMBERSHIP, _BAKING_ROLE_COLLECTION_SIGNATURE, _BAKING_ROLE_SYNCING
   if _BAKING_ROLE_SYNCING:
     return
   _, roles = baking_role_children(scene)
@@ -236,6 +274,7 @@ def sync_exclusive_baking_roles(scene=None):
       if memberships:
         next_membership[obj.as_pointer()] = memberships
     _BAKING_ROLE_MEMBERSHIP = next_membership
+    _BAKING_ROLE_COLLECTION_SIGNATURE = baking_role_collection_signature(roles)
   finally:
     _BAKING_ROLE_SYNCING = False
 
@@ -262,7 +301,8 @@ def ensure_baking_collections_deferred():
 
 @bpy.app.handlers.persistent
 def sync_exclusive_baking_roles_on_depsgraph(_scene, _depsgraph):
-  sync_exclusive_baking_roles(_scene)
+  if depsgraph_requires_baking_role_sync(_scene, _depsgraph):
+    sync_exclusive_baking_roles(_scene)
 
 
 def get_baking_collections():
@@ -1268,6 +1308,52 @@ def solidify_plus_fill_rim_socket_id(modifier):
   return None
 
 
+def geometry_nodes_input_state(modifier, socket_id):
+  inputs = getattr(getattr(modifier, 'properties', None), 'inputs', None)
+  if inputs is not None:
+    try:
+      input_group = inputs[socket_id]
+      if 'value' in input_group:
+        return True, input_group['value']
+      return False, None
+    except (KeyError, TypeError):
+      pass
+  try:
+    if socket_id in modifier.keys():
+      return True, modifier.get(socket_id)
+  except (AttributeError, TypeError):
+    pass
+  return False, None
+
+
+def set_geometry_nodes_input_value(modifier, socket_id, value):
+  inputs = getattr(getattr(modifier, 'properties', None), 'inputs', None)
+  if inputs is not None:
+    try:
+      inputs[socket_id]['value'] = value
+      return
+    except (KeyError, TypeError):
+      pass
+  modifier[socket_id] = value
+
+
+def delete_geometry_nodes_input_value(modifier, socket_id):
+  inputs = getattr(getattr(modifier, 'properties', None), 'inputs', None)
+  if inputs is not None:
+    try:
+      input_group = inputs[socket_id]
+      if 'value' in input_group:
+        del input_group['value']
+      return
+    except (KeyError, TypeError):
+      pass
+  try:
+    if socket_id in modifier.keys():
+      del modifier[socket_id]
+  except (AttributeError, TypeError):
+    pass
+
+
 def set_solidify_plus_fill_rim(source_objects, enabled):
   restore = []
   for obj in source_objects:
@@ -1275,10 +1361,9 @@ def set_solidify_plus_fill_rim(source_objects, enabled):
       socket_id = solidify_plus_fill_rim_socket_id(modifier)
       if not socket_id:
         continue
-      had_value = socket_id in modifier.keys()
-      old_value = modifier.get(socket_id)
+      had_value, old_value = geometry_nodes_input_state(modifier, socket_id)
       restore.append((obj, modifier, socket_id, had_value, old_value))
-      modifier[socket_id] = bool(enabled)
+      set_geometry_nodes_input_value(modifier, socket_id, bool(enabled))
       obj.update_tag(refresh={'DATA'})
   if restore:
     bpy.context.view_layer.update()
@@ -1297,9 +1382,9 @@ def refresh_solidify_plus_modifier(obj, modifier):
 def restore_solidify_plus_fill_rim(restore):
   for obj, modifier, socket_id, had_value, old_value in reversed(restore):
     if had_value:
-      modifier[socket_id] = old_value
-    elif socket_id in modifier.keys():
-      del modifier[socket_id]
+      set_geometry_nodes_input_value(modifier, socket_id, old_value)
+    else:
+      delete_geometry_nodes_input_value(modifier, socket_id)
     refresh_solidify_plus_modifier(obj, modifier)
   if restore:
     bpy.context.view_layer.update()
@@ -2017,9 +2102,31 @@ def _hash_modifier_summary(digest, obj, normalize_solidify_plus_fill_rim=False):
       if normalize_solidify_plus_fill_rim
       else None
     )
+    inputs = getattr(getattr(modifier, 'properties', None), 'inputs', None)
+    interface = getattr(getattr(modifier, 'node_group', None), 'interface', None)
+    if inputs is not None and interface is not None:
+      for item in interface.items_tree:
+        if (
+          getattr(item, 'item_type', None) != 'SOCKET'
+          or getattr(item, 'in_out', None) != 'INPUT'
+        ):
+          continue
+        had_value, value = geometry_nodes_input_state(modifier, item.identifier)
+        if not had_value:
+          continue
+        if item.identifier == fill_rim_socket:
+          value = False
+        if hasattr(value, 'name'):
+          value = value.name
+        elif not isinstance(value, (str, int, float, bool, type(None))):
+          try:
+            value = list(value)
+          except TypeError:
+            value = str(value)
+        _hash_update_value(digest, ('geometry_nodes_input', item.identifier, value))
     try:
       id_property_keys = sorted(modifier.keys())
-    except TypeError:
+    except (AttributeError, TypeError):
       id_property_keys = []
     for key in id_property_keys:
       value = False if key == fill_rim_socket else modifier[key]
