@@ -284,7 +284,10 @@ def ensure_baking_collections_on_load(_unused):
   for scene in bpy.data.scenes:
     _, low_collection, _, _ = ensure_baking_collections(scene)
     if low_collection is not None:
-      sync_bake_selection(scene, low_texture_set_names(collection_meshes(low_collection)))
+      sync_bake_selection(
+        scene,
+        low_texture_set_names(painter_collection_meshes(low_collection)),
+      )
     sync_exclusive_baking_roles(scene)
   remember_baking_role_membership()
 
@@ -293,7 +296,10 @@ def ensure_baking_collections_deferred():
   for scene in bpy.data.scenes:
     _, low_collection, _, _ = ensure_baking_collections(scene)
     if low_collection is not None:
-      sync_bake_selection(scene, low_texture_set_names(collection_meshes(low_collection)))
+      sync_bake_selection(
+        scene,
+        low_texture_set_names(painter_collection_meshes(low_collection)),
+      )
     sync_exclusive_baking_roles(scene)
   remember_baking_role_membership()
   return None
@@ -334,7 +340,7 @@ def painter_low_export_hierarchy():
 
   if low_collection is not None:
     for obj in low_collection.all_objects:
-      if obj.type != 'MESH':
+      if obj.type != 'MESH' or is_painter_guide_mesh(obj):
         continue
       low_objects.add(obj)
       for modifier in obj.modifiers:
@@ -574,6 +580,23 @@ def collection_meshes(collection):
   )
 
 
+def is_painter_guide_mesh(obj):
+  """Treat wire-only viewport meshes as non-exporting Painter guides.
+
+  The decision is intentionally independent of object names. Temporary H-key,
+  viewport, and render visibility are not used because they can hide otherwise
+  valid bake meshes during ordinary scene work.
+  """
+  return obj.type == 'MESH' and obj.display_type == 'WIRE'
+
+
+def painter_collection_meshes(collection):
+  return [
+    obj for obj in collection_meshes(collection)
+    if not is_painter_guide_mesh(obj)
+  ]
+
+
 def stripped_material_name(name):
   return name[len(MATERIAL_PREFIX):] if name.startswith(MATERIAL_PREFIX) else name
 
@@ -789,7 +812,7 @@ def alpha_target_material_items(alpha_object, _context):
   if alpha_object is None:
     return [('AUTO', 'Auto', 'Use the only or same-named Low material')]
   _, low_collection, _, _ = ensure_baking_collections()
-  low_objects = collection_meshes(low_collection) if low_collection else []
+  low_objects = painter_collection_meshes(low_collection) if low_collection else []
   materials = []
   seen = set()
   for low in matching_low_objects(alpha_object, low_objects):

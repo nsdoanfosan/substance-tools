@@ -11,10 +11,10 @@ class PairSelectedBakingMeshesOperator(bpy.types.Operator):
     )
     selected = {obj for obj in context.selected_objects if obj.type == 'MESH'}
     low_selected = [
-      obj for obj in collection_meshes(low_collection) if obj in selected
+      obj for obj in painter_collection_meshes(low_collection) if obj in selected
     ]
     high_selected = [
-      obj for obj in collection_meshes(high_collection) if obj in selected
+      obj for obj in painter_collection_meshes(high_collection) if obj in selected
     ]
     if len(low_selected) > 1:
       self.report(
@@ -299,11 +299,11 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
       context.scene
     )
-    low_objects = collection_meshes(low_collection)
-    alpha_objects = collection_meshes(alpha_collection)
+    low_objects = painter_collection_meshes(low_collection)
+    alpha_objects = painter_collection_meshes(alpha_collection)
     alpha_ids = {obj.as_pointer() for obj in alpha_objects}
     high_objects = [
-      obj for obj in collection_meshes(high_collection)
+      obj for obj in painter_collection_meshes(high_collection)
       if obj.as_pointer() not in alpha_ids
     ]
     if not low_objects:
@@ -729,7 +729,7 @@ class ReloadMeshOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
-    low_objects = collection_meshes(low_collection)
+    low_objects = painter_collection_meshes(low_collection)
     if not low_objects:
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
@@ -830,12 +830,14 @@ def send_painter_bake_request(context, selected=None):
   _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
     context.scene
   )
-  low_objects = collection_meshes(low_collection)
+  low_objects = painter_collection_meshes(low_collection)
   if not low_objects:
     raise RuntimeError("The 'Baking/low' collection has no mesh objects")
-  alpha_ids = {obj.as_pointer() for obj in collection_meshes(alpha_collection)}
+  alpha_ids = {
+    obj.as_pointer() for obj in painter_collection_meshes(alpha_collection)
+  }
   high_objects = [
-    obj for obj in collection_meshes(high_collection)
+    obj for obj in painter_collection_meshes(high_collection)
     if obj.as_pointer() not in alpha_ids
   ]
 
@@ -952,7 +954,7 @@ class RefreshBakeSelectionOperator(bpy.types.Operator):
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
     sync_bake_selection(
       context.scene,
-      low_texture_set_names(collection_meshes(low_collection)),
+      low_texture_set_names(painter_collection_meshes(low_collection)),
     )
     return {'FINISHED'}
 
@@ -968,7 +970,7 @@ class BakeSelectedInPainterOperator(bpy.types.Operator):
     _, low_collection, _, _ = ensure_baking_collections(scene)
     sync_bake_selection(
       scene,
-      low_texture_set_names(collection_meshes(low_collection)),
+      low_texture_set_names(painter_collection_meshes(low_collection)),
     )
     selected = {item.name for item in scene.substance_tools_bake_selection if item.bake}
     try:
@@ -995,12 +997,12 @@ class BakeBaseColorToLowOperator(bpy.types.Operator):
     _, low_collection, high_collection, alpha_collection = ensure_baking_collections(
       context.scene
     )
-    low_objects = collection_meshes(low_collection)
+    low_objects = painter_collection_meshes(low_collection)
     alpha_ids = {
-      obj.as_pointer() for obj in collection_meshes(alpha_collection)
+      obj.as_pointer() for obj in painter_collection_meshes(alpha_collection)
     }
     high_objects = [
-      obj for obj in collection_meshes(high_collection)
+      obj for obj in painter_collection_meshes(high_collection)
       if obj.as_pointer() not in alpha_ids
     ]
     if not low_objects:
@@ -1094,8 +1096,8 @@ class BakeAlphaDetailsToLowOperator(bpy.types.Operator):
     _, low_collection, _, alpha_collection = ensure_baking_collections(
       context.scene
     )
-    low_objects = collection_meshes(low_collection)
-    alpha_objects = collection_meshes(alpha_collection)
+    low_objects = painter_collection_meshes(low_collection)
+    alpha_objects = painter_collection_meshes(alpha_collection)
     if not low_objects:
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
@@ -1164,7 +1166,7 @@ class SendPainterMapsOperator(bpy.types.Operator):
       return {'CANCELLED'}
 
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
-    texture_sets = low_texture_set_names(collection_meshes(low_collection))
+    texture_sets = low_texture_set_names(painter_collection_meshes(low_collection))
 
     baked_base_color = (
       paths['texture_dir'] / f'{base_color_bake_name(texture_sets[0])}.png'
@@ -1234,7 +1236,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       self.report({'ERROR'}, 'Create the Painter project first')
       return {'CANCELLED'}
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
-    if not collection_meshes(low_collection):
+    if not painter_collection_meshes(low_collection):
       self.report({'ERROR'}, "The 'Baking/low' collection has no mesh objects")
       return {'CANCELLED'}
     painter_path = get_preferences(context)['painter_path']
@@ -1309,7 +1311,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
 
     canonicalize_painter_export_files(result)
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
-    low_objects = collection_meshes(low_collection)
+    low_objects = painter_collection_meshes(low_collection)
     applied = apply_painter_textures_to_low(
       low_objects,
       baking_paths()['texture_dir'],
@@ -1358,7 +1360,7 @@ class ToggleBaseColorSourceOperator(bpy.types.Operator):
 
   def execute(self, context):
     _, low_collection, _, _ = ensure_baking_collections(context.scene)
-    low_objects = collection_meshes(low_collection)
+    low_objects = painter_collection_meshes(low_collection)
     props = context.scene.substance_tools_baking
     target = 'BAKING' if props.base_color_source == 'PAINTER' else 'PAINTER'
     texture_dir = baking_paths()['texture_dir']

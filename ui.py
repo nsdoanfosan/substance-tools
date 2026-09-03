@@ -34,11 +34,13 @@ class SubstanceToolsPanel(bpy.types.Panel):
     baking_box.prop(baking, 'id_source')
     baking_box.prop(baking, 'painter_low_hide_solidify_rim')
     _, low_collection, high_collection, alpha_collection = get_baking_collections()
-    low_objects = collection_meshes(low_collection) if low_collection else []
-    alpha_objects = collection_meshes(alpha_collection) if alpha_collection else []
+    low_objects = painter_collection_meshes(low_collection) if low_collection else []
+    alpha_objects = painter_collection_meshes(alpha_collection) if alpha_collection else []
     alpha_ids = {obj.as_pointer() for obj in alpha_objects}
     high_objects = [
-      obj for obj in (collection_meshes(high_collection) if high_collection else [])
+      obj for obj in (
+        painter_collection_meshes(high_collection) if high_collection else []
+      )
       if obj.as_pointer() not in alpha_ids
     ]
     painter_project_exists = baking_paths()['spp'].is_file() if bpy.data.filepath else False
