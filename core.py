@@ -2,6 +2,8 @@ import bpy, bmesh, re, subprocess, os, time, traceback
 import colorsys
 import hashlib
 import json
+import shutil
+import tempfile
 from array import array
 from collections import defaultdict
 from pathlib import Path
@@ -38,6 +40,7 @@ PAINTER_EXPORT_PRESET_ITEMS = (
   ),
 )
 PAINTER_TEXTURE_ROLES = ('Color', 'Extra', 'Normal', 'Emissive', 'Height')
+MESHY_PAINTER_CANONICAL_ROLES = ('Color', 'Extra', 'Normal')
 PAINTER_CLOTH_TEXTURE_ROLES = PAINTER_TEXTURE_ROLES + (
   'SheenColor',
   'SheenOpacity',
@@ -714,22 +717,22 @@ def low_objects_by_texture_set(low_objects):
 
 
 def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
-  high_by_base = {
-    match_base(obj.name, 'high').lower(): obj
-    for obj in high_objects
-  }
+  high_by_base = defaultdict(list)
+  for obj in high_objects:
+    high_by_base[match_base(obj.name, 'high').lower()].append(obj)
   entries = defaultdict(lambda: {'objects': [], 'bases': set()})
   for low in low_objects:
     base = match_base(low.name, 'low').lower()
-    high = high_by_base.get(base)
-    if high is None:
+    matching_highs = high_by_base.get(base, ())
+    if not matching_highs:
       continue
     for slot in low.material_slots:
       if not slot.material:
         continue
       texture_set = stripped_material_name(slot.material.name)
-      if high not in entries[texture_set]['objects']:
-        entries[texture_set]['objects'].append(high)
+      for high in matching_highs:
+        if high not in entries[texture_set]['objects']:
+          entries[texture_set]['objects'].append(high)
       entries[texture_set]['bases'].add(base)
 
   result = []
@@ -751,6 +754,82 @@ def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
 
 def base_color_bake_name(texture_set):
   return f'T_{clean_name(texture_set)}_Color_baking'
+
+
+def source_map_bake_name(texture_set, role):
+  role_names = {
+    'BaseColor': 'Color_baking',
+    'Extra': 'Extra_baking',
+    'ExtraR': 'ExtraR_baking',
+    'Roughness': 'Roughness_baking',
+    'Metallic': 'Metallic_baking',
+    'Normal': 'Normal_baking',
+  }
+  if role not in role_names:
+    raise ValueError(f'Unsupported source-map role: {role}')
+  return f'T_{clean_name(texture_set)}_{role_names[role]}'
+
+
+def painter_source_map_plan(texture_sets, texture_dir):
+  """Return only complete, independently sampled Painter source channels.
+
+  Extra is deliberately transported as three split grayscale images. Painter
+  grayscale channels must not receive the packed RGB image because Painter
+  would sample luminance and corrupt the original per-channel values.
+  """
+  texture_dir = Path(texture_dir)
+  result = {}
+  for texture_set in texture_sets:
+    role_paths = {
+      role: texture_dir / f'{source_map_bake_name(texture_set, role)}.png'
+      for role in ('BaseColor', 'ExtraR', 'Roughness', 'Metallic')
+    }
+    existing = {
+      role: str(path.resolve())
+      for role, path in role_paths.items()
+      if path.is_file()
+    }
+    if existing:
+      result[texture_set] = existing
+  return result
+
+
+def painter_source_normal_mesh_map_plan(texture_sets, texture_dir):
+  texture_dir = Path(texture_dir)
+  result = {}
+  for texture_set in texture_sets:
+    path = texture_dir / f'{source_map_bake_name(texture_set, "Normal")}.png'
+    if path.is_file():
+      result[texture_set] = {
+        'source_normal_texture': str(path.resolve()),
+        'normal_convention': 'DIRECTX',
+        'basis': 'LOW_TANGENT',
+      }
+  return result
+
+
+def hash_nested_existing_paths(plan):
+  result = {}
+  for texture_set, entry in plan.items():
+    if isinstance(entry, dict):
+      role_hashes = {}
+      for role, path_or_entry in entry.items():
+        if isinstance(path_or_entry, dict):
+          path_value = path_or_entry.get('source_normal_texture') or path_or_entry.get('path')
+        else:
+          path_value = path_or_entry
+        if not path_value or role in {'normal_convention', 'basis'}:
+          continue
+        path = Path(path_value)
+        if path.is_file():
+          role_hashes[role] = file_hash(path)
+      if role_hashes:
+        result[texture_set] = role_hashes
+    elif entry:
+      path = Path(entry)
+      if path.is_file():
+        result[texture_set] = file_hash(path)
+  return result
 
 
 def alpha_color_bake_name(texture_set):
@@ -1127,6 +1206,48 @@ def force_material_opaque(material):
       pass
 
 
+def connect_painter_directx_normal(node_tree, image_node, principled_nodes):
+  """Connect a Painter DirectX normal map to Blender with an explicit Y flip."""
+  separate = (
+    node_tree.nodes.get('Painter Normal DirectX Channels')
+    or node_tree.nodes.new('ShaderNodeSeparateColor')
+  )
+  separate.name = 'Painter Normal DirectX Channels'
+  separate.mode = 'RGB'
+  invert_green = (
+    node_tree.nodes.get('Painter Normal DirectX Green Flip')
+    or node_tree.nodes.new('ShaderNodeMath')
+  )
+  invert_green.name = 'Painter Normal DirectX Green Flip'
+  invert_green.operation = 'SUBTRACT'
+  invert_green.inputs[0].default_value = 1.0
+  combine = (
+    node_tree.nodes.get('Painter Normal OpenGL')
+    or node_tree.nodes.new('ShaderNodeCombineColor')
+  )
+  combine.name = 'Painter Normal OpenGL'
+  combine.mode = 'RGB'
+  normal_node = (
+    node_tree.nodes.get('Painter Normal')
+    or node_tree.nodes.new('ShaderNodeNormalMap')
+  )
+  normal_node.name = 'Painter Normal'
+  normal_node.space = 'TANGENT'
+  replace_socket_link(node_tree, image_node.outputs['Color'], separate.inputs['Color'])
+  replace_socket_link(
+    node_tree,
+    separate.outputs['Green'],
+    invert_green.inputs[1],
+  )
+  replace_socket_link(node_tree, separate.outputs['Red'], combine.inputs['Red'])
+  replace_socket_link(node_tree, invert_green.outputs['Value'], combine.inputs['Green'])
+  replace_socket_link(node_tree, separate.outputs['Blue'], combine.inputs['Blue'])
+  replace_socket_link(node_tree, combine.outputs['Color'], normal_node.inputs['Color'])
+  for principled in principled_nodes:
+    replace_socket_link(node_tree, normal_node.outputs['Normal'], principled.inputs['Normal'])
+  return normal_node
+
+
 def apply_painter_textures_to_low(low_objects, texture_dir):
   texture_dir = Path(texture_dir)
   applied = 0
@@ -1137,6 +1258,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
     if slot.material
   }
   for material in materials:
+    material_applied = False
     texture_set = clean_name(stripped_material_name(material.name))
     paths = {
       role: texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png'
@@ -1158,19 +1280,17 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       if node.type == 'BSDF_PRINCIPLED'
     ]
     if images.get('Color') is not None:
-      applied += set_material_base_color_image(material, images['Color'])
+      set_material_base_color_image(material, images['Color'])
       set_material_alpha_overlay_enabled(material, False)
+      material_applied = True
     if images.get('Normal') is not None:
       normal_image = images['Normal']
       normal_image.colorspace_settings.name = 'Non-Color'
       image_node = node_tree.nodes.get(normal_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
       image_node.name = normal_image.name
       image_node.image = normal_image
-      normal_node = node_tree.nodes.get('Painter Normal') or node_tree.nodes.new('ShaderNodeNormalMap')
-      normal_node.name = 'Painter Normal'
-      replace_socket_link(node_tree, image_node.outputs['Color'], normal_node.inputs['Color'])
-      for principled in principled_nodes:
-        replace_socket_link(node_tree, normal_node.outputs['Normal'], principled.inputs['Normal'])
+      connect_painter_directx_normal(node_tree, image_node, principled_nodes)
+      material_applied = True
     if images.get('Extra') is not None:
       extra_image = images['Extra']
       extra_image.colorspace_settings.name = 'Non-Color'
@@ -1183,6 +1303,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       for principled in principled_nodes:
         replace_socket_link(node_tree, separate.outputs['Green'], principled.inputs['Roughness'])
         replace_socket_link(node_tree, separate.outputs['Blue'], principled.inputs['Metallic'])
+      material_applied = True
     if images.get('Emissive') is not None:
       emissive_image = images['Emissive']
       image_node = node_tree.nodes.get(emissive_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
@@ -1192,6 +1313,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
         emission = principled.inputs.get('Emission Color') or principled.inputs.get('Emission')
         if emission is not None:
           replace_socket_link(node_tree, image_node.outputs['Color'], emission)
+      material_applied = True
     else:
       for principled in principled_nodes:
         clear_principled_emission(material, principled)
@@ -1202,6 +1324,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
       image_node.name = height_image.name
       image_node.image = height_image
       image_node.label = 'Painter Height'
+      material_applied = True
     if images.get('SheenColor') is not None:
       sheen_color_image = images['SheenColor']
       image_node = node_tree.nodes.get(sheen_color_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
@@ -1216,6 +1339,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
         )
         if sheen_color is not None:
           replace_socket_link(node_tree, image_node.outputs['Color'], sheen_color)
+      material_applied = True
     if images.get('SheenOpacity') is not None:
       sheen_opacity_image = images['SheenOpacity']
       sheen_opacity_image.colorspace_settings.name = 'Non-Color'
@@ -1233,6 +1357,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
         )
         if sheen_opacity is not None:
           replace_socket_link(node_tree, separate.outputs['Red'], sheen_opacity)
+      material_applied = True
     if images.get('SheenRoughness') is not None:
       sheen_roughness_image = images['SheenRoughness']
       sheen_roughness_image.colorspace_settings.name = 'Non-Color'
@@ -1247,16 +1372,415 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
         sheen_roughness = principled.inputs.get('Sheen Roughness')
         if sheen_roughness is not None:
           replace_socket_link(node_tree, separate.outputs['Red'], sheen_roughness)
+      material_applied = True
     force_material_opaque(material)
     remove_stale_unlinked_image_nodes(material, preserve_images=images.values())
+    if material_applied:
+      applied += 1
   return applied
 
 
-def canonicalize_painter_export_files(result):
-  canonical_paths = []
+def _ensure_managed_shader_node(node_tree, name, node_type):
+  node = node_tree.nodes.get(name)
+  if node is not None and node.bl_idname != node_type:
+    node_tree.nodes.remove(node)
+    node = None
+  if node is None:
+    node = node_tree.nodes.new(node_type)
+    node.name = name
+  return node
+
+
+def normalize_meshy_required_roles(required_roles_by_texture_set, texture_sets):
+  """Return an exact per-Texture-Set Color/Extra/Normal role contract.
+
+  ``None`` preserves the legacy three-map behavior for ordinary callers.  A
+  staged Meshy request passes the roles actually present in its immutable
+  source package so optional Extra or Normal maps are never invented.
+  """
+  texture_sets = validate_exact_texture_set_ids(
+    texture_sets,
+    'Meshy canonical Texture Set IDs',
+  )
+  allowed = set(MESHY_PAINTER_CANONICAL_ROLES)
+  if required_roles_by_texture_set is None:
+    return {texture_set: set(allowed) for texture_set in texture_sets}
+  if not isinstance(required_roles_by_texture_set, dict):
+    raise RuntimeError('Meshy required roles must be a Texture Set dictionary')
+  declared_sets = validate_exact_texture_set_ids(
+    required_roles_by_texture_set,
+    'Meshy required-role Texture Set IDs',
+  )
+  if declared_sets != texture_sets:
+    raise RuntimeError(
+      'Meshy required-role Texture Sets differ from the canonical set: '
+      f'roles={sorted(declared_sets)}, canonical={sorted(texture_sets)}'
+    )
+  normalized = {}
+  for texture_set in sorted(texture_sets):
+    raw_roles = required_roles_by_texture_set.get(texture_set)
+    if isinstance(raw_roles, str) or not isinstance(raw_roles, (list, tuple, set)):
+      raise RuntimeError(f'Meshy roles must be an array for {texture_set}')
+    roles = {str(role) for role in raw_roles}
+    unsupported = roles - allowed
+    if unsupported:
+      raise RuntimeError(
+        f'Unsupported Meshy Painter roles for {texture_set}: {sorted(unsupported)}'
+      )
+    normalized[texture_set] = roles
+  return normalized
+
+
+def apply_meshy_painter_textures_to_material(
+  material,
+  texture_set,
+  texture_dir,
+  *,
+  images=None,
+  required_roles=None,
+):
+  """Apply the source-backed Meshy roles to one candidate material.
+
+  This intentionally does not touch emission, blend mode, Alpha, or unrelated
+  image nodes.  Call it on a copied material and publish that copy only after the
+  complete file/material transaction has passed verification.
+  """
+  texture_dir = Path(texture_dir).resolve()
+  required_roles = set(required_roles or MESHY_PAINTER_CANONICAL_ROLES)
+  unsupported = required_roles - set(MESHY_PAINTER_CANONICAL_ROLES)
+  if unsupported:
+    raise RuntimeError(
+      f'Unsupported Meshy Painter roles for {texture_set}: {sorted(unsupported)}'
+    )
+  if not required_roles:
+    raise PainterApplyNoMaterialsError(
+      f'Meshy Painter has no source-backed roles for material {texture_set}'
+    )
+  paths = {
+    role: texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png'
+    for role in required_roles
+  }
+  missing = [role for role, path in paths.items() if not path.is_file()]
+  if missing:
+    if len(missing) == len(paths):
+      raise PainterApplyNoMaterialsError(
+        f'Meshy Painter textures did not match material {texture_set}'
+      )
+    raise RuntimeError(
+      f'Meshy Painter material group is incomplete for {texture_set}: '
+      + ', '.join(missing)
+    )
+  material.use_nodes = True
+  node_tree = material.node_tree
+  if node_tree is None:
+    raise RuntimeError(f'Meshy Painter material has no node tree: {material.name}')
+  principled_nodes = [
+    node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'
+  ]
+  if not principled_nodes:
+    raise RuntimeError(f'Meshy Painter material has no Principled BSDF: {material.name}')
+
+  if images is None:
+    images = {role: load_or_reload_image(path) for role, path in paths.items()}
+  elif set(images) != set(paths) or any(images[role] is None for role in paths):
+    raise RuntimeError(
+      f'Meshy Painter transaction images are incomplete for {texture_set}'
+    )
+  if 'Color' in required_roles:
+    images['Color'].colorspace_settings.name = 'sRGB'
+    color_node = _ensure_managed_shader_node(
+      node_tree,
+      'Painter Color',
+      'ShaderNodeTexImage',
+    )
+    color_node.image = images['Color']
+    color_node.label = 'Painter Color'
+    for principled in principled_nodes:
+      base_color = principled.inputs.get('Base Color')
+      if base_color is None:
+        continue
+      target = base_color
+      if base_color.is_linked:
+        upstream = base_color.links[0].from_node
+        if upstream.name.startswith('__SubstanceToolsAlphaMix_'):
+          target = upstream.inputs[1]
+      replace_socket_link(node_tree, color_node.outputs['Color'], target)
+
+  if 'Extra' in required_roles:
+    extra_image = images['Extra']
+    extra_image.colorspace_settings.name = 'Non-Color'
+    extra_node = _ensure_managed_shader_node(
+      node_tree,
+      'Painter Extra',
+      'ShaderNodeTexImage',
+    )
+    extra_node.image = extra_image
+    extra_node.label = 'Painter Extra'
+    extra_separate = _ensure_managed_shader_node(
+      node_tree,
+      'Painter Extra Channels',
+      'ShaderNodeSeparateColor',
+    )
+    extra_separate.mode = 'RGB'
+    replace_socket_link(
+      node_tree,
+      extra_node.outputs['Color'],
+      extra_separate.inputs['Color'],
+    )
+    for principled in principled_nodes:
+      replace_socket_link(
+        node_tree,
+        extra_separate.outputs['Green'],
+        principled.inputs['Roughness'],
+      )
+      replace_socket_link(
+        node_tree,
+        extra_separate.outputs['Blue'],
+        principled.inputs['Metallic'],
+      )
+
+  if 'Normal' in required_roles:
+    normal_image = images['Normal']
+    normal_image.colorspace_settings.name = 'Non-Color'
+    normal_node = _ensure_managed_shader_node(
+      node_tree,
+      'Painter Normal Texture',
+      'ShaderNodeTexImage',
+    )
+    normal_node.image = normal_image
+    normal_node.label = 'Painter Normal (DirectX)'
+    for name, node_type in (
+      ('Painter Normal DirectX Channels', 'ShaderNodeSeparateColor'),
+      ('Painter Normal DirectX Green Flip', 'ShaderNodeMath'),
+      ('Painter Normal OpenGL', 'ShaderNodeCombineColor'),
+      ('Painter Normal', 'ShaderNodeNormalMap'),
+    ):
+      _ensure_managed_shader_node(node_tree, name, node_type)
+    connect_painter_directx_normal(node_tree, normal_node, principled_nodes)
+  return 1
+
+
+class MeshyMaterialApplyTransaction:
+  """Prepare copied materials and atomically publish them through mesh slots."""
+
+  def __init__(
+    self,
+    low_objects,
+    texture_dir,
+    canonical_texture_sets,
+    required_roles_by_texture_set=None,
+  ):
+    self.low_objects = list(low_objects)
+    self.texture_dir = Path(texture_dir).resolve()
+    self.slot_records = []
+    self.original_names = {}
+    self.candidates = {}
+    self.owned_images = {}
+    self.texture_sets = {}
+    self.canonical_texture_sets = validate_exact_texture_set_ids(
+      canonical_texture_sets,
+      'Meshy canonical Texture Set IDs',
+    )
+    self.required_roles_by_texture_set = normalize_meshy_required_roles(
+      required_roles_by_texture_set,
+      self.canonical_texture_sets,
+    )
+    self.swapped = False
+    self.committed = False
+    self._collect_slots()
+
+  def _collect_slots(self):
+    allowed_data = {
+      obj.data for obj in self.low_objects
+      if obj.type == 'MESH' and obj.data is not None
+    }
+    for obj in bpy.data.objects:
+      if obj.type == 'MESH' and obj.data in allowed_data and obj not in self.low_objects:
+        raise RuntimeError(
+          f'Meshy low mesh data is shared outside the apply set: {obj.name}'
+        )
+    seen_slots = set()
+    for obj in self.low_objects:
+      if obj.type != 'MESH' or obj.data is None:
+        continue
+      for index, material in enumerate(obj.data.materials):
+        if material is None:
+          continue
+        key = (obj.data.as_pointer(), index)
+        if key in seen_slots:
+          continue
+        seen_slots.add(key)
+        self.slot_records.append((obj.data, index, material))
+    if not self.slot_records:
+      raise PainterApplyNoMaterialsError('Meshy Painter apply has no low material slots')
+
+    target_keys = {
+      (data.as_pointer(), index)
+      for data, index, _material in self.slot_records
+    }
+    originals = {material for _data, _index, material in self.slot_records}
+    for mesh in bpy.data.meshes:
+      for index, material in enumerate(mesh.materials):
+        if material in originals and (mesh.as_pointer(), index) not in target_keys:
+          raise RuntimeError(
+            f'Meshy low material is shared outside the apply set: {material.name}'
+          )
+    for material in originals:
+      slot_users = sum(
+        1 for mesh in bpy.data.meshes
+        for candidate in mesh.materials
+        if candidate == material
+      )
+      if material.users != slot_users:
+        raise RuntimeError(
+          f'Meshy low material has non-slot users and cannot be swapped safely: '
+          f'{material.name}'
+        )
+      self.original_names[material] = material.name
+      self.texture_sets[material] = stripped_material_name(material.name)
+    material_sets = validate_exact_texture_set_ids(
+      self.texture_sets.values(),
+      'Meshy low material Texture Set IDs',
+    )
+    if material_sets != self.canonical_texture_sets:
+      raise RuntimeError(
+        'Meshy low material Texture Set IDs differ from the state-pinned IDs: '
+        f'materials={sorted(material_sets)}, '
+        f'state={sorted(self.canonical_texture_sets)}'
+      )
+    active_materials = {
+      material
+      for material, texture_set in self.texture_sets.items()
+      if self.required_roles_by_texture_set[texture_set]
+    }
+    self.slot_records = [
+      record for record in self.slot_records if record[2] in active_materials
+    ]
+    self.original_names = {
+      material: name
+      for material, name in self.original_names.items()
+      if material in active_materials
+    }
+    self.texture_sets = {
+      material: texture_set
+      for material, texture_set in self.texture_sets.items()
+      if material in active_materials
+    }
+    if not self.slot_records:
+      raise PainterApplyNoMaterialsError(
+        'Meshy Painter apply has no source-backed material roles'
+      )
+
+  def _images_for_texture_set(self, texture_set):
+    images = {}
+    for role in self.required_roles_by_texture_set[texture_set]:
+      path = (
+        self.texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png'
+      ).resolve()
+      image = self.owned_images.get(path)
+      if image is None:
+        image = bpy.data.images.load(str(path), check_existing=False)
+        image.name = (
+          f'__ST_PainterApply_{clean_name(texture_set)}_{role}_'
+          f'{image.as_pointer():x}'
+        )
+        self.owned_images[path] = image
+      images[role] = image
+    return images
+
+  def _discard_owned_images(self):
+    for image in list(self.owned_images.values()):
+      try:
+        if image.users == 0:
+          bpy.data.images.remove(image)
+      except (ReferenceError, RuntimeError):
+        pass
+    self.owned_images.clear()
+
+  def prepare(self):
+    try:
+      for original in sorted(self.original_names, key=lambda value: value.name_full):
+        candidate = original.copy()
+        candidate.name = f'__ST_PainterCandidate_{original.as_pointer():x}'
+        self.candidates[original] = candidate
+        apply_meshy_painter_textures_to_material(
+          candidate,
+          self.texture_sets[original],
+          self.texture_dir,
+          images=self._images_for_texture_set(self.texture_sets[original]),
+          required_roles=self.required_roles_by_texture_set[
+            self.texture_sets[original]
+          ],
+        )
+      managed_roles = verify_painter_material_roles(
+        [],
+        self.texture_dir,
+        self.required_roles_by_texture_set,
+        material_texture_sets={
+          candidate: self.texture_sets[original]
+          for original, candidate in self.candidates.items()
+        },
+      )
+      return len(self.candidates), managed_roles
+    except Exception:
+      self.rollback()
+      raise
+
+  def swap(self):
+    if self.swapped:
+      return
+    try:
+      for original, original_name in self.original_names.items():
+        original.name = f'__ST_PainterRollback_{original.as_pointer():x}'
+        self.candidates[original].name = original_name
+      self.swapped = True
+      for data, index, original in self.slot_records:
+        data.materials[index] = self.candidates[original]
+      still_used = [
+        original.name for original in self.original_names
+        if original.users != 0
+      ]
+      if still_used:
+        raise RuntimeError(
+          f'Meshy material slot swap left original users: {still_used}'
+        )
+    except Exception:
+      self.rollback()
+      raise
+
+  def rollback(self):
+    if self.committed:
+      return
+    if self.swapped:
+      for data, index, original in self.slot_records:
+        data.materials[index] = original
+    for original, original_name in self.original_names.items():
+      candidate = self.candidates.get(original)
+      if candidate is not None:
+        candidate.name = f'__ST_DiscardedCandidate_{candidate.as_pointer():x}'
+      original.name = original_name
+    for candidate in list(self.candidates.values()):
+      if candidate.users == 0:
+        bpy.data.materials.remove(candidate)
+    self.candidates.clear()
+    self._discard_owned_images()
+    self.swapped = False
+
+  def commit(self):
+    self.committed = True
+    for original in list(self.original_names):
+      try:
+        if original.users == 0:
+          bpy.data.materials.remove(original)
+      except (ReferenceError, RuntimeError):
+        pass
+
+
+def painter_export_canonical_replacements(result):
+  replacements = []
   for files in result.get('textures', {}).values():
     for file_value in files:
-      source = Path(file_value)
+      source = Path(file_value).resolve()
       if not source.is_file():
         continue
       stem = source.stem
@@ -1269,11 +1793,861 @@ def canonicalize_painter_export_files(result):
         canonical_stem = stem
       else:
         canonical_stem = f'{TEXTURE_PREFIX}{stem}'
-      target = source.with_name(f'{canonical_stem}{source.suffix.lower()}')
-      if source.resolve() != target.resolve():
-        os.replace(source, target)
-      canonical_paths.append(str(target.resolve()))
-  return canonical_paths
+      target = source.with_name(f'{canonical_stem}{source.suffix.lower()}').resolve()
+      replacements.append((source, target))
+  return replacements
+
+
+def filter_meshy_painter_export_result(
+  result,
+  canonical_texture_sets,
+  required_roles_by_texture_set=None,
+):
+  """Select only state-pinned, source-backed exports for Meshy apply.
+
+  Painter presets may additionally emit Height, Emissive, or cloth maps.  Those
+  files are outside the Meshy replacement contract, so they remain untouched in
+  Painter staging and never enter the canonical file transaction.
+  """
+  expected_sets = validate_exact_texture_set_ids(
+    canonical_texture_sets,
+    'Meshy canonical Texture Set IDs',
+  )
+  role_contract = normalize_meshy_required_roles(
+    required_roles_by_texture_set,
+    expected_sets,
+  )
+  filtered_textures = {}
+  for group, files in (result.get('textures') or {}).items():
+    if not isinstance(files, (list, tuple)):
+      raise RuntimeError('Painter export result texture entries must be lists')
+    selected = []
+    for file_value in files:
+      single_result = {'textures': {'candidate': [file_value]}}
+      replacements = painter_export_canonical_replacements(single_result)
+      if not replacements:
+        continue
+      _source, target = replacements[0]
+      role = painter_export_role(target)
+      texture_set = painter_export_texture_set(target, role)
+      if texture_set in expected_sets and role in role_contract[texture_set]:
+        selected.append(file_value)
+    if selected:
+      filtered_textures[group] = selected
+  filtered = dict(result)
+  filtered['textures'] = filtered_textures
+  return filtered
+
+
+def validate_meshy_painter_export_group(
+  result,
+  low_objects,
+  expected_resolution=None,
+  *,
+  canonical_texture_sets=None,
+  required_roles_by_texture_set=None,
+):
+  replacements = painter_export_canonical_replacements(result)
+  expected_sets = (
+    validate_exact_texture_set_ids(
+      canonical_texture_sets,
+      'Meshy canonical Texture Set IDs',
+    )
+    if canonical_texture_sets is not None else {
+      clean_name(stripped_material_name(slot.material.name))
+      for obj in low_objects
+      for slot in obj.material_slots
+      if slot.material
+    }
+  )
+  role_contract = normalize_meshy_required_roles(
+    required_roles_by_texture_set,
+    expected_sets,
+  )
+  active_expected_sets = {
+    texture_set for texture_set, roles in role_contract.items() if roles
+  }
+  recognized_roles = set(MESHY_PAINTER_CANONICAL_ROLES)
+  present = defaultdict(set)
+  decoded = []
+  try:
+    for source, target in replacements:
+      if not source.is_file() or source.stat().st_size <= 0:
+        raise RuntimeError(f'Painter export is missing or empty: {source}')
+      role = next(
+        (value for value in recognized_roles if target.stem.endswith(f'_{value}')),
+        None,
+      )
+      if role is not None:
+        texture_set = target.stem[len(TEXTURE_PREFIX):-len(f'_{role}')]
+        present[texture_set].add(role)
+        image = bpy.data.images.load(str(source), check_existing=False)
+        decoded.append(image)
+        width, height = (int(value) for value in image.size[:])
+        if width <= 0 or height <= 0 or width != height:
+          raise RuntimeError(f'Painter export has invalid dimensions: {source}')
+        if expected_resolution and (width != int(expected_resolution) or height != int(expected_resolution)):
+          raise RuntimeError(
+            f'Painter export resolution differs from {expected_resolution}: '
+            f'{source} is {width}x{height}'
+          )
+    missing = {
+      texture_set: sorted(role_contract[texture_set] - present.get(texture_set, set()))
+      for texture_set in sorted(expected_sets)
+      if role_contract[texture_set] - present.get(texture_set, set())
+    }
+    if missing:
+      details = '; '.join(
+        f'{texture_set}: {", ".join(roles)}' for texture_set, roles in missing.items()
+      )
+      raise RuntimeError(f'Painter export group is incomplete ({details})')
+    if canonical_texture_sets is not None:
+      validate_exact_texture_set_ids(present, 'Painter export Texture Set IDs')
+      if set(present) != active_expected_sets:
+        raise RuntimeError(
+          'Painter export Texture Set IDs differ from the state-pinned IDs: '
+          f'export={sorted(present)}, '
+          f'source-backed={sorted(active_expected_sets)}'
+        )
+      non_exact = {
+        texture_set: sorted(roles)
+        for texture_set, roles in present.items()
+        if roles != role_contract[texture_set]
+      }
+      if non_exact:
+        raise RuntimeError(
+          f'Painter export roles differ from the source-backed contract: {non_exact}'
+        )
+    return {
+      'texture_sets': sorted(active_expected_sets),
+      'roles': {key: sorted(value) for key, value in sorted(present.items())},
+      'files': len(replacements),
+    }
+  finally:
+    for image in decoded:
+      if image.users == 0:
+        bpy.data.images.remove(image)
+
+
+def remove_painter_export_source_files(result):
+  """Remove non-canonical Painter export names after a successful apply."""
+  removed = []
+  for source, target in painter_export_canonical_replacements(result):
+    if source != target and source.is_file():
+      source.unlink()
+      removed.append(str(source))
+  return removed
+
+
+def painter_export_role(path):
+  stem = Path(path).stem
+  return next(
+    (
+      role for role in sorted(PAINTER_CLOTH_TEXTURE_ROLES, key=len, reverse=True)
+      if stem.endswith(f'_{role}')
+    ),
+    None,
+  )
+
+
+def painter_export_texture_set(path, role=None):
+  path = Path(path)
+  role = role or painter_export_role(path)
+  if role is None or not path.stem.startswith(TEXTURE_PREFIX):
+    return None
+  suffix = f'_{role}'
+  return path.stem[len(TEXTURE_PREFIX):-len(suffix)]
+
+
+def painter_texture_set_match_token(value):
+  value = stripped_material_name(str(value or ''))
+  return ''.join(character for character in value.casefold() if character.isalnum())
+
+
+def validate_exact_texture_set_ids(values, label):
+  tokens = defaultdict(list)
+  for value in values:
+    canonical = str(value)
+    token = painter_texture_set_match_token(canonical)
+    if not canonical or not token:
+      raise RuntimeError(f'{label} contains an empty Texture Set ID')
+    tokens[token].append(canonical)
+  collisions = {
+    token: names for token, names in tokens.items()
+    if len(set(names)) > 1
+  }
+  if collisions:
+    raise RuntimeError(
+      f'{label} contains Painter name collisions: {collisions}'
+    )
+  noncanonical = [
+    name for names in tokens.values() for name in names
+    if clean_name(name) != name
+  ]
+  if noncanonical:
+    raise RuntimeError(
+      f'{label} contains non-canonical Texture Set IDs: {sorted(noncanonical)}'
+    )
+  return {name for names in tokens.values() for name in names}
+
+
+def _normalized_path(path):
+  return os.path.normcase(str(Path(path).resolve()))
+
+
+def _painter_result_source_paths(result):
+  paths = []
+  for files in result.get('textures', {}).values():
+    if not isinstance(files, (list, tuple)):
+      raise RuntimeError('Painter export result texture entries must be lists')
+    paths.extend(Path(value).resolve() for value in files)
+  return paths
+
+
+class PainterCanonicalApplyTransaction:
+  """Keep canonical texture replacement rollback data alive through material apply.
+
+  ``install`` copies, verifies, and installs Painter exports but deliberately keeps
+  both the original Painter files and rollback copies.  Only ``commit`` removes
+  the Painter-prefixed sources and transaction directory.  ``rollback`` restores
+  every canonical target as well as any staging source removed by a failed commit.
+  """
+
+  PREFIX = '.substance_tools_apply_'
+
+  def __init__(
+    self,
+    result,
+    *,
+    texture_dir=None,
+    allowed_roles=None,
+    expected_texture_sets=None,
+    expected_roles_by_texture_set=None,
+    require_noncanonical_sources=False,
+  ):
+    self.result = result
+    self.texture_dir = Path(texture_dir).resolve() if texture_dir else None
+    self.allowed_roles = set(allowed_roles or ())
+    self.expected_texture_sets = validate_exact_texture_set_ids(
+      expected_texture_sets or (),
+      'Expected low materials',
+    )
+    self.expected_roles_by_texture_set = (
+      normalize_meshy_required_roles(
+        expected_roles_by_texture_set,
+        self.expected_texture_sets,
+      )
+      if expected_roles_by_texture_set is not None else None
+    )
+    if self.expected_roles_by_texture_set is not None:
+      contracted_roles = {
+        role
+        for roles in self.expected_roles_by_texture_set.values()
+        for role in roles
+      }
+      if self.allowed_roles and self.allowed_roles != contracted_roles:
+        raise RuntimeError(
+          'Painter transaction allowed roles differ from its per-set contract'
+        )
+      self.allowed_roles = contracted_roles
+    self.require_noncanonical_sources = bool(require_noncanonical_sources)
+    self.replacements = painter_export_canonical_replacements(result)
+    self.transaction_parent = None
+    self.transaction_root = None
+    self.source_copies = {}
+    self.target_backups = {}
+    self.target_hashes = {}
+    self.installed_targets = []
+    self.removed_sources = []
+    self.state = 'NEW'
+    self._validate_plan()
+
+  @property
+  def canonical_files(self):
+    return [str(target) for _source, target in self.replacements]
+
+  def _validate_plan(self):
+    raw_sources = _painter_result_source_paths(self.result)
+    if self.texture_dir is not None:
+      if not self.texture_dir.is_dir():
+        raise RuntimeError(f'Painter texture directory does not exist: {self.texture_dir}')
+      for source in raw_sources:
+        if source.parent != self.texture_dir:
+          raise RuntimeError(
+            f'Painter export source must be directly inside texture_dir: {source}'
+          )
+        if not source.is_file():
+          raise RuntimeError(f'Painter export source is missing: {source}')
+      if len(raw_sources) != len(self.replacements):
+        raise RuntimeError('Painter export result contains a missing source file')
+
+    target_sources = defaultdict(set)
+    for source, target in self.replacements:
+      target_sources[_normalized_path(target)].add(_normalized_path(source))
+    collisions = [target for target, sources in target_sources.items() if len(sources) > 1]
+    if collisions:
+      raise RuntimeError(
+        'Painter export maps multiple files to the same canonical target: '
+        + ', '.join(sorted(collisions))
+      )
+    if not self.replacements:
+      raise RuntimeError('Painter export contains no existing texture files')
+
+    self.transaction_parent = self.replacements[0][1].parent
+    if any(target.parent != self.transaction_parent for _source, target in self.replacements):
+      raise RuntimeError('Painter canonicalization requires one texture directory')
+    if self.texture_dir is not None and self.transaction_parent != self.texture_dir:
+      raise RuntimeError(
+        f'Painter canonical targets must be directly inside texture_dir: '
+        f'{self.transaction_parent}'
+      )
+
+    if self.allowed_roles:
+      observed_roles = set()
+      roles_by_texture_set = defaultdict(set)
+      role_counts_by_texture_set = defaultdict(lambda: defaultdict(int))
+      for source, target in self.replacements:
+        role = painter_export_role(target)
+        if role not in self.allowed_roles:
+          raise RuntimeError(
+            f'Painter export role is not allowed in this transaction: {source.name}'
+          )
+        if self.require_noncanonical_sources and source == target:
+          raise RuntimeError(
+            f'Painter staging source must not already be canonical: {source.name}'
+          )
+        observed_roles.add(role)
+        texture_set = painter_export_texture_set(target, role)
+        if not texture_set:
+          raise RuntimeError(f'Painter export has no canonical Texture Set: {source.name}')
+        roles_by_texture_set[texture_set].add(role)
+        role_counts_by_texture_set[texture_set][role] += 1
+      missing_roles = self.allowed_roles - observed_roles
+      if missing_roles:
+        raise RuntimeError(
+          'Painter export transaction is missing required roles: '
+          + ', '.join(sorted(missing_roles))
+        )
+      if self.expected_texture_sets:
+        validate_exact_texture_set_ids(
+          roles_by_texture_set,
+          'Painter export',
+        )
+        if set(roles_by_texture_set) != self.expected_texture_sets:
+          raise RuntimeError(
+            'Painter export Texture Sets differ from low materials: '
+            f'export={sorted(roles_by_texture_set)}, '
+            f'low={sorted(self.expected_texture_sets)}'
+          )
+        expected_roles = self.expected_roles_by_texture_set or {
+          texture_set: set(self.allowed_roles)
+          for texture_set in self.expected_texture_sets
+        }
+        incomplete = {
+          texture_set: {
+            role: role_counts_by_texture_set[texture_set].get(role, 0)
+            for role in sorted(expected_roles[texture_set])
+            if role_counts_by_texture_set[texture_set].get(role, 0) != 1
+          }
+          for texture_set in sorted(self.expected_texture_sets)
+          if roles_by_texture_set.get(texture_set, set()) != expected_roles[texture_set]
+          or any(
+            count != 1
+            for count in role_counts_by_texture_set[texture_set].values()
+          )
+        }
+        if incomplete:
+          raise RuntimeError(
+            'Painter export does not contain exactly one managed role group per '
+            f'Texture Set: {incomplete}'
+          )
+
+  def _copy_verified(self, source, target, label):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    if file_hash(source) != file_hash(target):
+      raise RuntimeError(f'Painter {label} verification failed: {source}')
+
+  def _cleanup(self):
+    root = self.transaction_root
+    if root is None or not root.exists():
+      return
+    if (
+      root.parent != self.transaction_parent
+      or not root.name.startswith(self.PREFIX)
+    ):
+      raise RuntimeError(f'Refusing to clean unexpected transaction path: {root}')
+    shutil.rmtree(root)
+
+  def _restore_sources(self):
+    for source in self.removed_sources:
+      backup = self.source_copies.get(source)
+      if backup is None or not backup.is_file():
+        raise RuntimeError(f'Painter staging source backup is missing: {source}')
+      restore_path = self.transaction_root / 'restore_source' / source.name
+      self._copy_verified(backup, restore_path, 'source restore staging')
+      os.replace(restore_path, source)
+      if file_hash(source) != file_hash(backup):
+        raise RuntimeError(f'Painter staging source restore failed: {source}')
+
+  def _restore_targets(self):
+    for target in reversed(self.installed_targets):
+      backup = self.target_backups.get(target)
+      if backup is None:
+        if target.is_file():
+          target.unlink()
+        continue
+      restore_path = self.transaction_root / 'restore_target' / target.name
+      self._copy_verified(backup, restore_path, 'target restore staging')
+      os.replace(restore_path, target)
+      if file_hash(target) != file_hash(backup):
+        raise RuntimeError(f'Painter canonical rollback failed: {target}')
+
+  def _reload_restored_images(self):
+    restored = {_normalized_path(target) for target in self.installed_targets}
+    for image in bpy.data.images:
+      image_path = bpy.path.abspath(image.filepath_raw or image.filepath)
+      if image_path and _normalized_path(image_path) in restored:
+        try:
+          image.reload()
+        except RuntimeError:
+          pass
+
+  def install(self):
+    if self.state != 'NEW':
+      raise RuntimeError(f'Painter transaction cannot install from {self.state}')
+    self.transaction_root = Path(tempfile.mkdtemp(
+      prefix=self.PREFIX,
+      dir=str(self.transaction_parent),
+    )).resolve()
+    try:
+      for index, (source, target) in enumerate(self.replacements):
+        source_hash = file_hash(source)
+        self.target_hashes[target] = source_hash
+        if source != target:
+          source_copy = (
+            self.transaction_root / 'source' / f'{index:04d}{source.suffix.lower()}'
+          )
+          self._copy_verified(source, source_copy, 'source staging')
+          self.source_copies[source] = source_copy
+        if source == target or (
+          target.is_file() and source_hash == file_hash(target)
+        ):
+          continue
+        if target.is_file():
+          backup = (
+            self.transaction_root / 'rollback' / f'{index:04d}{target.suffix.lower()}'
+          )
+          self._copy_verified(target, backup, 'rollback')
+          self.target_backups[target] = backup
+        install_path = (
+          self.transaction_root / 'install' / f'{index:04d}{target.suffix.lower()}'
+        )
+        self._copy_verified(source, install_path, 'install staging')
+        os.replace(install_path, target)
+        self.installed_targets.append(target)
+        if file_hash(target) != source_hash:
+          raise RuntimeError(f'Painter canonical verification failed: {target}')
+      self.state = 'INSTALLED'
+      return self.canonical_files
+    except Exception:
+      self.state = 'FAILED'
+      try:
+        self._restore_targets()
+        self._restore_sources()
+        self._reload_restored_images()
+      finally:
+        self._cleanup()
+      raise
+
+  def rollback(self):
+    if self.state in {'ROLLED_BACK', 'COMMITTED'}:
+      return
+    try:
+      self._restore_targets()
+      self._restore_sources()
+      self._reload_restored_images()
+    finally:
+      self._cleanup()
+      self.state = 'ROLLED_BACK'
+
+  def commit(self, *, remove_sources=True):
+    if self.state != 'INSTALLED':
+      raise RuntimeError(f'Painter transaction cannot commit from {self.state}')
+    try:
+      for target, expected_hash in self.target_hashes.items():
+        if not target.is_file() or file_hash(target) != expected_hash:
+          raise RuntimeError(f'Painter canonical file changed before commit: {target}')
+      if remove_sources:
+        for source, target in self.replacements:
+          if source == target or not source.is_file():
+            continue
+          source.unlink()
+          self.removed_sources.append(source)
+      self._cleanup()
+      self.state = 'COMMITTED'
+      return self.canonical_files
+    except Exception:
+      self.rollback()
+      raise
+
+
+def begin_painter_canonical_apply_transaction(
+  result,
+  *,
+  texture_dir=None,
+  allowed_roles=None,
+  expected_texture_sets=None,
+  expected_roles_by_texture_set=None,
+  require_noncanonical_sources=False,
+):
+  transaction = PainterCanonicalApplyTransaction(
+    result,
+    texture_dir=texture_dir,
+    allowed_roles=allowed_roles,
+    expected_texture_sets=expected_texture_sets,
+    expected_roles_by_texture_set=expected_roles_by_texture_set,
+    require_noncanonical_sources=require_noncanonical_sources,
+  )
+  transaction.install()
+  return transaction
+
+
+def _socket_has_upstream_node(socket, target_node, visited=None):
+  visited = set() if visited is None else visited
+  for link in socket.links:
+    node = link.from_node
+    if node == target_node:
+      return True
+    if node in visited:
+      continue
+    visited.add(node)
+    if any(
+      _socket_has_upstream_node(input_socket, target_node, visited)
+      for input_socket in node.inputs
+    ):
+      return True
+  return False
+
+
+def _socket_has_direct_source(socket, node, socket_name):
+  return any(
+    link.from_node == node and link.from_socket.name == socket_name
+    for link in socket.links
+  )
+
+
+def _managed_image_node(node_tree, name, expected_path, colorspace):
+  node = node_tree.nodes.get(name)
+  if node is None or node.type != 'TEX_IMAGE' or node.image is None:
+    raise RuntimeError(f'Painter managed image node is missing: {name}')
+  image_path = bpy.path.abspath(node.image.filepath_raw or node.image.filepath)
+  if _normalized_path(image_path) != _normalized_path(expected_path):
+    raise RuntimeError(f'Painter managed image path differs: {name}')
+  if node.image.colorspace_settings.name != colorspace:
+    raise RuntimeError(
+      f'Painter managed image colorspace differs for {name}: '
+      f'{node.image.colorspace_settings.name}'
+    )
+  return node
+
+
+def verify_painter_material_roles(
+  low_objects,
+  texture_dir,
+  required_roles,
+  *,
+  material_texture_sets=None,
+):
+  texture_dir = Path(texture_dir).resolve()
+  role_contract = None
+  if isinstance(required_roles, dict):
+    role_contract = normalize_meshy_required_roles(
+      required_roles,
+      required_roles,
+    )
+    active_role_contract = {
+      texture_set: roles
+      for texture_set, roles in role_contract.items()
+      if roles
+    }
+    shared_required_roles = None
+  else:
+    shared_required_roles = set(required_roles)
+  material_texture_sets = material_texture_sets or {}
+  materials = set(material_texture_sets) or {
+    slot.material
+    for obj in low_objects
+    for slot in obj.material_slots
+    if slot.material
+  }
+  verified = {}
+  represented_texture_sets = set()
+  for material in materials:
+    texture_set = (
+      str(material_texture_sets[material])
+      if material in material_texture_sets
+      else clean_name(stripped_material_name(material.name))
+    )
+    if role_contract is not None:
+      if texture_set not in role_contract:
+        raise RuntimeError(
+          f'Painter material Texture Set is outside the role contract: {texture_set}'
+        )
+      if not role_contract[texture_set]:
+        continue
+      material_required_roles = role_contract[texture_set]
+    else:
+      material_required_roles = shared_required_roles
+    if material.node_tree is None:
+      raise RuntimeError(f'Painter material has no node tree: {material.name}')
+    node_tree = material.node_tree
+    principled_nodes = [
+      node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'
+    ]
+    if not principled_nodes:
+      raise RuntimeError(f'Painter material has no Principled BSDF: {material.name}')
+    represented_texture_sets.add(texture_set)
+    node_names = {
+      'Color': 'Painter Color',
+      'Extra': 'Painter Extra',
+      'Normal': 'Painter Normal Texture',
+    }
+    role_colorspaces = {
+      'Color': 'sRGB',
+      'Extra': 'Non-Color',
+      'Normal': 'Non-Color',
+    }
+    image_nodes = {
+      role: _managed_image_node(
+        node_tree,
+        node_names[role],
+        texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png',
+        role_colorspaces[role],
+      )
+      for role in material_required_roles
+    }
+
+    if 'Color' in material_required_roles:
+      for principled in principled_nodes:
+        if not _socket_has_upstream_node(
+          principled.inputs['Base Color'], image_nodes['Color']
+        ):
+          raise RuntimeError(
+            f'Painter Color is not connected to {material.name}'
+          )
+    if 'Extra' in material_required_roles:
+      separate = node_tree.nodes.get('Painter Extra Channels')
+      if (
+        separate is None
+        or separate.type != 'SEPARATE_COLOR'
+        or separate.mode != 'RGB'
+      ):
+        raise RuntimeError(f'Painter Extra channel node is missing: {material.name}')
+      if not _socket_has_direct_source(
+        separate.inputs['Color'], image_nodes['Extra'], 'Color'
+      ):
+        raise RuntimeError(f'Painter Extra image is not connected: {material.name}')
+      for principled in principled_nodes:
+        roughness_links = principled.inputs['Roughness'].links
+        metallic_links = principled.inputs['Metallic'].links
+        if not any(
+          link.from_node == separate and link.from_socket.name == 'Green'
+          for link in roughness_links
+        ):
+          raise RuntimeError(f'Painter Extra.G is not Roughness: {material.name}')
+        if not any(
+          link.from_node == separate and link.from_socket.name == 'Blue'
+          for link in metallic_links
+        ):
+          raise RuntimeError(f'Painter Extra.B is not Metallic: {material.name}')
+    if 'Normal' in material_required_roles:
+      separate = node_tree.nodes.get('Painter Normal DirectX Channels')
+      green_flip = node_tree.nodes.get('Painter Normal DirectX Green Flip')
+      combine = node_tree.nodes.get('Painter Normal OpenGL')
+      normal_map = node_tree.nodes.get('Painter Normal')
+      if (
+        separate is None
+        or separate.type != 'SEPARATE_COLOR'
+        or separate.mode != 'RGB'
+      ):
+        raise RuntimeError(f'Painter Normal channel node is missing: {material.name}')
+      if green_flip is None or green_flip.type != 'MATH' or (
+        green_flip.operation != 'SUBTRACT'
+      ) or abs(float(green_flip.inputs[0].default_value) - 1.0) > 1e-6:
+        raise RuntimeError(f'Painter Normal green flip is invalid: {material.name}')
+      if (
+        combine is None
+        or combine.type != 'COMBINE_COLOR'
+        or combine.mode != 'RGB'
+      ):
+        raise RuntimeError(f'Painter Normal combine node is missing: {material.name}')
+      if normal_map is None or normal_map.type != 'NORMAL_MAP' or (
+        normal_map.space != 'TANGENT'
+      ):
+        raise RuntimeError(f'Painter tangent Normal Map is invalid: {material.name}')
+      exact_links = (
+        (separate.inputs['Color'], image_nodes['Normal'], 'Color'),
+        (green_flip.inputs[1], separate, 'Green'),
+        (combine.inputs['Red'], separate, 'Red'),
+        (combine.inputs['Green'], green_flip, 'Value'),
+        (combine.inputs['Blue'], separate, 'Blue'),
+        (normal_map.inputs['Color'], combine, 'Color'),
+      )
+      if not all(
+        _socket_has_direct_source(socket, node, socket_name)
+        for socket, node, socket_name in exact_links
+      ):
+        raise RuntimeError(f'Painter Normal direct chain is invalid: {material.name}')
+      for principled in principled_nodes:
+        if not _socket_has_direct_source(
+          principled.inputs['Normal'], normal_map, 'Normal'
+        ):
+          raise RuntimeError(
+            f'Painter Normal is not connected to {material.name}'
+          )
+    receipt_name = (
+      f'{MATERIAL_PREFIX}{texture_set}'
+      if material in material_texture_sets
+      else material.name
+    )
+    verified[receipt_name] = sorted(material_required_roles)
+  if not verified:
+    raise RuntimeError('Painter apply found no low materials to verify')
+  if role_contract is not None and represented_texture_sets != set(active_role_contract):
+    raise RuntimeError(
+      'Painter material Texture Sets differ from the role contract: '
+      f'materials={sorted(represented_texture_sets)}, '
+      f'contract={sorted(active_role_contract)}'
+    )
+  return verified
+
+
+class PainterApplyNoMaterialsError(RuntimeError):
+  pass
+
+
+def apply_painter_export_transaction(
+  result,
+  low_objects,
+  texture_dir,
+  *,
+  meshy_mode=False,
+  canonical_texture_sets=None,
+  required_roles_by_texture_set=None,
+  before_commit=None,
+):
+  expected_texture_sets = set(canonical_texture_sets or ()) or {
+    stripped_material_name(slot.material.name)
+    for obj in low_objects
+    for slot in obj.material_slots
+    if slot.material
+  }
+  required_roles_by_texture_set = (
+    normalize_meshy_required_roles(
+      required_roles_by_texture_set,
+      expected_texture_sets,
+    )
+    if meshy_mode else None
+  )
+  required_roles = (
+    {
+      role
+      for roles in required_roles_by_texture_set.values()
+      for role in roles
+    }
+    if meshy_mode else set(MESHY_PAINTER_CANONICAL_ROLES)
+  )
+  transaction_role_contract = (
+    {
+      texture_set: roles
+      for texture_set, roles in required_roles_by_texture_set.items()
+      if roles
+    }
+    if meshy_mode else None
+  )
+  transaction_texture_sets = (
+    set(transaction_role_contract) if meshy_mode else expected_texture_sets
+  )
+  transaction_result = (
+    filter_meshy_painter_export_result(
+      result,
+      expected_texture_sets,
+      required_roles_by_texture_set,
+    )
+    if meshy_mode else result
+  )
+  material_transaction = (
+    MeshyMaterialApplyTransaction(
+      low_objects,
+      texture_dir,
+      expected_texture_sets,
+      required_roles_by_texture_set,
+    )
+    if meshy_mode else None
+  )
+  transaction = begin_painter_canonical_apply_transaction(
+    transaction_result,
+    texture_dir=texture_dir if meshy_mode else None,
+    allowed_roles=required_roles if meshy_mode else None,
+    expected_texture_sets=transaction_texture_sets if meshy_mode else None,
+    expected_roles_by_texture_set=(
+      transaction_role_contract if meshy_mode else None
+    ),
+    require_noncanonical_sources=meshy_mode,
+  )
+  rollback_before_commit = None
+  try:
+    if meshy_mode:
+      applied, managed_roles = material_transaction.prepare()
+      material_transaction.swap()
+    else:
+      applied = apply_painter_textures_to_low(low_objects, texture_dir)
+      managed_roles = {}
+    if applied == 0:
+      raise PainterApplyNoMaterialsError('Painter textures did not match any low material')
+    pending_receipt = {
+      'applied': applied,
+      'canonical_files': list(transaction.canonical_files),
+      'managed_roles': managed_roles,
+    }
+    if before_commit is not None:
+      rollback_before_commit = before_commit(pending_receipt)
+    canonical_files = transaction.commit(remove_sources=True)
+    if material_transaction is not None:
+      material_transaction.commit()
+    pending_receipt['canonical_files'] = canonical_files
+    return pending_receipt
+  except Exception as error:
+    rollback_errors = []
+    for label, rollback_action in (
+      ('material', material_transaction.rollback if material_transaction else None),
+      ('file', transaction.rollback),
+      (
+        'checkpoint',
+        rollback_before_commit if callable(rollback_before_commit) else None,
+      ),
+    ):
+      if rollback_action is None:
+        continue
+      try:
+        rollback_action()
+      except Exception as rollback_error:
+        rollback_errors.append(f'{label}: {rollback_error}')
+    if rollback_errors:
+      raise RuntimeError(
+        'Painter apply failed and rollback was incomplete: '
+        + '; '.join(rollback_errors)
+      ) from error
+    raise
+
+
+def canonicalize_painter_export_files(result, *, remove_sources=True):
+  """Compatibility API for callers that need an immediate file-only commit."""
+  if not painter_export_canonical_replacements(result):
+    return []
+  transaction = begin_painter_canonical_apply_transaction(result)
+  return transaction.commit(remove_sources=remove_sources)
 
 
 def add_high_id_colors(mesh, object_name, attribute_name='Color'):
@@ -1505,7 +2879,10 @@ def export_objects_to_fbx(
       mesh_smooth_type='EDGE',
       use_mesh_modifiers=False,
       use_mesh_edges=True,
-      use_tspace=True,
+      # Painter computes its own MikkTSpace tangent basis. Blender-exported
+      # FBX bitangents can be non-unit after axis/scale conversion, which makes
+      # Painter warn and normalize them on every import.
+      use_tspace=False,
       add_leaf_bones=False,
       apply_scale_options='FBX_SCALE_ALL',
       bake_anim=False,
@@ -2620,6 +3997,39 @@ def painter_is_running(painter_path):
     return result.returncode == 0
   except OSError:
     return False
+
+
+_PAINTER_INHERITED_ENVIRONMENT_VARIABLES = (
+  'BLENDER_SYSTEM_SCRIPTS',
+  'BLENDER_USER_CONFIG',
+  'BLENDER_USER_SCRIPTS',
+  'OCIO',
+  'PYTHONHOME',
+  'PYTHONPATH',
+  'QT_PLUGIN_PATH',
+  'QT_QPA_PLATFORM_PLUGIN_PATH',
+)
+
+
+def painter_launch_environment():
+  """Return an environment that is safe for Painter's embedded runtimes.
+
+  Blender sets OCIO to its bundled color configuration and may also be started
+  with Blender-, Python-, or Qt-specific overrides. Letting Painter inherit
+  those values can make it terminate during startup before Python plugins are
+  loaded.
+  """
+  environment = os.environ.copy()
+  for variable in _PAINTER_INHERITED_ENVIRONMENT_VARIABLES:
+    environment.pop(variable, None)
+  return environment
+
+
+def launch_painter(painter_path, project_path=None):
+  command = [str(painter_path)]
+  if project_path is not None:
+    command.append(str(project_path))
+  return subprocess.Popen(command, env=painter_launch_environment())
 
 
 # Scanning every drive for the Painter executable is slow, so do it once.

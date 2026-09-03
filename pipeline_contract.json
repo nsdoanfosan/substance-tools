@@ -2,11 +2,66 @@
   "schema_version": 1,
   "owner": "substance-tools",
   "status": "runtime_enforced_for_core_shared_constants",
-  "verified_against_code": "2026-06-27",
+  "verified_against_code": "2026-09-03",
   "repositories": {
     "substance_tools": "https://github.com/nsdoanfosan/substance-tools",
+    "quad_remesher_workflow_addon": "https://github.com/nsdoanfosan/quad-remesher-workflow-addon",
     "ue_unique_export_names_addon": "https://github.com/nsdoanfosan/ue-unique-export-names-addon",
     "blender_tools": "https://github.com/nsdoanfosan/BlenderTools"
+  },
+  "integration_apis": {
+    "quad_remesher_workflow": {
+      "owner": "quad-remesher-workflow-addon",
+      "service_id": "quad-remesher.workflow",
+      "module": "quad_remesher_workflow_addon.api",
+      "getter": "get_workflow_api",
+      "version": 1,
+      "functions": [
+        "analyze_target",
+        "capture_pre_remesh",
+        "configure_request",
+        "validate_result",
+        "validate_target_override"
+      ],
+      "boundary": "target calculation, public scene.qremesher settings, and read-only native-result provenance only; it never invokes Remesh It or mutates Painter collections/materials"
+    },
+    "uvgami_unwrap": {
+      "owner": "UVgami",
+      "service_id": "uvgami.unwrap",
+      "version": 1,
+      "discovery": "derive the enabled provider package from Blender's UVGAMI_OT_start operator module and import its sibling api module",
+      "functions": [
+        "preflight_unwrap",
+        "begin_unwrap",
+        "poll_unwrap",
+        "inspect_uv_map",
+        "get_capabilities"
+      ],
+      "boundary": "UVgami owns its profile, live manager, native operator call, asynchronous job and UV validation; consumers store only its versioned receipts"
+    },
+    "painter_transfer": {
+      "owner": "substance-tools",
+      "service_id": "substance.painter_transfer",
+      "module": "substance_tools.api",
+      "getter": "get_painter_transfer_api",
+      "version": 1,
+      "functions": [
+        "adopt_retopology_pair",
+        "inspect_transfer_state",
+        "get_capabilities"
+      ],
+      "boundary": "Painter High/Low collection classification, Painter-safe material isolation and Painter transfer checkpoints only; topology analysis and UV unwrapping remain provider-owned"
+    },
+    "painter_low_export_sync": {
+      "owner": "ue-unique-export-names-addon",
+      "service_id": "unreal-handoff.painter-low-export",
+      "module": "ue_unique_export_names_addon.api",
+      "getter": "get_painter_low_export_api",
+      "function": "ensure_painter_low_export_unit",
+      "version": 2,
+      "input_contract": "one exact <base>_low object is a member of Baking/low and asset_base is canonical",
+      "output_contract": "a standalone static Low keeps its _low name under an exact <base> Empty, Send2UE Combine Child meshes is selected and Use immediate parent name is disabled when available, and the Low hierarchy is linked into Export; existing parented, shape-keyed, or rigged hierarchies are preserved"
+    }
   },
   "blender_collections": {
     "baking_root": "Baking",
@@ -131,8 +186,8 @@
     "schema_version": 3,
     "matching": {
       "individual_mesh": "When Send to Unreal imports meshes individually, the sidecar name matches the mesh object/imported asset name.",
-      "empty_combined_mesh": "When Send to Unreal combines child meshes under an Empty, the sidecar name matches the Empty/imported asset name.",
-      "reason_for_multiple_files": "The producer writes both mesh-name and Empty-name sidecars so the pipeline survives either Send to Unreal export mode."
+      "empty_combined_mesh": "When Send to Unreal combines child meshes under an Empty, the sole sidecar for that asset unit matches the Empty/imported asset name.",
+      "emission_rule": "Write one sidecar per resolved export asset unit. An Empty-grouped unit does not publish a competing child-mesh sidecar."
     },
     "top_level_fields": {
       "schema_version": "integer, currently 3",

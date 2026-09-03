@@ -19,3 +19,8 @@ def naming_value(key, default):
 
 def unreal_path_mapping():
   return pipeline_contract().get('unreal_path_mapping', {}).get('current_default', {})
+
+
+def integration_api(name):
+  """Return one versioned cross-add-on API declaration."""
+  return dict(pipeline_contract().get('integration_apis', {}).get(name, {}))

@@ -14,6 +14,16 @@ in [docs/pipeline_contract.md](docs/pipeline_contract.md). Treat that contract
 and `pipeline_contract.json` as the source of truth before changing collection
 names, texture/material prefixes, JSON request files, or Unreal path anchors.
 
+Cross-add-on provider implementations are deliberately not collected into this
+repository. Substance Tools keeps only the stage orchestration needed to call
+the owners below and validate their receipts.
+Quad Remesher target/configuration/provenance belongs to the separate
+`quad-remesher-workflow-addon`; UV profile/start/poll/validation belongs to
+UVgami; and Empty/`Export`/Send2UE naming belongs to UE Unique Export Names.
+Substance Tools consumes their exact versioned APIs and owns only the
+Painter-facing High/Low collections, materials, source maps, backups, and
+texture round trip. See [docs/integration_api.md](docs/integration_api.md).
+
 > Originally derived from
 > [passivestar/substance-tools](https://github.com/passivestar/substance-tools)
 > and has since been almost entirely rewritten through 3.0.0 (2026): the
@@ -62,6 +72,13 @@ is no "pick a collection in the outliner" step anymore. Source meshes are never
 modified; exports run on temporary evaluated copies.
 
 ## Panel: Substance Painter Tools
+
+The established controls remain first and visible. Optional high-poly repair
+and Painter-transfer controls are placed at the end in a default-collapsed
+**High-Poly Painter Transfer (Advanced)** child panel. They run only when the
+user chooses this workflow; importing or generating a Meshy asset does not
+start it automatically. Quad Remesher and UVgami controls are intentionally not
+repeated in the Substance UI.
 
 ### High to Low Baking
 
@@ -180,8 +197,8 @@ a loop.
 
 A read-only sub-panel that classifies the `Send to Unreal` `Export` collection:
 
-- **Low Auto** — the `Baking/low` meshes (plus their parent/armature chain) that
-  belong to the Painter export; managed automatically, not toggleable here.
+- **Low Auto** — the `Baking/low` meshes plus their managed Empty or existing
+  parent/armature chain; managed automatically, not toggleable here.
 - **Linked** — objects in `Export` that also live in another collection.
 - **Export Only** — objects whose only home is `Export`.
 
@@ -195,21 +212,29 @@ This add-on is paired with
 [UE Unique Export Names](https://github.com/nsdoanfosan/ue-unique-export-names-addon)
 for the final Blender-to-Unreal handoff.
 
-After the Painter round trip is complete:
+After the Painter round trip has passed visual QA and the Meshy pipeline state is
+`VERIFIED`:
 
 1. Use `Export Painter Textures & Apply` so the `Unreal_V2` maps are present in
    the shared `texture` folder and connected to the `Baking/low` materials.
 2. Do not rename the Low materials afterward. Painter Texture Set names match
    the Blender material names with the leading `M_` removed.
-3. `UE Unique Export Names` automatically links the `Baking/low` meshes and
-   their complete parent chains into `Export`. No handoff button is required.
-4. Export with Send to Unreal. Enable `Combine > Child meshes` when an Empty and
-   its child meshes should become one Unreal asset.
+3. For an adopted standalone static Low, `UE Unique Export Names` keeps the mesh
+   named `<base>_low` for Painter and places it under one exact top-level Empty
+   `<base>`, which supplies the Unreal asset name. Both are linked into `Export`.
+4. A rigged or shape-keyed Low keeps its hierarchy and is synchronized without
+   forced reparenting. An existing parent is accepted only when it is the exact
+   top-level Empty `<base>` with no other mesh; an incompatible parent stops the
+   export-unit operation without mutation.
+5. For the managed Empty unit, export with Send to Unreal Combine set to
+   `Child meshes` and leave UE Unique `use_immediate_parent_name` off. An exact
+   Empty-name collision is an error; do not accept a `.001` fallback.
 
-`UE Unique Export Names` does not copy or rename the Painter Low data. It links
-the existing `Baking/low` hierarchy into `Export` automatically and protects its
-objects, mesh data, materials, images, and texture files from its External
-workflow.
+`UE Unique Export Names` does not copy or strip the suffix from the Painter Low
+data. Its public export-unit API owns the safe standalone Empty wrapper and the
+`Export` links, and its normal synchronizer preserves existing hierarchies. It
+protects the managed objects, mesh data, materials, images, and texture files
+from its External workflow.
 
 ## Naming conventions
 
@@ -219,6 +244,8 @@ Unreal naming drives the whole pipeline:
   Texture Set `rock`.
 - Exported textures are `T_<set>_<map>`, e.g. `T_rock_Color.png`.
 - Low/High meshes are paired as `A_low` / `A_high` (or `A_high_01`, …).
+- A managed standalone static `A_low` is exported under top-level Empty `A`, so
+  Unreal receives `A` while Painter continues to see `A_low`.
 
 ## Typical workflow
 

@@ -27,7 +27,7 @@ two.
 
 ## Shared Conventions (Current behavior)
 
-Verified against the code on 2026-06-27.
+Verified against the code on 2026-09-03.
 
 Collections. Role is decided by COLLECTION MEMBERSHIP, not by object name:
 
@@ -65,6 +65,29 @@ These strings should not be retyped casually. If they become runtime-shared,
 load them from `pipeline_contract.json` or a small common module rather than
 duplicating literals.
 
+### Painter Retopo Low export unit
+
+The Painter pairing suffix and the Unreal asset name intentionally live on different
+objects for a standalone static retopologized asset:
+
+```text
+<base>              # top-level Empty; Send2UE/Unreal asset name
+`-- <base>_low      # mesh; Painter pairs it with <base>_high
+```
+
+`ue_unique_export_names_addon.api.ensure_painter_low_export_unit()` owns this unit. It
+links the Empty and child into `Export`, preserves the child world transform, and selects
+Send2UE Combine `Child meshes`. UE Unique `use_immediate_parent_name` stays off. The Empty
+must be top-level and contain no unrelated mesh; exact name/type/ownership collisions fail
+instead of producing `.001`.
+
+Only a standalone static Low is wrapped automatically. Armature relationships and shape
+keys are preserved and synchronized without reparenting. An existing parent is accepted
+only when it is the exact top-level Empty `<base>` with no other mesh; any incompatible
+non-skeletal parent stops without mutation. Substance Tools must not duplicate the grouping
+or `Export` mutation. Regardless of when the unit is prepared, actual Unreal Handoff and
+Send2UE are gated on Meshy pipeline state `VERIFIED`.
+
 ## Silent Failure Risk
 
 This pipeline currently has several convention-only links:
@@ -89,9 +112,11 @@ When debugging "nothing happened", check the contract before changing behavior.
 
 ## Unreal Handoff Sidecar Contract
 
-`ue-unique-export-names-addon` writes per-mesh or per-Empty JSON sidecars for
-Send to Unreal and the Unreal material setup script. The current sidecar schema
-is version 2 and includes material entries plus a `cleanup` object.
+`ue-unique-export-names-addon` writes one JSON sidecar per export asset unit for Send to
+Unreal and the Unreal material setup script. An ungrouped unit uses its mesh name; an
+Empty-grouped unit uses the top-level Empty name and does not publish competing child-mesh
+sidecars. The current sidecar schema is version 3 and includes material entries plus a
+`cleanup` object.
 
 The `cleanup.source_material_names` and `cleanup.source_texture_names` arrays
 are precomputed by the producer. They describe FBX-import source assets that may

@@ -61,7 +61,7 @@ class SubstanceToolsPanel(bpy.types.Panel):
     send_maps_row.enabled = painter_project_exists
     send_maps_row.operator(
       'st.send_painter_maps',
-      text='Send Base Color & Detail',
+      text='Send Source Maps & Detail',
       icon='EXPORT',
     )
     if alpha_objects:
@@ -256,3 +256,34 @@ class SubstanceToolsExportStatusPanel(bpy.types.Panel):
     self.draw_group(layout, 'Low Auto', low_auto, 'COLORSET_03_VEC')
     self.draw_group(layout, 'Linked', linked, 'COLORSET_04_VEC')
     self.draw_group(layout, 'Export Only', export_only, 'COLORSET_01_VEC')
+
+
+class SubstanceToolsMeshyPainterPanel(bpy.types.Panel):
+  """Optional high-poly transfer controls, kept out of the primary UI."""
+  bl_idname = 'SCENE_PT_substance_tools_meshy_painter'
+  bl_label = 'High-Poly Painter Transfer (Advanced)'
+  bl_space_type = 'VIEW_3D'
+  bl_region_type = 'UI'
+  bl_category = 'Substance'
+  bl_parent_id = 'SCENE_PT_substance_tools'
+  bl_options = {'DEFAULT_CLOSED'}
+  bl_order = 100
+
+  def draw(self, context):
+    layout = self.layout
+    layout.operator('st.meshy_pipeline_status', text='Status', icon='INFO')
+    layout.operator(
+      'st.bake_meshy_source_maps',
+      text='Bake Available Source Maps',
+      icon='RENDER_STILL',
+    )
+    layout.label(
+      text='Auto: Color / Extra / Normal when present',
+      icon='INFO',
+    )
+    verify = layout.operator(
+      'st.verify_meshy_pipeline',
+      text='Verify Final (after visual QA)',
+      icon='CHECKMARK',
+    )
+    verify.visual_qa_confirmed = True

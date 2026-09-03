@@ -34,7 +34,7 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
       ('X4', 'x4', 'Bake mesh maps with 4x antialiasing'),
       ('X8', 'x8', 'Bake mesh maps with 8x antialiasing'),
     ],
-    default='NONE',
+    default='X2',
   )
   id_source: bpy.props.EnumProperty(
     name='ID Source',
@@ -55,7 +55,7 @@ class SubstanceToolsBakingSettings(bpy.types.PropertyGroup):
         'Use High-poly material colors in Painter ID baking',
       ),
     ],
-    default='FACE_SETS',
+    default='MATERIAL_COLOR',
   )
   painter_low_hide_solidify_rim: bpy.props.BoolProperty(
     name='Hide Solidify Rim in Painter Low',
