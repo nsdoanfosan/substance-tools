@@ -454,6 +454,45 @@ class MeshyUVgamiBlenderTests(unittest.TestCase):
     finally:
       self.pipeline._refresh_recorded_low_export_unit = original_refresh
 
+  def test_finalize_qr_ready_wraps_adoption_then_starts_uv(self):
+    low = self._low_with_valid_uv()
+    state = self._low_created_state(low)
+    state['stage'] = 'QR_READY'
+    state.pop('low')
+    self.pipeline.store_pipeline_state(bpy.context.scene, state)
+    calls = []
+    original_adopt_stage = self.pipeline._adopt_retopology_pair_stage
+
+    def adopt_stage(context):
+      calls.append('adopt')
+      current = self.pipeline.load_pipeline_state(context.scene)
+      receipt = {
+        'high_object': 'UVgamiAsset_high',
+        'low_object': low.name,
+        'actual_low_polygons': len(low.data.polygons),
+      }
+      current['low'] = receipt
+      current = self.pipeline.advance_pipeline_state(
+        current,
+        'LOW_CREATED',
+        receipt,
+      )
+      self.pipeline.store_pipeline_state(context.scene, current)
+      return current, receipt, True
+
+    self.pipeline._adopt_retopology_pair_stage = adopt_stage
+    try:
+      self.assertEqual(bpy.ops.st.finalize_meshy_retopo(), {'FINISHED'})
+    finally:
+      self.pipeline._adopt_retopology_pair_stage = original_adopt_stage
+
+    observed = self.pipeline.load_pipeline_state(bpy.context.scene)
+    self.assertEqual(calls, ['adopt'])
+    self.assertEqual(observed['stage'], 'UVGAMI_RUNNING')
+    operations = [call[0] for call in self.provider.calls]
+    self.assertEqual(operations.count('begin_unwrap'), 1)
+    self.assertNotIn('preflight_unwrap', operations)
+
   def test_incompatible_provider_begin_receipt_is_rejected(self):
     low = self._low_with_valid_uv()
     self.provider.receipt_api_version = 2

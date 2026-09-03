@@ -92,8 +92,11 @@ API directly.
 
 - `st.analyze_meshy_source`: optional, strictly read-only analysis.
 - `st.prepare_meshy_retopo`: publish stage 1 and configure QR without running it.
-- `st.finalize_meshy_retopo`: adopt/name the selected QR result once, classify
-  High/Low in `Baking/high` and `Baking/low`, and start UVgami API v1. While UVgami
+- `st.adopt_retopology_pair`: hidden orchestration operator that validates and
+  adopts the selected QR result, classifies High/Low in `Baking/high` and
+  `Baking/low`, records only `LOW_CREATED`, and does not resolve or start UVgami.
+- `st.finalize_meshy_retopo`: compatibility entry point that runs the same
+  adoption stage when needed and then starts UVgami API v1. While UVgami
   is active the state remains `UVGAMI_RUNNING`; run the same operator again
   after completion to validate the transferred UV and advance to `UV_READY`.
 - `st.prepare_meshy_low_uv`: alternate start/status/confirmation entry point for

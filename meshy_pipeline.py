@@ -2184,7 +2184,7 @@ class PrepareMeshyRetopoOperator(bpy.types.Operator):
       self.report(
         {'INFO'},
         f'QR ready: {state["analysis"]["target_quads"]:,} quads. '
-        'Use Quad Remesher > Remesh It once, then Finalize',
+        'Use Quad Remesher > Remesh It once, then Adopt Retopology Pair',
       )
       return {'FINISHED'}
     except Exception as exc:
@@ -2193,7 +2193,7 @@ class PrepareMeshyRetopoOperator(bpy.types.Operator):
 
 
 class FinalizeMeshyRetopoOperator(bpy.types.Operator):
-  """Adopt the selected QR result, then start or confirm UVgami"""
+  """Compatibility wrapper: adopt when needed, then start or confirm UVgami"""
   bl_idname = 'st.finalize_meshy_retopo'
   bl_label = 'Finalize Retopo + UV'
   bl_options = {'REGISTER', 'UNDO'}
@@ -2233,41 +2233,7 @@ class FinalizeMeshyRetopoOperator(bpy.types.Operator):
         raise MeshyPipelineError(
           f'Finalize requires QR_READY, not {state["stage"]}'
         )
-      verify_source_archive_receipt(
-        (state.get('archive') or {}).get('source_original') or {}
-      )
-      receipt = recover_committed_adoption(context.scene, state)
-      if receipt is not None:
-        state['low'] = receipt
-        state = advance_pipeline_state(state, 'LOW_CREATED', receipt)
-        store_pipeline_state(context.scene, state)
-      else:
-        # Ask UVgami's owner to preflight before the pairing transaction.
-        settings = _pipeline_settings(context.scene)
-        resolution = settings.uv_resolution if settings is not None else 2048
-        margin = settings.uv_margin_pixels if settings is not None else 8
-        result = _single_selected_mesh(context)
-        source = _find_source_from_state(state)
-        uvgami_api = _resolve_uvgami_workflow_api()
-        preflight = _call_uvgami(
-          uvgami_api,
-          'preflight_unwrap',
-          [result],
-          scene=context.scene,
-          resolution=resolution,
-          margin_pixels=margin,
-        )
-        if (
-          not isinstance(preflight, dict)
-          or preflight.get('service_id') != uvgami_api['service_id']
-          or preflight.get('api_version') != uvgami_api['version']
-          or preflight.get('status') != 'READY'
-        ):
-          raise MeshyPipelineError('UVgami returned an invalid preflight receipt')
-        receipt = adopt_qr_result(context.scene, source, result, state)
-        state['low'] = receipt
-        state = advance_pipeline_state(state, 'LOW_CREATED', receipt)
-        store_pipeline_state(context.scene, state)
+      state, receipt, _ = _adopt_retopology_pair_stage(context)
 
       requested = state['analysis']['target_quads']
       actual = receipt['actual_low_polygons']
@@ -2279,6 +2245,72 @@ class FinalizeMeshyRetopoOperator(bpy.types.Operator):
         f'Adopted {receipt["high_object"]} / {receipt["low_object"]}: '
         f'{actual:,} polygons{suffix}; UVgami Hard Surface started. '
         'Run Finalize again after it finishes',
+      )
+      return {'FINISHED'}
+    except Exception as exc:
+      self.report({'ERROR'}, str(exc))
+      return {'CANCELLED'}
+
+
+def _adopt_retopology_pair_stage(context):
+  """Advance only the QR adoption checkpoint; never resolve or start UVgami."""
+  state = load_pipeline_state(context.scene)
+  if not state:
+    raise MeshyPipelineError('Run Prepare High-Poly Retopo first')
+  current = pipeline_stage_index(state['stage'])
+  low_created = pipeline_stage_index('LOW_CREATED')
+  if current >= low_created:
+    pair = validate_adopted_pair(state)
+    _activate_only(pair['low'])
+    return state, dict(state.get('low') or {}), False
+  if state['stage'] != 'QR_READY':
+    raise MeshyPipelineError(
+      f'Adoption requires QR_READY, not {state["stage"]}'
+    )
+
+  verify_source_archive_receipt(
+    (state.get('archive') or {}).get('source_original') or {}
+  )
+  receipt = recover_committed_adoption(context.scene, state)
+  if receipt is None:
+    result = _single_selected_mesh(context)
+    source = _find_source_from_state(state)
+    receipt = adopt_qr_result(context.scene, source, result, state)
+  updated = dict(state)
+  updated['low'] = receipt
+  updated = advance_pipeline_state(updated, 'LOW_CREATED', receipt)
+  store_pipeline_state(context.scene, updated)
+  return updated, receipt, True
+
+
+class AdoptRetopologyPairOperator(bpy.types.Operator):
+  """Adopt a validated QR result without starting UVgami"""
+  bl_idname = 'st.adopt_retopology_pair'
+  bl_label = 'Adopt Retopology Pair'
+  bl_description = (
+    'Name and classify the validated retopology as Painter High/Low, '
+    'then stop at LOW_CREATED without starting UVgami'
+  )
+  bl_options = {'REGISTER', 'UNDO'}
+
+  def execute(self, context):
+    try:
+      state, receipt, changed = _adopt_retopology_pair_stage(context)
+      if not changed:
+        self.report(
+          {'INFO'},
+          f'Retopology pair is already adopted at {state["stage"]}; '
+          'UVgami was not started',
+        )
+        return {'FINISHED'}
+      requested = state['analysis']['target_quads']
+      actual = receipt['actual_low_polygons']
+      variance = abs(actual - requested) / requested if requested else 0.0
+      suffix = ' (outside +/-10%)' if variance > 0.10 else ''
+      self.report(
+        {'WARNING'} if variance > 0.10 else {'INFO'},
+        f'Adopted {receipt["high_object"]} / {receipt["low_object"]}: '
+        f'{actual:,} polygons{suffix}; stopped at LOW_CREATED without UVgami',
       )
       return {'FINISHED'}
     except Exception as exc:
@@ -2418,6 +2450,7 @@ CLASSES = (
   MeshyPipelineSettings,
   AnalyzeMeshySourceOperator,
   PrepareMeshyRetopoOperator,
+  AdoptRetopologyPairOperator,
   FinalizeMeshyRetopoOperator,
   PrepareMeshyLowUVOperator,
   MeshyPipelineStatusOperator,
@@ -2450,6 +2483,7 @@ def unregister():
 
 
 __all__ = [
+  'AdoptRetopologyPairOperator',
   'CLASSES',
   'FinalizeMeshyRetopoOperator',
   'LEGACY_STATE_PROPERTY',

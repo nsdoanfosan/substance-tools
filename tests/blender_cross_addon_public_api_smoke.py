@@ -203,6 +203,91 @@ class CrossAddonPublicApiSmokeTests(unittest.TestCase):
       1,
     )
 
+  def test_staged_adoption_operator_stops_before_uvgami(self):
+    from substance_tools import meshy_pipeline
+
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    source = bpy.context.object
+    source.name = 'StagedAdoptionAsset'
+    material = bpy.data.materials.new('M_StagedAdoptionAsset')
+    source.data.materials.append(material)
+
+    result = source.copy()
+    result.data = source.data.copy()
+    result.name = 'Retopo_StagedAdoptionAsset'
+    bpy.context.scene.collection.objects.link(result)
+    state, _ = self._state_and_topology(
+      source,
+      result,
+      'StagedAdoptionAsset',
+      'staged-adoption-source',
+    )
+    state.update({
+      'analysis': {'target_quads': 5000},
+      'archive': {'source_original': {'test_receipt': True}},
+      'checkpoints': {},
+    })
+    meshy_pipeline.store_pipeline_state(bpy.context.scene, state)
+    bpy.ops.object.select_all(action='DESELECT')
+    result.select_set(True)
+    bpy.context.view_layer.objects.active = result
+
+    unexpected_uv_calls = []
+
+    def fail_if_uvgami_is_resolved():
+      unexpected_uv_calls.append('resolve')
+      raise AssertionError('staged adoption must not resolve UVgami')
+
+    with mock.patch.object(
+      meshy_pipeline,
+      'verify_source_archive_receipt',
+      return_value={'verified': True},
+    ), mock.patch.object(
+      meshy_pipeline,
+      '_validate_qr_result_via_owner',
+      wraps=meshy_pipeline._validate_qr_result_via_owner,
+    ) as validate_qr, mock.patch.object(
+      meshy_pipeline,
+      '_resolve_uvgami_workflow_api',
+      side_effect=fail_if_uvgami_is_resolved,
+    ):
+      self.assertTrue(hasattr(bpy.ops.st, 'adopt_retopology_pair'))
+      self.assertEqual(bpy.ops.st.adopt_retopology_pair(), {'FINISHED'})
+      adopted = meshy_pipeline.load_pipeline_state(bpy.context.scene)
+      self.assertEqual(adopted['stage'], 'LOW_CREATED')
+      self.assertEqual(adopted['low']['high_object'], 'StagedAdoptionAsset_high')
+      self.assertEqual(adopted['low']['low_object'], 'StagedAdoptionAsset_low')
+      self.assertEqual(
+        adopted['low']['topology_owner_receipt']['status'],
+        'SUCCESS',
+      )
+      self.assertEqual(adopted['checkpoints']['LOW_CREATED'], adopted['low'])
+      self.assertNotIn('uvgami', adopted['low'])
+      self.assertNotIn('uv', adopted['low'])
+      self.assertEqual(unexpected_uv_calls, [])
+      validate_qr.assert_called_once()
+
+      # Re-entry is an idempotent adoption check; it neither regresses the
+      # checkpoint nor asks either topology or UV owners to run again.
+      self.assertEqual(bpy.ops.st.adopt_retopology_pair(), {'FINISHED'})
+      self.assertEqual(
+        meshy_pipeline.load_pipeline_state(bpy.context.scene)['stage'],
+        'LOW_CREATED',
+      )
+      self.assertEqual(unexpected_uv_calls, [])
+      validate_qr.assert_called_once()
+
+    baking = bpy.data.collections.get('Baking')
+    self.assertIsNotNone(baking)
+    self.assertIs(
+      baking.children['high'].objects.get('StagedAdoptionAsset_high'),
+      source,
+    )
+    self.assertIs(
+      baking.children['low'].objects.get('StagedAdoptionAsset_low'),
+      result,
+    )
+
   def test_missing_optional_export_addon_is_reported_without_failing_adoption(self):
     from substance_tools import api, meshy_pipeline
 

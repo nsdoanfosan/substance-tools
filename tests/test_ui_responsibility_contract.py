@@ -42,6 +42,7 @@ class UiResponsibilityContractTests(unittest.TestCase):
     self.assertIn('st.bake_meshy_source_maps', panel_source)
     self.assertIn('st.verify_meshy_pipeline', panel_source)
     self.assertNotIn('st.prepare_meshy_retopo', panel_source)
+    self.assertNotIn('st.adopt_retopology_pair', panel_source)
     self.assertNotIn('st.finalize_meshy_retopo', panel_source)
     self.assertNotIn('st.prepare_meshy_low_uv', panel_source)
 

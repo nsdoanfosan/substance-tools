@@ -86,7 +86,8 @@ The workflow remains staged:
 
 1. Archive/analyze and configure Quad Remesher.
 2. Pause for one native **Remesh It** action.
-3. Validate the result and create Painter High/Low collections/materials.
+3. Validate the result and create Painter High/Low collections/materials. The
+   hidden `st.adopt_retopology_pair` adapter stops here at `LOW_CREATED`.
 4. Ask UVgami to unwrap; poll its asynchronous receipt.
 5. Bake available Color, Extra, and Normal source maps.
 6. Create/update Painter, then export/apply textures.
