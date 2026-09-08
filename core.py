@@ -138,7 +138,6 @@ def baking_role_children(scene=None):
   for child in root.children:
     role = collection_role(child)
     if role in roles:
-      child[COLLECTION_ROLE_PROPERTY] = role
       roles[role].append(child)
   for role, collection in (
     (LOW_COLLECTION, low_collection),
@@ -181,18 +180,9 @@ def depsgraph_requires_baking_role_sync(scene, depsgraph):
   if not roles:
     return False
 
-  collection_or_scene_updated = False
-  for update in depsgraph.updates:
-    id_data = getattr(update.id, 'original', None) or update.id
-    if isinstance(id_data, bpy.types.Object):
-      previous = _BAKING_ROLE_MEMBERSHIP.get(id_data.as_pointer(), set())
-      if object_baking_roles(id_data, roles) != previous:
-        return True
-    elif isinstance(id_data, (bpy.types.Collection, bpy.types.Scene)):
-      collection_or_scene_updated = True
-
-  if not collection_or_scene_updated:
-    return False
+  # Collection links are the authoritative input. Inspect their members once,
+  # regardless of how many unrelated geometry/selection updates Blender emits.
+  # This also catches unlink/delete changes reported only as Object updates.
   return baking_role_collection_signature(roles) != _BAKING_ROLE_COLLECTION_SIGNATURE
 
 
