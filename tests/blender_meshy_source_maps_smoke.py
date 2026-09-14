@@ -55,6 +55,20 @@ class MeshySourceMapBakeSmokeTests(unittest.TestCase):
     bpy.context.scene.collection.objects.link(low)
     low.name = 'SM_TestAsset_low'
 
+    # The production Low inherits parent scale while High is detached. The
+    # outward source gap is covered by the world-space cage, but not by that
+    # distance mistakenly scaled a second time in Cycles object space.
+    parent = bpy.data.objects.new('ScaledExportParent', None)
+    bpy.context.scene.collection.objects.link(parent)
+    parent.scale = (0.1, 0.1, 0.1)
+    low.parent = parent
+    high.scale = (0.1, 0.1, 0.1)
+    for vertex in high.data.vertices:
+      vertex.co *= 1.005
+    bpy.context.view_layer.update()
+    original_high_matrix = high.matrix_world.copy()
+    original_low_matrix = low.matrix_world.copy()
+
     high_material = bpy.data.materials.new('__SubstanceToolsHigh_M_TestAsset')
     high_material.use_nodes = True
     nodes = high_material.node_tree.nodes
@@ -157,6 +171,9 @@ class MeshySourceMapBakeSmokeTests(unittest.TestCase):
       bpy.context.scene.substance_tools_baking.resolution = '512'
       first_result = bpy.ops.st.bake_meshy_source_maps()
       self.assertEqual(first_result, {'FINISHED'})
+      self.assertEqual(high.matrix_world, original_high_matrix)
+      self.assertEqual(low.matrix_world, original_low_matrix)
+      self.assertIs(low.parent, parent)
       first = json.loads(
         bpy.context.scene['_substance_tools_meshy_source_maps_receipt']
       )

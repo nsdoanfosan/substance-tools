@@ -1049,6 +1049,17 @@ def bake_meshy_source_maps(context, resolution, archive_parent=None):
       if _low_export_materials or _low_renamed or _high_export_materials or _high_renamed:
         raise RuntimeError('Unexpected material mutation while duplicating bake meshes')
 
+      # Bake distances are object-space, while our bounds/projection settings are
+      # world-space. Normalize only these disposable evaluated copies, including
+      # inherited parent scale; production meshes and transforms remain untouched.
+      for selected_object in context.selected_objects:
+        selected_object.select_set(False)
+      for duplicate in low_duplicates + high_duplicates:
+        duplicate.select_set(True)
+      context.view_layer.objects.active = low_duplicates[0]
+      bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+      context.view_layer.update()
+
       for duplicate in low_duplicates:
         _validate_low_uv(duplicate)
       low_materials, low_slot_records = _copy_materials_for_duplicates(
