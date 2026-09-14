@@ -28,6 +28,7 @@ __all__ = (
   'get_capabilities',
   'get_painter_transfer_api',
   'inspect_transfer_state',
+  'revise_source_maps',
 )
 
 
@@ -65,6 +66,7 @@ def get_painter_transfer_api(version=PAINTER_TRANSFER_API_VERSION):
     'adopt_retopology_pair': adopt_retopology_pair,
     'inspect_transfer_state': inspect_transfer_state,
     'get_capabilities': get_capabilities,
+    'revise_source_maps': revise_source_maps,
   }
 
 
@@ -85,6 +87,13 @@ def get_capabilities():
       ],
     },
   )
+
+
+def revise_source_maps(*, reason, revision_id, resolution=None, context=None):
+  """Publish a corrected source-map baseline while retaining the previous one."""
+  from .source_revision import revise_source_maps as revise
+  return _receipt('revise_source_maps', revise(context or bpy.context,
+      reason=reason, revision_id=revision_id, resolution=resolution))
 
 
 def inspect_transfer_state(*, scene=None):
