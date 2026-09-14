@@ -67,6 +67,7 @@ def get_painter_transfer_api(version=PAINTER_TRANSFER_API_VERSION):
     'inspect_transfer_state': inspect_transfer_state,
     'get_capabilities': get_capabilities,
     'revise_source_maps': revise_source_maps,
+    'queue_existing_painter_project': queue_existing_painter_project,
   }
 
 
@@ -94,6 +95,12 @@ def revise_source_maps(*, reason, revision_id, resolution=None, context=None):
   from .source_revision import revise_source_maps as revise
   return _receipt('revise_source_maps', revise(context or bpy.context,
       reason=reason, revision_id=revision_id, resolution=resolution))
+
+
+def queue_existing_painter_project(*, preserve_open_project=False):
+  from .existing_project import queue_existing_painter_project as queue
+  return _receipt('queue_existing_painter_project', queue(
+      preserve_open_project=preserve_open_project))
 
 
 def inspect_transfer_state(*, scene=None):
