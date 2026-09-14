@@ -607,5 +607,14 @@ class PainterPendingCreateContractTests(unittest.TestCase):
         self.assertEqual(preserved["request_id"], displaced["request_id"])
 
 
+    def test_existing_update_ticket_matches_without_create_template(self):
+        left = dict(self.request, action='UPDATE', spp_existed=True)
+        left.pop('template', None)
+        right = dict(left, open_existing_project=True, preserve_open_project=True)
+        self.assertTrue(self.plugin._same_pending_request(left, right))
+        self.assertFalse(self.plugin._same_pending_request(left, dict(right, spp='different.spp')))
+        self.assertFalse(self.plugin._same_pending_request(left, self.request))
+
+
 if __name__ == "__main__":
     unittest.main()

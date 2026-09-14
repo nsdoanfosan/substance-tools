@@ -87,12 +87,17 @@ def _is_new_create_request(request):
 
 
 def _same_pending_request(left, right):
-    if not (_is_new_create_request(left) and _is_new_create_request(right)):
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    is_create = _is_new_create_request(left) and _is_new_create_request(right)
+    is_update = (left.get('action') == right.get('action') == 'UPDATE'
+                 and left.get('spp_existed') and right.get('spp_existed'))
+    if not (is_create or is_update):
         return False
     marker = _request_marker(left)
     if not marker or marker != _request_marker(right):
         return False
-    for key in ("spp", "low_fbx", "template"):
+    for key in (("spp", "low_fbx", "template") if is_create else ("spp", "low_fbx")):
         left_value = left.get(key)
         right_value = right.get(key)
         if not left_value or not right_value:
@@ -338,6 +343,12 @@ def _load_matching_pending_request():
         except (OSError, ValueError):
             continue
         if _same_pending_request(candidate, request):
+            if (request.get('action') == 'UPDATE' and candidate.get('status') == 'SUCCESS'
+                    and not substance_painter.project.is_busy()
+                    and not substance_painter.project.needs_saving()):
+                if _claim_pending_request(request):
+                    _delete_claimed_pending_request(request)
+                return None
             durable_request_path = path
             break
     if durable_request_path is None:
