@@ -271,3 +271,15 @@ Unreal naming drives the whole pipeline:
 - Windows Steam Substance Painter
 - macOS CC Substance Painter
 - macOS Steam Substance Painter
+# Multiple assets in one original blend
+
+For independent retopo/Painter assets stored in one production file, create a fresh
+Blender scene and call `core.configure_baking_scope(asset_name, scene=scene)` before
+Prepare High-Poly Retopo. Each scene gets its own baking root and asset-named FBX/SPP
+paths. Existing pipeline states and geometry are never reset or moved by this call.
+Legacy scenes retain their existing `Baking` root and blend-named output paths.
+The scope name is stored in the scene's custom properties. Changing a prepared scope,
+reusing another scene's root, and unsafe filename tokens are rejected.
+
+Validate with Blender `--factory-startup --background --python
+tests/blender_baking_scope_smoke.py`; the test does not write user preferences.

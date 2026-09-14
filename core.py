@@ -102,6 +102,48 @@ def ensure_baking_role_child(root, role_name):
   return child
 
 
+def baking_root_name(scene=None):
+  """Resolve an opt-in asset scope; legacy scenes retain the default root."""
+  scene = scene if scene is not None else getattr(bpy.context, 'scene', None)
+  return (scene.get('st_baking_root_name') if scene is not None else None) or BAKING_COLLECTION
+
+
+def configure_baking_scope(asset_name, *, scene=None):
+  """Give a fresh scene its own baking hierarchy and Painter/FBX basename.
+
+  This does not reset pipeline state or relocate existing objects. Each asset
+  can stay in the original blend while another scene retains a finished pair.
+  """
+  scene = scene if scene is not None else bpy.context.scene
+  asset_name = str(asset_name).strip()
+  if not asset_name or clean_name(asset_name) != asset_name:
+    raise ValueError('Use a non-empty asset name containing only letters, digits and underscores')
+  if any(scene.get(key) for key in (
+      '_substance_tools_meshy_pipeline_state_v1',
+      '_substance_tools_meshy_pipeline_state_v2')):
+    raise RuntimeError('A prepared scene cannot change its baking scope')
+  previous = scene.get('st_baking_asset_name')
+  if previous and previous != asset_name:
+    raise RuntimeError('This scene already owns a different baking scope')
+  root_name = BAKING_COLLECTION + '__' + asset_name
+  existing = bpy.data.collections.get(root_name)
+  if existing is not None and not (previous == asset_name and
+      scene.get('st_baking_root_name') == root_name and
+      root_name in scene.collection.children):
+    raise RuntimeError('The requested baking collection already belongs to another scope')
+  legacy = bpy.data.collections.get(BAKING_COLLECTION)
+  if legacy is not None and legacy.name in scene.collection.children:
+    if legacy.all_objects:
+      raise RuntimeError('Use a fresh scene; the current legacy baking hierarchy contains objects')
+    scene.collection.children.unlink(legacy)
+  scene['st_baking_asset_name'] = asset_name
+  scene['st_baking_root_name'] = root_name
+  root, low, high, alpha = ensure_baking_collections(scene)
+  return {'asset': asset_name, 'scene': scene.name, 'root': root.name,
+          'low': low.name, 'high': high.name, 'alpha': alpha.name,
+          'spp': str(baking_paths(scene)['spp'])}
+
+
 def ensure_baking_collections(scene=None):
   if scene is None:
     scene = getattr(bpy.context, 'scene', None)
@@ -109,9 +151,9 @@ def ensure_baking_collections(scene=None):
     scene = bpy.data.scenes[0]
   if scene is None:
     return None, None, None, None
-  root = bpy.data.collections.get(BAKING_COLLECTION)
+  root = bpy.data.collections.get(baking_root_name(scene))
   if root is None:
-    root = bpy.data.collections.new(BAKING_COLLECTION)
+    root = bpy.data.collections.new(baking_root_name(scene))
   if root.name not in {collection.name for collection in scene.collection.children}:
     scene.collection.children.link(root)
 
@@ -127,9 +169,7 @@ def ensure_baking_collections(scene=None):
 
 
 def baking_role_children(scene=None):
-  root, low_collection, high_collection, alpha_collection = get_baking_collections()
-  if root is None and scene is not None:
-    root = bpy.data.collections.get(BAKING_COLLECTION)
+  root, low_collection, high_collection, alpha_collection = get_baking_collections(scene)
   if root is None:
     return None, {}
 
@@ -304,13 +344,13 @@ def sync_exclusive_baking_roles_on_depsgraph(_scene, _depsgraph):
     sync_exclusive_baking_roles(_scene)
 
 
-def get_baking_collections():
+def get_baking_collections(scene=None):
   """Look up the baking collections without creating or linking anything.
 
   Use this in UI draw code: a load handler and a deferred timer already create
   the collections, and Blender discourages modifying data during draw().
   """
-  root = bpy.data.collections.get(BAKING_COLLECTION)
+  root = bpy.data.collections.get(baking_root_name(scene))
   children = {}
   if root is not None:
     for child in root.children:
@@ -328,7 +368,7 @@ def get_baking_collections():
 def painter_low_export_hierarchy():
   """Return the low meshes, parent chains, and Armature modifier rigs."""
   low_objects = set()
-  baking_collection = bpy.data.collections.get(BAKING_COLLECTION)
+  baking_collection = bpy.data.collections.get(baking_root_name())
   low_collection = find_baking_role_child(baking_collection, LOW_COLLECTION)
 
   if low_collection is not None:
@@ -381,9 +421,10 @@ def blend_asset_name():
   return clean_name(bpy.context.scene.name)
 
 
-def baking_paths():
+def baking_paths(scene=None):
+  scene = scene if scene is not None else bpy.context.scene
   base = Path(bpy.path.abspath('//')).resolve()
-  asset = blend_asset_name()
+  asset = scene.get("st_baking_asset_name") or blend_asset_name()
   low_dir = base / LOW_COLLECTION
   high_dir = base / HIGH_COLLECTION
   texture_dir = base / 'texture'
