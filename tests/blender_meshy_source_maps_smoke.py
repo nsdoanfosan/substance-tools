@@ -226,6 +226,27 @@ class MeshySourceMapBakeSmokeTests(unittest.TestCase):
         bpy.context.scene[STATE_PROPERTY],
         state_before_resolution_error,
       )
+      from substance_tools.api import revise_source_maps
+      from substance_tools import meshy_pipeline as mp, meshy_source_maps as sm
+      from unittest.mock import patch
+      bpy.context.scene.substance_tools_baking.resolution = '512'
+      revision = revise_source_maps(reason='Explicit projection correction fixture',
+                                    revision_id='projection_02', resolution=512)
+      self.assertFalse(revision['reused'])
+      self.assertNotEqual(revision['snapshot_dir'], first['snapshot_dir'])
+      self.assertEqual({p.relative_to(archive_root).as_posix(): p.stat().st_mtime_ns
+                        for p in archive_root.rglob('*') if p.is_file()}, before)
+      self.assertEqual(bpy.ops.st.bake_meshy_source_maps(), {'FINISHED'})
+      self.assertTrue(revise_source_maps(reason='Explicit projection correction fixture',
+                                        revision_id='projection_02', resolution=512)['reused'])
+      # A crash after publication must restore that exact revision, not rebake.
+      with patch.object(mp, 'store_pipeline_state', side_effect=RuntimeError('fixture state write gap')):
+        with self.assertRaisesRegex(RuntimeError, 'fixture state write gap'):
+          revise_source_maps(reason='Recovery fixture', revision_id='projection_03', resolution=512)
+      with patch.object(sm, 'bake_meshy_source_maps', side_effect=AssertionError('must reuse published revision')):
+        recovered = revise_source_maps(reason='Recovery fixture', revision_id='projection_03', resolution=512)
+      self.assertEqual(recovered['stage'], 'BAKE_BASELINE_ARCHIVED')
+      self.assertEqual(load_pipeline_state(bpy.context.scene)['source_map_revision_id'], 'projection_03')
 
     self.assertEqual(high.material_slots[0].material.as_pointer(), high_material_pointer)
     self.assertEqual(len(high.material_slots[0].material.node_tree.nodes), high_node_count)

@@ -104,3 +104,14 @@ are adapters; the Codex skill chooses checkpoints and performs visual QA.
 - Tests never save user preferences.
 - Cross-add-on smoke tests validate service/version rejection, transactional
   rollback, `<base>_low` plus Empty `<base>`, and actual Send2UE asset naming.
+# Explicit source-map revisions
+
+`get_painter_transfer_api(1)['revise_source_maps'](reason=..., revision_id=..., resolution=...)`
+publishes a corrected source-map baseline after a verified baseline exists. Use a
+unique safe request ID and a concrete failure/correction reason. Correct projection
+inputs through the owner's existing controls before this call. It verifies unchanged
+High/Low geometry and UVs, preserves the original baseline and complete previous
+pipeline state, then uses the existing atomic baker under a separate revision archive.
+Only downstream Painter/bake/apply checkpoints are invalidated; no SDF, retopology or
+unwrap is repeated. A published revision with a state-write gap is restored rather
+than baked again. Incomplete attempts and changed request inputs require inspection.

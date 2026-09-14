@@ -1282,7 +1282,8 @@ class BakeMeshySourceMapsOperator(bpy.types.Operator):
           raise RuntimeError(
             f'Unexpected immutable source archive directory: {source_root}'
           )
-        archive_parent = source_root.parent
+        from .source_revision import active_archive_parent
+        archive_parent = active_archive_parent(state, source_root)
         stage2_snapshot = archive_parent / '10_bake_baseline_once'
         if stage_index >= pipeline_stage_index('BAKE_BASELINE_ARCHIVED'):
           baseline = (state.get('archive') or {}).get('bake_baseline') or {}
