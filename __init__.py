@@ -1,6 +1,6 @@
 bl_info = {
   'name': 'Substance Import-Export Tools',
-  'version': (3, 0, 0),
+  'version': (3, 2, 0),
   'author': 'passivestar',
   'blender': (4, 1, 0),
   'location': '3D View N Panel',
@@ -9,6 +9,8 @@ bl_info = {
 }
 
 import bpy
+
+from . import api
 
 from .core import (
   alpha_target_material_items,
@@ -33,16 +35,28 @@ from .operators import (
   ToggleBaseColorSourceOperator,
   ToggleExportLinkOperator,
 )
+from .meshy_pipeline import (
+  CLASSES as MESHY_PIPELINE_CLASSES,
+  register_scene_properties as register_meshy_scene_properties,
+  unregister_scene_properties as unregister_meshy_scene_properties,
+)
+from .meshy_source_maps import classes as MESHY_SOURCE_MAP_CLASSES
 from .properties import (
   SubstanceToolsBakingSettings,
   SubstanceToolsPreferences,
   TextureSetBakeItem,
 )
-from .ui import SubstanceToolsExportStatusPanel, SubstanceToolsPanel
+from .ui import (
+  SubstanceToolsExportStatusPanel,
+  SubstanceToolsMeshyPainterPanel,
+  SubstanceToolsPanel,
+)
 
 classes = (
   TextureSetBakeItem,
   SubstanceToolsBakingSettings,
+  *MESHY_PIPELINE_CLASSES,
+  *MESHY_SOURCE_MAP_CLASSES,
   PairSelectedBakingMeshesOperator,
   GroupSelectedMeshesOperator,
   ToggleExportLinkOperator,
@@ -60,6 +74,7 @@ classes = (
   SelectExportStatusObjectOperator,
   SubstanceToolsPanel,
   SubstanceToolsExportStatusPanel,
+  SubstanceToolsMeshyPainterPanel,
   SubstanceToolsPreferences,
 )
 
@@ -86,6 +101,7 @@ def register():
   bpy.types.Scene.substance_tools_baking = bpy.props.PointerProperty(
     type=SubstanceToolsBakingSettings
   )
+  register_meshy_scene_properties()
   bpy.types.Scene.substance_tools_bake_selection = bpy.props.CollectionProperty(
     type=TextureSetBakeItem
   )
@@ -116,6 +132,7 @@ def unregister():
   )
   if hasattr(bpy.types.Scene, 'substance_tools_bake_selection'):
     del bpy.types.Scene.substance_tools_bake_selection
+  unregister_meshy_scene_properties()
   if hasattr(bpy.types.Scene, 'substance_tools_baking'):
     del bpy.types.Scene.substance_tools_baking
   if hasattr(bpy.types.Object, 'substance_tools_alpha_target_material'):

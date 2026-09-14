@@ -1,0 +1,25 @@
+name: Contract tests
+
+on:
+  pull_request:
+    paths:
+      - "**.py"
+      - "pipeline_contract.json"
+      - "docs/integration_api.md"
+      - ".github/workflows/contract-tests.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  python-contracts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python sources
+        run: python -m compileall -q .
+      - name: Run dependency-free contract tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
