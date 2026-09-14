@@ -313,12 +313,13 @@ def _log_pending_request_wait(reason):
 
 
 def _load_matching_pending_request():
-    """Load the CREATE ticket only after it matches the open Painter target."""
+    """Load a project ticket only after it matches the open Painter target."""
     request = _load_pending_request()
     if (
         request is None
         or request.get("status") in {"FAILED", "SUCCESS"}
-        or not _is_new_create_request(request)
+        or not (_is_new_create_request(request) or (
+            request.get('action') == 'UPDATE' and request.get('open_existing_project')))
     ):
         return None
     matched, reason = _open_project_request_match(request)
@@ -911,6 +912,11 @@ def _create_pending_project():
     if not _started:
         return
     request = _load_pending_request()
+    if (request and request.get('status') not in {'FAILED', 'SUCCESS'}
+            and request.get('action') == 'UPDATE' and request.get('open_existing_project')):
+        from .existing_project import handle_existing_project
+        if handle_existing_project(substance_painter.project, request, _log):
+            return
     if (
         request is None
         or request.get("status") in {"FAILED", "SUCCESS"}
