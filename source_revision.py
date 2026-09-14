@@ -39,7 +39,7 @@ def revise_source_maps(context, *, reason, revision_id, resolution=None):
     pair = mp.validate_adopted_pair(state)
     high = mp.validate_content_signature(pair['high'], context.scene, state['source']['content_signature'],
                                          include_material=False, label='Revision High')
-    low = mp.mesh_object_content_signature(pair['low'], context.scene)
+    low = mp.mesh_object_content_signature(pair['low'], context.scene, source_images=[])
     signatures = {name: {k: sig[k] for k in ('geometry_sha256', 'uv_sha256')}
                   for name, sig in [('high', high), ('low', low)]}
     resolve_cage = getattr(core, 'resolve_source_bake_collision', None)
@@ -47,7 +47,7 @@ def revise_source_maps(context, *, reason, revision_id, resolution=None):
     projection = {'max_ray_distance': float(pair['low'].get('st_source_bake_max_ray_distance', 0.0))}
     if cage is not None:
         projection['cage'] = cage.name
-        projection['cage_geometry'] = mp.mesh_object_content_signature(cage, context.scene)['geometry_sha256']
+        projection['cage_geometry'] = mp.mesh_object_content_signature(cage, context.scene, source_images=[])['geometry_sha256']
     baseline = state['archive']['bake_baseline']
     verify_immutable_snapshot_set_archive(baseline['snapshot_dir'])
     if file_manifest(baseline['snapshot_manifest'])['sha256'] != baseline['snapshot_manifest_sha256']:
@@ -75,8 +75,9 @@ def revise_source_maps(context, *, reason, revision_id, resolution=None):
     else:
         receipt = sm.bake_meshy_source_maps(context, resolution, archive_parent=parent)
     for name in ('high', 'low'):
-        mp.validate_content_signature(pair[name], context.scene, signatures[name],
-                                      include_material=False, label='Unchanged revision ' + name)
+        observed = mp.mesh_object_content_signature(pair[name], context.scene, source_images=[])
+        if any(observed[k] != signatures[name][k] for k in signatures[name]):
+            raise ValueError('Revision changed geometry/UV: ' + name)
     updated = copy.deepcopy(state)
     updated['source_map_revision_id'] = revision_id
     updated.setdefault('source_map_revision_history', []).append({

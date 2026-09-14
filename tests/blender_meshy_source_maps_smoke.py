@@ -230,6 +230,15 @@ class MeshySourceMapBakeSmokeTests(unittest.TestCase):
       from substance_tools import meshy_pipeline as mp, meshy_source_maps as sm
       from unittest.mock import patch
       bpy.context.scene.substance_tools_baking.resolution = '512'
+      # Applied Low materials retain disconnected original and canonical nodes.
+      # Geometry-only revision validation must not rediscover those as sources.
+      for index in range(2):
+        retained = color.copy()
+        retained.filepath_raw = str(Path(raw) / f'retained_color_{index}.png')
+        retained.file_format = 'PNG'
+        retained.save()
+        low_material.node_tree.nodes.new('ShaderNodeTexImage').image = retained
+      low_node_count = len(low_material.node_tree.nodes)
       revision = revise_source_maps(reason='Explicit projection correction fixture',
                                     revision_id='projection_02', resolution=512)
       self.assertFalse(revision['reused'])
