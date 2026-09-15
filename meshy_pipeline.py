@@ -690,12 +690,17 @@ def _stage_archive_root(asset_base):
   if not bpy.data.filepath:
     raise MeshyPipelineError('Save the blend file before creating the source archive')
   blend_path = Path(bpy.data.filepath).resolve()
-  return (
+  root = (
     blend_path.parent
     / '_painter_archive'
     / clean_name(asset_base)
     / '00_source_original_once'
   )
+  revision = bpy.context.scene.get('st_original_source_revision', '')
+  if revision:
+    from .original_source_revision import validate_revision_id
+    return root.parent / '00_source_original_revisions' / validate_revision_id(revision)
+  return root
 
 
 def create_source_archive(asset_base, analysis):
