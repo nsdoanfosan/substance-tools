@@ -2,8 +2,13 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import sys
+import types
 
-spec = importlib.util.spec_from_file_location('revision_policy', Path(__file__).parents[1] / 'source_revision.py')
+package = types.ModuleType('_source_revision_policy_test')
+package.__path__ = [str(Path(__file__).parents[1])]
+sys.modules[package.__name__] = package
+spec = importlib.util.spec_from_file_location(package.__name__ + '.source_revision', Path(__file__).parents[1] / 'source_revision.py')
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 

@@ -29,6 +29,7 @@ __all__ = (
   'get_painter_transfer_api',
   'inspect_transfer_state',
   'revise_source_maps',
+  'configure_original_source_revision',
 )
 
 
@@ -68,6 +69,7 @@ def get_painter_transfer_api(version=PAINTER_TRANSFER_API_VERSION):
     'get_capabilities': get_capabilities,
     'revise_source_maps': revise_source_maps,
     'queue_existing_painter_project': queue_existing_painter_project,
+    'configure_original_source_revision': configure_original_source_revision,
   }
 
 
@@ -101,6 +103,13 @@ def queue_existing_painter_project(*, preserve_open_project=False):
   from .existing_project import queue_existing_painter_project as queue
   return _receipt('queue_existing_painter_project', queue(
       preserve_open_project=preserve_open_project))
+
+
+def configure_original_source_revision(*, revision_id, reason, scene=None):
+  """Choose a new immutable original for an explicitly regenerated source."""
+  from .original_source_revision import configure_original_source_revision as configure
+  return _receipt('configure_original_source_revision', configure(
+      _scene(scene), revision_id=revision_id, reason=reason))
 
 
 def inspect_transfer_state(*, scene=None):

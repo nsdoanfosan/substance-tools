@@ -283,3 +283,11 @@ reusing another scene's root, and unsafe filename tokens are rejected.
 
 Validate with Blender `--factory-startup --background --python
 tests/blender_baking_scope_smoke.py`; the test does not write user preferences.
+# Regenerated original sources
+
+For a deliberately rebuilt source using an existing asset name, start in a fresh
+Blender scene and call the Painter transfer API's
+`configure_original_source_revision(revision_id=..., reason=...)` before Prepare.
+The original file remains the production file. Earlier immutable source archives
+remain unchanged; the new source and its bake stages receive separate versioned
+archive locations. An active repair cannot switch to another original revision.

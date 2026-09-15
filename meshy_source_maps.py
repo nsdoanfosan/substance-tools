@@ -1289,10 +1289,8 @@ class BakeMeshySourceMapsOperator(bpy.types.Operator):
         if not source_root_value:
           raise RuntimeError('Meshy state has no immutable source archive root')
         source_root = Path(source_root_value).resolve()
-        if source_root.name != '00_source_original_once':
-          raise RuntimeError(
-            f'Unexpected immutable source archive directory: {source_root}'
-          )
+        from .original_source_revision import original_stage_parent
+        original_stage_parent(source_root)
         from .source_revision import active_archive_parent
         archive_parent = active_archive_parent(state, source_root)
         stage2_snapshot = archive_parent / '10_bake_baseline_once'

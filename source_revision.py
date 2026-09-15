@@ -3,23 +3,23 @@ from pathlib import Path
 import copy
 import json
 import re
+from .original_source_revision import original_stage_parent
 
 
 def revision_parent(source_root, revision_id):
     source_root = Path(source_root).resolve()
-    if source_root.name != '00_source_original_once':
-        raise ValueError('Revision requires the verified original-source archive')
+    original_parent = original_stage_parent(source_root)
     if not re.fullmatch(r'[a-zA-Z0-9_-]{8,80}', str(revision_id)):
         raise ValueError('Revision ID must be a safe unique token of 8–80 characters')
-    parent = (source_root.parent / 'source_map_revisions' / revision_id).resolve()
-    if not parent.is_relative_to(source_root.parent):
+    parent = (original_parent / 'source_map_revisions' / revision_id).resolve()
+    if not parent.is_relative_to(original_parent):
         raise ValueError('Revision archive escapes the source asset root')
     return parent
 
 
 def active_archive_parent(state, source_root):
     revision_id = state.get('source_map_revision_id')
-    return revision_parent(source_root, revision_id) if revision_id else Path(source_root).resolve().parent
+    return revision_parent(source_root, revision_id) if revision_id else original_stage_parent(source_root)
 
 
 def revise_source_maps(context, *, reason, revision_id, resolution=None):
