@@ -2300,8 +2300,16 @@ def _audit_expected_source_state(expected):
 
 def _apply_alpha_color_layers(request):
     alpha_color_maps = request.get("alpha_color_maps", {})
+    alpha_mask_maps = request.get("alpha_mask_maps", {})
     if not alpha_color_maps:
         return
+
+    # Validate the whole mask plan before importing resources or changing layers.
+    for texture_set_name, image_path in alpha_color_maps.items():
+        if image_path and Path(image_path).is_file():
+            mask_path = alpha_mask_maps.get(texture_set_name, image_path)
+            if not Path(mask_path).is_file():
+                raise RuntimeError(f"Explicit Alpha mask was not found: {mask_path}")
 
     applied = 0
     for texture_set in substance_painter.textureset.all_texture_sets():
@@ -2316,7 +2324,7 @@ def _apply_alpha_color_layers(request):
             group="Substance Tools",
         )
         mask_resource = substance_painter.resource.import_project_resource(
-            image_path,
+            alpha_mask_maps.get(texture_set_name, image_path),
             substance_painter.resource.Usage.ALPHA,
             name=f"{texture_set_name}_BlenderAlphaMask",
             group="Substance Tools",
