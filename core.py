@@ -26,6 +26,7 @@ PAINTER_EXPORT_REQUEST = '.substance_tools_export_request.json'
 PAINTER_EXPORT_RESULT = '.substance_tools_export_result.json'
 EXPORT_PRESET_NAME = naming_value('painter_export_preset', 'Unreal_V2')
 CLOTH_EXPORT_PRESET_NAME = naming_value('painter_cloth_export_preset', 'Unreal_V2_Cloth')
+FABRIC_TWOSIDED_EXPORT_PRESET_NAME = 'Unreal_V2_FabricTwoSided'
 MATERIAL_PREFIX = naming_value('material_prefix', 'M_')
 TEXTURE_PREFIX = naming_value('texture_prefix', 'T_')
 BACK_TEXTURE_SET_SUFFIX = naming_value('back_texture_set_suffix', '_back')
@@ -38,6 +39,7 @@ PAINTER_EXPORT_PRESET_ITEMS = (
     CLOTH_EXPORT_PRESET_NAME,
     'Unreal V2 plus Sheen Color, Sheen Opacity, Sheen Roughness',
   ),
+  ('UNREAL_V2_FABRIC_TWOSIDED', FABRIC_TWOSIDED_EXPORT_PRESET_NAME, 'Two-sided fabric: Cloth maps and a separate Opacity mask'),
 )
 PAINTER_TEXTURE_ROLES = ('Color', 'Extra', 'Normal', 'Emissive', 'Height')
 MESHY_PAINTER_CANONICAL_ROLES = ('Color', 'Extra', 'Normal')
@@ -46,6 +48,7 @@ PAINTER_CLOTH_TEXTURE_ROLES = PAINTER_TEXTURE_ROLES + (
   'SheenOpacity',
   'SheenRoughness',
 )
+PAINTER_FABRIC_TWOSIDED_TEXTURE_ROLES = PAINTER_CLOTH_TEXTURE_ROLES + ('Opacity',)
 BAKING_ROLE_COLLECTIONS = (LOW_COLLECTION, HIGH_COLLECTION, ALPHA_COLLECTION)
 _BAKING_ROLE_MEMBERSHIP = {}
 _BAKING_ROLE_COLLECTION_SIGNATURE = ()
@@ -512,7 +515,7 @@ def _unreal_v2_inline_maps():
 
 
 def painter_inline_export_preset_variants(name):
-  if name != CLOTH_EXPORT_PRESET_NAME:
+  if name not in (CLOTH_EXPORT_PRESET_NAME, FABRIC_TWOSIDED_EXPORT_PRESET_NAME):
     return ()
   return ({
     'name': name,
@@ -520,7 +523,7 @@ def painter_inline_export_preset_variants(name):
       _export_rgb_map('$textureSet_SheenColor', 'sheencolor'),
       _export_luminance_map('$textureSet_SheenOpacity', 'sheenopacity'),
       _export_luminance_map('$textureSet_SheenRoughness', 'sheenroughness'),
-    ],
+    ] + ([_export_luminance_map('$textureSet_Opacity', 'opacity')] if name == FABRIC_TWOSIDED_EXPORT_PRESET_NAME else []),
   },)
 
 
@@ -1293,7 +1296,7 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
     texture_set = clean_name(stripped_material_name(material.name))
     paths = {
       role: texture_dir / f'{TEXTURE_PREFIX}{texture_set}_{role}.png'
-      for role in PAINTER_CLOTH_TEXTURE_ROLES
+      for role in (PAINTER_FABRIC_TWOSIDED_TEXTURE_ROLES if texture_set.startswith('FabricTwoSided_') else PAINTER_CLOTH_TEXTURE_ROLES)
     }
     images = {
       role: load_or_reload_image(path)
@@ -1405,6 +1408,16 @@ def apply_painter_textures_to_low(low_objects, texture_dir):
           replace_socket_link(node_tree, separate.outputs['Red'], sheen_roughness)
       material_applied = True
     force_material_opaque(material)
+    if images.get('Opacity') is not None:
+      opacity_image = images['Opacity']
+      opacity_image.colorspace_settings.name = 'Non-Color'
+      image_node = node_tree.nodes.get(opacity_image.name) or node_tree.nodes.new('ShaderNodeTexImage')
+      image_node.name = opacity_image.name
+      image_node.image = opacity_image
+      image_node.label = 'Painter Opacity'
+      for principled in principled_nodes:
+        replace_socket_link(node_tree, image_node.outputs['Color'], principled.inputs['Alpha'])
+      material_applied = True
     remove_stale_unlinked_image_nodes(material, preserve_images=images.values())
     if material_applied:
       applied += 1
@@ -1974,7 +1987,7 @@ def painter_export_role(path):
   stem = Path(path).stem
   return next(
     (
-      role for role in sorted(PAINTER_CLOTH_TEXTURE_ROLES, key=len, reverse=True)
+      role for role in sorted(PAINTER_FABRIC_TWOSIDED_TEXTURE_ROLES, key=len, reverse=True)
       if stem.endswith(f'_{role}')
     ),
     None,

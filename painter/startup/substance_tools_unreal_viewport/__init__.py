@@ -26,6 +26,7 @@ PENDING_REQUEST_FILENAME = "pending_request.json"
 EXPORT_REQUEST_FILENAME = ".substance_tools_export_request.json"
 EXPORT_RESULT_FILENAME = ".substance_tools_export_result.json"
 CLOTH_EXPORT_PRESET_NAME = "Unreal_V2_Cloth"
+FABRIC_TWOSIDED_EXPORT_PRESET_NAME = "Unreal_V2_FabricTwoSided"
 CLOTH_EXPORT_CHANNELS = (
     ("SheenColor", "sRGB8"),
     ("SheenOpacity", "L8"),
@@ -576,7 +577,7 @@ def _export_textures_with_preset(request, export_list, preset):
 
 
 def _is_cloth_export_request(request):
-    if str(request.get("preset") or "") == CLOTH_EXPORT_PRESET_NAME:
+    if str(request.get("preset") or "") in {CLOTH_EXPORT_PRESET_NAME, FABRIC_TWOSIDED_EXPORT_PRESET_NAME}:
         return True
     for preset in request.get("inline_presets") or []:
         if isinstance(preset, dict) and str(preset.get("name") or "") == CLOTH_EXPORT_PRESET_NAME:
@@ -603,18 +604,23 @@ def _ensure_cloth_export_channels(request):
     if not _is_cloth_export_request(request):
         return None
 
+    fabric = str(request.get("preset") or "") == FABRIC_TWOSIDED_EXPORT_PRESET_NAME
+    required_channels = CLOTH_EXPORT_CHANNELS + (("Opacity", "L8"),) if fabric else CLOTH_EXPORT_CHANNELS
+    selected = set(request.get("texture_sets") or ())
     audit = {
-        "preset": CLOTH_EXPORT_PRESET_NAME,
-        "required": [name for name, _format_name in CLOTH_EXPORT_CHANNELS],
+        "preset": str(request.get("preset") or CLOTH_EXPORT_PRESET_NAME),
+        "required": [name for name, _format_name in required_channels],
         "added": [],
         "already_enabled": [],
     }
     errors = []
 
     for texture_set in substance_painter.textureset.all_texture_sets():
+        if fabric and (not str(texture_set.name).startswith("FabricTwoSided_") or selected and texture_set.name not in selected):
+            continue
         for stack in texture_set.all_stacks():
             root_path = _stack_root_path(texture_set, stack)
-            for channel_name, format_name in CLOTH_EXPORT_CHANNELS:
+            for channel_name, format_name in required_channels:
                 try:
                     channel_type = _enum_member(
                         substance_painter.textureset.ChannelType,
