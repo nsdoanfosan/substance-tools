@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -61,11 +62,17 @@ def _load_plugin_with_import_stubs():
         sys.modules["PySide6.QtCore"] = qtcore
 
         spec = importlib.util.spec_from_file_location(
-            "substance_tools_painter_source_map_test_target",
+            "substance_tools_painter_source_map_test_target_" + uuid.uuid4().hex,
             PLUGIN_PATH,
         )
         plugin = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plugin)
+        sys.modules[spec.name] = plugin
+        try:
+            spec.loader.exec_module(plugin)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
+        plugin._log = mock.Mock()
         return plugin, painter
     finally:
         for name, module in original.items():
@@ -288,7 +295,7 @@ class PainterSourceMapContractTests(unittest.TestCase):
             mock.patch.object(
                 plugin,
                 "_mark_request_success",
-                side_effect=lambda request: successes.append(request["request_id"]),
+                side_effect=lambda request, *, verified_noop=False: successes.append(request["request_id"]),
             ),
             mock.patch.object(
                 plugin,

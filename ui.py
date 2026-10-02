@@ -151,6 +151,16 @@ class SubstanceToolsPanel(bpy.types.Panel):
       text=switch_label,
       icon='FILE_REFRESH',
     )
+    collision_resolver = globals().get('resolve_source_bake_collision')
+    if callable(collision_resolver):
+      collision_box = baking_box.box()
+      collision_box.label(text='Baking/collision — Source Projection Cages', icon='MOD_WIREFRAME')
+      for low in low_objects:
+        try:
+          cage = collision_resolver(low)
+          collision_box.label(text=f'{low.name}: {cage.name if cage else "Default extrusion"}')
+        except RuntimeError as exc:
+          collision_box.label(text=str(exc), icon='ERROR')
 
 
 class SubstanceToolsExportStatusPanel(bpy.types.Panel):
