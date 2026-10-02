@@ -274,8 +274,8 @@ class CoordinationHelperTests(unittest.TestCase):
                                  target='C:/work/asset.blend', resource='blender')
         self.assertEqual(request['workstation_target'], 'C:/work/asset.blend')
         self.assertTrue(self.helper.can_execute(request))
-        self.helper.complete(request)
-        self.bridge.complete_handoff.assert_called_once_with(request['workstation_phase'], 'native-one', 'c:/work/asset.blend')
+        self.assertFalse(self.helper.complete(request))
+        self.bridge.complete_handoff.assert_not_called()
 
     def test_apply_binding_rejects_other_blender_resource_before_binding(self):
         request = dict(request_id='native-one', spp='C:/work/asset.spp')
@@ -551,6 +551,8 @@ class PainterNativeGateTests(unittest.TestCase):
 
 
 def load_operator_class(name, workstation):
+    if isinstance(workstation, mock.Mock):
+        workstation.resume_apply.return_value = None
     tree = ast.parse((ROOT / 'operators.py').read_text(encoding='utf-8'))
     node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == name)
     class Operator:
@@ -759,11 +761,11 @@ with tempfile.TemporaryDirectory(prefix='substance-queue-contract-') as director
         helper.attach_phase(application, apply['id'], pipeline=helper.APPLY_PIPELINE,
                             target=str(Path(directory) / 'asset.blend'), resource=result['phase']['resource'])
         assert helper.can_execute(application)
-        assert helper.complete(application)
+        assert not helper.complete(application)  # Apply alone has no saved Blend evidence.
         assert not helper.can_execute(request)
-        assert not helper.can_execute(application)
+        assert helper.can_execute(application)
         phases = store.phases_snapshot()
-        assert all(item['state'] == 'completed' for item in phases), phases
+        assert {item['id']: item['state'] for item in phases} == {parent['id']: 'completed', apply['id']: 'active'}, phases
 print('exact native lifecycle passed')
 '''
         environment = dict(os.environ, WORKSTATION_QUEUE_REPO=str(repo), SUBSTANCE_COORDINATION_HELPER=str(HELPER))
