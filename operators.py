@@ -2164,6 +2164,16 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     if phase_id and not getattr(self, 'workstation_apply_phase_id', ''):
       self.report({'ERROR'}, 'A separate authorized Blender apply phase is required')
       return {'CANCELLED'}
+    if phase_id:
+      try:
+        previous = workstation.resume_apply(phase_id, self.workstation_apply_phase_id, bpy.data.filepath)
+        if previous:
+          self.report({'INFO'}, f'Existing Blender apply: {previous}; native work was not repeated. '
+                      'Save the exact applied Blend through the approved workflow, or reconcile uncertain work.')
+          return {'FINISHED'}
+      except Exception as error:
+        self.report({'ERROR'}, f'Existing Blender apply must be reconciled: {error}')
+        return {'CANCELLED'}
     try:
       workstation.require_phase(phase_id)
     except Exception as error:
@@ -2344,6 +2354,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
             return {'PASS_THROUGH'}
           apply_request = dict(parent_request)
           apply_request.pop('workstation_phase', None)
+          apply_request['workstation_parent_phase_id'] = parent_request['workstation_phase']['phase_id']
           workstation.attach_phase(apply_request, self.workstation_apply_phase_id,
                                    pipeline=workstation.APPLY_PIPELINE, target=self._workstation_blend_file,
                                    resource=followup['phase']['resource'])
@@ -2353,6 +2364,16 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
           self.cancel(context)
           return {'CANCELLED'}
       if not self._workstation_apply_ready(context):
+        return {'CANCELLED'}
+      try:
+        if not workstation.begin_apply(self._workstation_apply_request, context.scene, result):
+          context.window_manager.event_timer_remove(self._timer)
+          self._timer = None
+          self.report({'INFO'}, 'Existing Blender apply retained; save/reconcile it without repeating apply')
+          return {'FINISHED'}
+      except Exception as error:
+        self.report({'ERROR'}, f'Blender apply journal could not be prepared: {error}')
+        self.cancel(context)
         return {'CANCELLED'}
     context.window_manager.event_timer_remove(self._timer)
     self._timer = None
@@ -2548,8 +2569,19 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     applied = apply_receipt['applied']
     canonical_files = apply_receipt['canonical_files']
     context.scene.substance_tools_baking.base_color_source = 'PAINTER'
-    if not workstation.complete(getattr(self, '_workstation_apply_request', None) or {}):
-      self.report({'WARNING'}, 'Textures were applied; the queue completion receipt must be reconciled')
+    apply_request = getattr(self, '_workstation_apply_request', None) or {}
+    if 'workstation_phase' in apply_request:
+      try:
+        workstation.applied_awaiting_save(apply_request, context.scene, dict(
+          applied=applied, canonical_files=[str(path) for path in canonical_files],
+          managed_roles=apply_receipt.get('managed_roles', {})))
+      except Exception as error:
+        workstation.fail(apply_request, f'Applied Blend receipt uncertain: {error}; do not reapply')
+        self.report({'ERROR'}, f'Applied result requires owner recovery before completion: {error}')
+        return {'CANCELLED'}
+      self.report({'INFO'}, 'Textures applied; queue still awaits saving the exact Blend through the '
+                  'approved workflow. No automatic save was performed.')
+      return {'FINISHED'}
     self.report(
       {'INFO'},
       f'완료 (done): Painter의 원본 기반 채널을 재질 {applied}개에 적용 '
