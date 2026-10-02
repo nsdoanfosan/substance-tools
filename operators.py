@@ -1,4 +1,5 @@
 from .core import *
+from . import workstation_coordination as workstation
 
 
 MESHY_SOURCE_MATERIAL_ROLES = ('BaseColor', 'ExtraR', 'Roughness', 'Metallic')
@@ -931,6 +932,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
   bl_idname = 'st.export_baking_to_substance_painter'
   bl_label = 'Send Baking Meshes to Substance Painter'
   bl_options = {'REGISTER'}
+  workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
 
   action: bpy.props.EnumProperty(
     name='Action',
@@ -944,11 +946,25 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
   )
 
   def execute(self, context):
+    phase_id = getattr(self, 'workstation_phase_id', '')
+    try:
+      workstation.require_phase(phase_id)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter work phase is not ready: {error}')
+      return {'CANCELLED'}
     if not bpy.data.filepath:
       self.report({'ERROR'}, 'Save the .blend file before exporting')
       return {'CANCELLED'}
 
     paths = baking_paths()
+    try:
+      pending = workstation.preflight_pending(pending_request_path(), phase_id=phase_id, target=paths['spp'])
+      if pending:
+        self.report({'INFO'}, 'The same native Painter request is already pending')
+        return {'FINISHED'}
+    except Exception as error:
+      self.report({'ERROR'}, str(error))
+      return {'CANCELLED'}
     spp_existed = paths['spp'].exists()
     if self.action == 'OPEN':
       if not spp_existed:
@@ -1434,6 +1450,12 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     if meshy_source_contract:
       request['meshy_contract_version'] = 1
       request['strict_bake_settings'] = True
+    try:
+      workstation.attach_phase(request, phase_id)
+      workstation.preflight_pending(pending_request_path(), request_id=request['request_id'])
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter handoff was not published: {error}')
+      return {'CANCELLED'}
     # Written to both the texture dir and the low dir because the Painter
     # plugin's _request_candidates() looks next to the open .spp (texture dir)
     # AND next to the last imported mesh (low dir); writing both guarantees a hit.
@@ -1441,25 +1463,32 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       paths['texture_dir'] / PAINTER_REQUEST,
       paths['low_dir'] / PAINTER_REQUEST,
     )
-    for request_path in request_paths:
-      write_json(request_path, request)
-
     try:
       if self.action == 'CREATE':
         request['template'] = str(template_path)
-        for request_path in request_paths:
-          write_json(request_path, request)
-        write_json(pending_request_path(), request)
+      workstation.publish_request_copies(request_paths, request)
+      if self.action == 'CREATE':
+        workstation.publish_pending(pending_request_path(), request)
         # The Painter startup plugin consumes the pending request and creates
         # the project through project.create(template_file_path=...).
-        launch_painter(painter_path)
+        if not painter_is_running(painter_path):
+          launch_painter(painter_path)
+      elif phase_id:
+        request['open_existing_project'] = True
+        request['preserve_open_project'] = False
+        workstation.publish_pending(pending_request_path(), request)
+        if not painter_is_running(painter_path):
+          launch_painter(painter_path, paths['spp'])
       elif not painter_is_running(painter_path):
         launch_painter(painter_path, paths['spp'])
     except Exception as error:
-      for request_path in request_paths:
-        request_path.unlink(missing_ok=True)
-      if self.action == 'CREATE':
-        pending_request_path().unlink(missing_ok=True)
+      if phase_id:
+        workstation.fail(request, f'Painter handoff failed; native request preserved: {error}')
+      else:
+        for request_path in request_paths:
+          workstation.discard_pending(request_path, request)
+        if self.action == 'CREATE':
+          workstation.discard_pending(pending_request_path(), request)
       self.report({'ERROR'}, f'Error opening Substance Painter: {error}')
       return {'CANCELLED'}
 
@@ -1581,11 +1610,15 @@ class StripMaterialPrefixOperator(bpy.types.Operator):
     # Written to both the texture dir and the low dir because the Painter
     # plugin's _request_candidates() looks next to the open .spp (texture dir)
     # AND next to the last imported mesh (low dir).
-    for request_path in (
+    request_paths = (
       paths['texture_dir'] / PAINTER_REQUEST,
       paths['low_dir'] / PAINTER_REQUEST,
-    ):
-      write_json(request_path, request)
+    )
+    try:
+      workstation.publish_request_copies(request_paths, request)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter request was not published: {error}')
+      return {'CANCELLED'}
 
     if not painter_is_running(painter_path):
       launch_painter(painter_path, paths['spp'])
@@ -1594,7 +1627,7 @@ class StripMaterialPrefixOperator(bpy.types.Operator):
     return {'FINISHED'}
 
 
-def send_painter_bake_request(context, selected=None):
+def send_painter_bake_request(context, selected=None, *, workstation_phase_id=''):
   """Export meshes and ask Painter to reload + bake mesh maps via the JSON request.
 
   ``selected`` is a set of Texture Set names to bake; ``None`` bakes all of them.
@@ -1603,9 +1636,13 @@ def send_painter_bake_request(context, selected=None):
   Raises RuntimeError with a user-facing message on any validation/export failure.
   Returns the number of Texture Sets queued for baking.
   """
+  workstation.require_phase(workstation_phase_id)
   if not bpy.data.filepath:
     raise RuntimeError('Save the .blend file before baking')
   paths = baking_paths()
+  pending = workstation.preflight_pending(pending_request_path(), phase_id=workstation_phase_id, target=paths['spp'])
+  if pending:
+    return len(pending.get('rebake_texture_sets') or [])
   if not paths['spp'].is_file():
     raise RuntimeError('Painter project does not exist; use Create in Painter first')
   painter_path = get_preferences(context)['painter_path']
@@ -1751,14 +1788,28 @@ def send_painter_bake_request(context, selected=None):
   if meshy_source_contract:
     request['meshy_contract_version'] = 1
     request['strict_bake_settings'] = True
-  for request_path in (
+  workstation.attach_phase(request, workstation_phase_id)
+  workstation.preflight_pending(pending_request_path(), request_id=request['request_id'])
+  if workstation_phase_id:
+    request['open_existing_project'] = True
+    request['preserve_open_project'] = False
+  request_paths = (
     paths['texture_dir'] / PAINTER_REQUEST,
     paths['low_dir'] / PAINTER_REQUEST,
-  ):
-    write_json(request_path, request)
-
-  if not painter_is_running(painter_path):
-    launch_painter(painter_path, paths['spp'])
+  )
+  try:
+    workstation.publish_request_copies(request_paths, request)
+    if workstation_phase_id:
+      workstation.publish_pending(pending_request_path(), request)
+    if not painter_is_running(painter_path):
+      launch_painter(painter_path, paths['spp'])
+  except Exception as error:
+    if workstation_phase_id:
+      workstation.fail(request, f'Painter bake dispatch failed; native request preserved: {error}')
+    else:
+      for request_path in request_paths:
+        workstation.discard_pending(request_path, request)
+    raise
   return len(bake_texture_sets)
 
 
@@ -1767,10 +1818,12 @@ class BakeAllInPainterOperator(bpy.types.Operator):
   bl_idname = 'st.bake_all_in_painter'
   bl_label = 'Bake All (Low + High)'
   bl_options = {'REGISTER'}
+  workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
 
   def execute(self, context):
     try:
-      count = send_painter_bake_request(context, selected=None)
+      count = send_painter_bake_request(context, selected=None,
+                                      workstation_phase_id=getattr(self, 'workstation_phase_id', ''))
     except Exception as error:
       self.report({'ERROR'}, str(error))
       traceback.print_exc()
@@ -1799,8 +1852,15 @@ class BakeSelectedInPainterOperator(bpy.types.Operator):
   bl_idname = 'st.bake_selected_in_painter'
   bl_label = 'Bake Selected'
   bl_options = {'REGISTER'}
+  workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
 
   def execute(self, context):
+    phase_id = getattr(self, 'workstation_phase_id', '')
+    try:
+      workstation.require_phase(phase_id)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter work phase is not ready: {error}')
+      return {'CANCELLED'}
     scene = context.scene
     _, low_collection, _, _ = ensure_baking_collections(scene)
     sync_bake_selection(
@@ -1809,7 +1869,7 @@ class BakeSelectedInPainterOperator(bpy.types.Operator):
     )
     selected = {item.name for item in scene.substance_tools_bake_selection if item.bake}
     try:
-      count = send_painter_bake_request(context, selected=selected)
+      count = send_painter_bake_request(context, selected=selected, workstation_phase_id=phase_id)
     except Exception as error:
       self.report({'ERROR'}, str(error))
       traceback.print_exc()
@@ -2066,11 +2126,15 @@ class SendPainterMapsOperator(bpy.types.Operator):
       ),
       'alpha_color_maps': alpha_color_maps,
     }
-    for request_path in (
+    request_paths = (
       paths['texture_dir'] / PAINTER_REQUEST,
       paths['low_dir'] / PAINTER_REQUEST,
-    ):
-      write_json(request_path, request)
+    )
+    try:
+      workstation.publish_request_copies(request_paths, request)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter maps request was not published: {error}')
+      return {'CANCELLED'}
     if not painter_is_running(painter_path):
       launch_painter(painter_path, paths['spp'])
 
@@ -2087,6 +2151,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   bl_idname = 'st.export_painter_textures_and_apply'
   bl_label = 'Export Painter Textures & Apply'
   bl_options = {'REGISTER', 'UNDO'}
+  workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
+  workstation_apply_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
 
   _timer = None
   _request_id = ''
@@ -2094,6 +2160,15 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   TIMEOUT_SECONDS = 300
 
   def execute(self, context):
+    phase_id = getattr(self, 'workstation_phase_id', '')
+    if phase_id and not getattr(self, 'workstation_apply_phase_id', ''):
+      self.report({'ERROR'}, 'A separate authorized Blender apply phase is required')
+      return {'CANCELLED'}
+    try:
+      workstation.require_phase(phase_id)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter work phase is not ready: {error}')
+      return {'CANCELLED'}
     if not bpy.data.filepath:
       self.report({'ERROR'}, 'Save the .blend file first')
       return {'CANCELLED'}
@@ -2165,8 +2240,14 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     self._request_id = str(time.time_ns())
     request_path = paths['texture_dir'] / PAINTER_EXPORT_REQUEST
     result_path = paths['texture_dir'] / PAINTER_EXPORT_RESULT
-    if result_path.is_file():
-      result_path.unlink()
+    try:
+      pending = workstation.preflight_pending(request_path, phase_id=phase_id, target=paths['spp'])
+      if pending:
+        self.report({'INFO'}, 'The same native Painter export request is already pending')
+        return {'FINISHED'}
+    except Exception as error:
+      self.report({'ERROR'}, str(error))
+      return {'CANCELLED'}
     export_request = {
       'request_id': self._request_id,
       'spp': str(paths['spp'].resolve()),
@@ -2180,13 +2261,32 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       export_request['meshy_contract_version'] = 1
       export_request['strict_bake_settings'] = True
       export_request['expected_source_state'] = expected_source_state
-    write_json(request_path, export_request)
+    try:
+      workstation.attach_phase(export_request, phase_id)
+    except Exception as error:
+      self.report({'ERROR'}, f'Painter export handoff was not published: {error}')
+      return {'CANCELLED'}
+    try:
+      workstation.publish_pending(request_path, export_request)
+    except Exception as error:
+      if phase_id:
+        workstation.fail(export_request, f'Painter export publication failed: {error}')
+      self.report({'ERROR'}, f'Painter export handoff was not published: {error}')
+      return {'CANCELLED'}
+    self._workstation_request = export_request
+    self._workstation_blend_file = str(Path(bpy.data.filepath).resolve())
+    self._workstation_export_result = None
+    self._workstation_apply_request = None
+    self._workstation_apply_attempt_at = float('-inf')
 
     if not painter_is_running(painter_path):
       try:
         launch_painter(painter_path, paths['spp'])
       except Exception as error:
-        request_path.unlink(missing_ok=True)
+        if phase_id:
+          workstation.fail(export_request, f'Painter launch failed; native export request preserved: {error}')
+        else:
+          workstation.discard_pending(request_path, export_request)
         self.report({'ERROR'}, f'Could not open Substance Painter: {error}')
         return {'CANCELLED'}
 
@@ -2199,9 +2299,11 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   def modal(self, context, event):
     if event.type != 'TIMER':
       return {'PASS_THROUGH'}
-    if time.time() > self._deadline:
+    workstation.heartbeat(getattr(self, '_workstation_request', {}))
+    if not getattr(self, '_workstation_export_result', None) and time.time() > self._deadline:
       context.window_manager.event_timer_remove(self._timer)
       self._timer = None
+      workstation.fail(getattr(self, '_workstation_request', {}), 'Painter export timed out; native state is uncertain')
       self.report(
         {'ERROR'},
         f'Painter 텍스처 익스포트 응답이 {self.TIMEOUT_SECONDS // 60}분 내에 오지 '
@@ -2209,15 +2311,49 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         '(Painter export timed out)',
       )
       return {'CANCELLED'}
-    result_path = baking_paths()['texture_dir'] / PAINTER_EXPORT_RESULT
-    if not result_path.is_file():
-      return {'PASS_THROUGH'}
-    try:
-      result = json.loads(result_path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-      return {'PASS_THROUGH'}
+    result = getattr(self, '_workstation_export_result', None)
+    if result is None:
+      original = getattr(self, '_workstation_request', {})
+      texture_dir = Path(original['texture_dir']) if 'workstation_phase' in original else baking_paths()['texture_dir']
+      result_path = texture_dir / PAINTER_EXPORT_RESULT
+      if not result_path.is_file():
+        return {'PASS_THROUGH'}
+      try:
+        result = json.loads(result_path.read_text(encoding='utf-8'))
+      except (OSError, ValueError):
+        return {'PASS_THROUGH'}
     if result.get('request_id') != self._request_id:
       return {'PASS_THROUGH'}
+    parent_request = getattr(self, '_workstation_request', {})
+    if 'workstation_phase' in parent_request and result.get('status') == 'SUCCESS':
+      self._workstation_export_result = result
+      if str(Path(bpy.data.filepath).resolve()) != self._workstation_blend_file:
+        self.report({'ERROR'}, 'Blender source changed while waiting; the exact Painter export was preserved')
+        self.cancel(context)
+        return {'CANCELLED'}
+      if self._workstation_apply_request is None:
+        if time.monotonic() - self._workstation_apply_attempt_at < 45.0:
+          return {'PASS_THROUGH'}
+        self._workstation_apply_attempt_at = time.monotonic()
+        try:
+          followup = workstation.start_followup(parent_request, self.workstation_apply_phase_id,
+                                               target=self._workstation_blend_file)
+          if not followup.get('started'):
+            if followup.get('error'):
+              raise RuntimeError(followup['error'])
+            return {'PASS_THROUGH'}
+          apply_request = dict(parent_request)
+          apply_request.pop('workstation_phase', None)
+          workstation.attach_phase(apply_request, self.workstation_apply_phase_id,
+                                   pipeline=workstation.APPLY_PIPELINE, target=self._workstation_blend_file,
+                                   resource=followup['phase']['resource'])
+          self._workstation_apply_request = apply_request
+        except Exception as error:
+          self.report({'ERROR'}, f'Blender apply phase could not start; export preserved: {error}')
+          self.cancel(context)
+          return {'CANCELLED'}
+      if not self._workstation_apply_ready(context):
+        return {'CANCELLED'}
     context.window_manager.event_timer_remove(self._timer)
     self._timer = None
     if result.get('status') != 'SUCCESS':
@@ -2280,6 +2416,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         )
         layer_result = painter_request.get('source_layer_result') or {}
         normal_result = painter_request.get('source_normal_mesh_map_result') or {}
+        if not self._workstation_apply_ready(context):
+          return {'CANCELLED'}
         if meshy_state['stage'] == 'BAKE_BASELINE_ARCHIVED':
           meshy_state['painter'] = {
             'source_layer_result': layer_result,
@@ -2308,6 +2446,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
           ],
         )
         export_receipt['source_state_receipt'] = source_state_receipt
+        if not self._workstation_apply_ready(context):
+          return {'CANCELLED'}
         if meshy_state['stage'] == 'SOURCE_LAYER_READY':
           meshy_state = advance_pipeline_state(
             meshy_state,
@@ -2317,6 +2457,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
           store_pipeline_state(context.scene, meshy_state)
     except Exception as error:
       self.report({'ERROR'}, f'Meshy Painter apply gate failed: {error}')
+      workstation.fail(getattr(self, '_workstation_apply_request', None) or {}, str(error))
       return {'CANCELLED'}
 
     commit_state = None
@@ -2361,6 +2502,8 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         return rollback_state
 
     try:
+      if not self._workstation_apply_ready(context):
+        return {'CANCELLED'}
       apply_receipt = apply_painter_export_transaction(
         apply_result,
         low_objects,
@@ -2375,6 +2518,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         before_commit=commit_state,
       )
     except PainterApplyNoMaterialsError:
+      workstation.fail(getattr(self, '_workstation_apply_request', None) or {}, 'Painter apply matched no materials')
       # Apply looks files up as T_<material-without-M_>_<role>.png. If Painter's
       # Texture Set names no longer match the Blender material names (e.g. the
       # material was renamed after the Painter project was created and never
@@ -2399,10 +2543,13 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       return {'CANCELLED'} if meshy_state else {'FINISHED'}
     except Exception as error:
       self.report({'ERROR'}, f'Painter canonical apply failed and was rolled back: {error}')
+      workstation.fail(getattr(self, '_workstation_apply_request', None) or {}, str(error))
       return {'CANCELLED'}
     applied = apply_receipt['applied']
     canonical_files = apply_receipt['canonical_files']
     context.scene.substance_tools_baking.base_color_source = 'PAINTER'
+    if not workstation.complete(getattr(self, '_workstation_apply_request', None) or {}):
+      self.report({'WARNING'}, 'Textures were applied; the queue completion receipt must be reconciled')
     self.report(
       {'INFO'},
       f'완료 (done): Painter의 원본 기반 채널을 재질 {applied}개에 적용 '
@@ -2410,7 +2557,21 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
     )
     return {'FINISHED'}
 
+  def _workstation_apply_ready(self, context):
+    request = getattr(self, '_workstation_apply_request', None) or {}
+    if 'workstation_phase' not in request:
+      return True
+    if (str(Path(bpy.data.filepath).resolve()) != self._workstation_blend_file
+        or not workstation.can_execute(request)):
+      self.report({'ERROR'}, 'Blender apply admission changed; the exact Painter export was preserved')
+      self.cancel(context)
+      return False
+    workstation.heartbeat(request)
+    return True
+
   def cancel(self, context):
+    workstation.fail(getattr(self, '_workstation_apply_request', None) or getattr(self, '_workstation_request', {}),
+                     'Blender export/apply operator cancelled; native state must be reconciled')
     if self._timer is not None:
       context.window_manager.event_timer_remove(self._timer)
       self._timer = None

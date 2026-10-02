@@ -30,6 +30,9 @@ __all__ = (
   'inspect_transfer_state',
   'revise_source_maps',
   'configure_original_source_revision',
+  'dispatch_painter_request',
+  'dispatch_painter_bake',
+  'dispatch_painter_export_apply',
 )
 
 
@@ -70,6 +73,9 @@ def get_painter_transfer_api(version=PAINTER_TRANSFER_API_VERSION):
     'revise_source_maps': revise_source_maps,
     'queue_existing_painter_project': queue_existing_painter_project,
     'configure_original_source_revision': configure_original_source_revision,
+    'dispatch_painter_request': dispatch_painter_request,
+    'dispatch_painter_bake': dispatch_painter_bake,
+    'dispatch_painter_export_apply': dispatch_painter_export_apply,
   }
 
 
@@ -90,6 +96,43 @@ def get_capabilities():
       ],
     },
   )
+
+
+def dispatch_painter_request(*, workstation_phase_id, action='UPDATE'):
+  """Dispatch the existing native operator; this receipt is not completion."""
+  if action not in {'CREATE', 'UPDATE'}:
+    raise ValueError('Painter dispatch action must be CREATE or UPDATE')
+  if not workstation_phase_id:
+    raise ValueError('An admitted Painter work phase is required')
+  result = bpy.ops.st.export_baking_to_substance_painter(
+      'EXEC_DEFAULT', action=action, workstation_phase_id=workstation_phase_id)
+  return _receipt('dispatch_painter_request', {'dispatch_only': True,
+      'workstation_phase_id': workstation_phase_id, 'operator_result': sorted(result)},
+      status='ERROR' if 'CANCELLED' in result else 'SUCCESS')
+
+
+def dispatch_painter_bake(*, workstation_phase_id, texture_sets=None, context=None):
+  """Use the existing selected/all bake function and native request identity."""
+  if not workstation_phase_id:
+    raise ValueError('An admitted Painter work phase is required')
+  from .operators import send_painter_bake_request
+  count = send_painter_bake_request(context or bpy.context, selected=texture_sets,
+                                   workstation_phase_id=workstation_phase_id)
+  return _receipt('dispatch_painter_bake', {'dispatch_only': True,
+      'workstation_phase_id': workstation_phase_id, 'texture_sets_queued': count})
+
+
+def dispatch_painter_export_apply(*, workstation_phase_id, workstation_apply_phase_id):
+  """Continue the existing export/apply flow with separately admitted apps."""
+  if not workstation_phase_id or not workstation_apply_phase_id:
+    raise ValueError('Painter and Blender apply phases are both required')
+  result = bpy.ops.st.export_painter_textures_and_apply('EXEC_DEFAULT',
+      workstation_phase_id=workstation_phase_id,
+      workstation_apply_phase_id=workstation_apply_phase_id)
+  return _receipt('dispatch_painter_export_apply', {'dispatch_only': True,
+      'workstation_phase_id': workstation_phase_id,
+      'workstation_apply_phase_id': workstation_apply_phase_id,
+      'operator_result': sorted(result)}, status='ERROR' if 'CANCELLED' in result else 'SUCCESS')
 
 
 def revise_source_maps(*, reason, revision_id, resolution=None, context=None):

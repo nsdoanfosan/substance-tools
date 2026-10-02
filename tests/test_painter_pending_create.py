@@ -6,6 +6,7 @@ import tempfile
 import time
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -64,11 +65,19 @@ def _load_plugin_with_import_stubs():
         sys.modules["PySide6.QtCore"] = qtcore
 
         spec = importlib.util.spec_from_file_location(
-            "substance_tools_painter_pending_create_test_target",
+            "substance_tools_painter_pending_create_test_target_" + uuid.uuid4().hex,
             PLUGIN_PATH,
         )
         plugin = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plugin)
+        # Lazy native helpers use relative imports after this fixture returns.
+        # Give each test package its own identity and retain its package path.
+        sys.modules[spec.name] = plugin
+        try:
+            spec.loader.exec_module(plugin)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
+        plugin._log = mock.Mock()
         return plugin, painter
     finally:
         for name, module in original.items():

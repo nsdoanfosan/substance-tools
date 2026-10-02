@@ -61,6 +61,48 @@ _export_processing = False
 _last_busy_log_time = 0.0
 
 
+def _workstation_helper():
+    from . import workstation_coordination
+    return workstation_coordination
+
+
+def _phase_allowed(request):
+    if not request or 'workstation_phase' not in request:
+        return True
+    try:
+        allowed = _workstation_helper().can_execute(request)
+    except Exception:
+        allowed = False
+    if not allowed:
+        _log_pending_request_wait('workstation phase is waiting; native request preserved')
+    return allowed
+
+
+def _phase_heartbeat(request):
+    if request and 'workstation_phase' in request:
+        try:
+            _workstation_helper().heartbeat(request)
+        except Exception:
+            pass
+
+
+def _phase_complete(request):
+    if request and 'workstation_phase' in request:
+        try:
+            if not _workstation_helper().complete(request):
+                _log('Native SUCCESS receipt saved; workstation completion must be reconciled')
+        except Exception:
+            _log('Native SUCCESS receipt saved; workstation completion bridge unavailable')
+
+
+def _phase_fail(request, note):
+    if request and 'workstation_phase' in request:
+        try:
+            _workstation_helper().fail(request, note)
+        except Exception:
+            _log('Native failure requires workstation phase recovery')
+
+
 def _log_file_path():
     base = Path(
         os.environ.get("LOCALAPPDATA")
@@ -300,7 +342,15 @@ class _ProjectRequestMismatch(RuntimeError):
     pass
 
 
+class _WorkstationRequestDenied(RuntimeError):
+    pass
+
+
 def _require_requested_project_open(request, operation):
+    if not _phase_allowed(request):
+        raise _WorkstationRequestDenied(
+            f'Refusing to {operation}; the native request no longer has its admitted workstation execution'
+        )
     matched, reason = _open_project_request_match(request)
     if not matched:
         raise _ProjectRequestMismatch(
@@ -742,6 +792,7 @@ def _request_result_payload(request):
 
 
 def _mark_request_failed(request, message):
+    _phase_fail(request, message)
     try:
         request_paths = _matching_request_paths(request)
         if not request_paths:
@@ -750,12 +801,12 @@ def _mark_request_failed(request, message):
         saved["status"] = "FAILED"
         saved["failure"] = message
         for request_path in request_paths:
-            _write_json(request_path, saved)
+            _workstation_helper().write_receipt(request_path, request, saved)
     except Exception as error:
         _log(f"Could not mark request failed: {error}")
 
 
-def _mark_request_success(request):
+def _mark_request_success(request, *, complete_phase=False, verified_noop=False):
     try:
         request_paths = _matching_request_paths(request)
         if not request_paths:
@@ -763,8 +814,21 @@ def _mark_request_success(request):
         saved = _request_result_payload(request)
         saved["status"] = "SUCCESS"
         saved.pop("failure", None)
+        if 'workstation_phase' in request:
+            if complete_phase:
+                saved['native_completion_kind'] = 'saved'
+                saved.pop('workstation_completion_requires_owner', None)
+            else:
+                saved['native_completion_kind'] = 'verified_noop' if verified_noop else 'owner_reconciliation'
+                saved['workstation_completion_requires_owner'] = True
+        saved_any = False
         for request_path in request_paths:
-            _write_json(request_path, saved)
+            if _workstation_helper().write_receipt(request_path, request, saved):
+                saved_any = True
+        if not saved_any:
+            return False
+        if complete_phase:
+            _phase_complete(request)
         return True
     except Exception as error:
         _log(f"Could not mark request successful: {error}")
@@ -802,6 +866,12 @@ def _process_export_request():
     request_path = Path(project_path).parent / EXPORT_REQUEST_FILENAME
     if not request_path.is_file():
         return
+    try:
+        candidate = json.loads(request_path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return
+    if not _phase_allowed(candidate):
+        return
     claimed_request_path = request_path.with_name(
         f"{request_path.name}.{os.getpid()}.processing"
     )
@@ -822,12 +892,16 @@ def _process_export_request():
     if _normalized_path(project_path) != _normalized_path(request.get("spp", "")):
         claimed_request_path.unlink(missing_ok=True)
         return
+    if not _phase_allowed(request):
+        _restore_pending_without_overwrite(claimed_request_path, request_path)
+        return
     if substance_painter.project.is_busy():
         os.replace(claimed_request_path, request_path)
         return
 
     _last_export_request_id = request_id
     _export_processing = True
+    _phase_heartbeat(request)
     result_path = Path(request["texture_dir"]) / EXPORT_RESULT_FILENAME
     try:
         _normalize_texture_set_names()
@@ -874,10 +948,15 @@ def _process_export_request():
             "channel_audit": channel_audit,
             "source_state_receipt": source_state_receipt,
         })
+        if success:
+            _phase_complete(request)
+        else:
+            _phase_fail(request, result.message)
         _log(
             f"Unreal_V2 texture export {'completed' if success else 'failed'}"
         )
     except Exception as error:
+        _phase_fail(request, str(error))
         _write_json(result_path, {
             "request_id": request_id,
             "status": "ERROR",
@@ -923,6 +1002,9 @@ def _create_pending_project():
     if not _started:
         return
     request = _load_pending_request()
+    if request and not _phase_allowed(request):
+        return
+    _phase_heartbeat(request)
     if (request and request.get('status') not in {'FAILED', 'SUCCESS'}
             and request.get('action') == 'UPDATE' and request.get('open_existing_project')):
         from .existing_project import handle_existing_project
@@ -1012,11 +1094,21 @@ def _create_pending_project():
         _pending_creation_request_id = None
         _pending_creation_started_at = 0.0
         _log(f"Could not create project from Unreal Engine template: {error}")
+        if 'workstation_phase' in request:
+            _mark_request_failed(request, str(error))
+            saved = _request_result_payload(request)
+            saved['status'] = 'FAILED'
+            saved['failure'] = str(error)
+            try:
+                _workstation_helper().write_receipt(_pending_request_path(), request, saved)
+            except Exception as receipt_error:
+                _log(f'Failed native CREATE was preserved for recovery: {receipt_error}')
 
 
 def _poll_requests():
     if not _started:
         return
+    _phase_heartbeat(_active_request)
     _create_pending_project()
     _process_export_request()
     if (
@@ -2462,7 +2554,7 @@ def _save_successful_request():
                 )
             substance_painter.project.save_as(requested_path)
         saved = True
-        if not _mark_request_success(request):
+        if not _mark_request_success(request, complete_phase=True):
             raise RuntimeError(
                 "Painter project saved, but the durable request receipt could not be updated"
             )
@@ -2471,8 +2563,12 @@ def _save_successful_request():
         _log_timing(f"post-bake layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Could not save the successful bake state: {error}")
-        if _schedule_successful_save_retry(request, str(error)):
+        if isinstance(error, _WorkstationRequestDenied):
+            _phase_fail(request, str(error))
+        elif _schedule_successful_save_retry(request, str(error)):
             return
+        else:
+            _phase_fail(request, str(error))
     try:
         if saved:
             # Painter's Python API calls Painting mode "Edition".
@@ -2512,7 +2608,7 @@ def _save_reimported_request():
                 metadata.set(key, request[key])
         _require_requested_project_open(request, "save the Painter update")
         substance_painter.project.save()
-        if not _mark_request_success(request):
+        if not _mark_request_success(request, complete_phase=True):
             raise RuntimeError("Painter update saved, but its success receipt was not written")
         substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
         if request.get("_low_reloaded"):
@@ -2522,6 +2618,7 @@ def _save_reimported_request():
         _log_timing(f"reload-only layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Low-poly mesh was reimported, but the update could not be saved: {error}")
+        _phase_fail(request, str(error))
         _last_polled_pipeline_hash = None
     _active_request = None
     _processing = False
@@ -2539,13 +2636,16 @@ def _save_normalized_request():
         _normalize_texture_set_names()
         _require_requested_project_open(request, "save normalized Texture Set names")
         substance_painter.project.save()
-        _mark_request_success(request)
+        receipt_written = _mark_request_success(request, complete_phase=True)
+        if 'workstation_phase' in request and not receipt_written:
+            raise RuntimeError('Normalized Painter project saved, but its exact success receipt was not written')
         substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
         _log("Texture Set names normalized and project saved")
         _log_timing(f"normalize/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Could not normalize Texture Set names and save the project: {error}")
         if isinstance(error, _ProjectRequestMismatch):
+            _phase_fail(request, str(error))
             _last_polled_pipeline_hash = None
         else:
             _mark_request_failed(request, str(error))
@@ -2567,13 +2667,16 @@ def _save_applied_maps_request():
         _apply_alpha_color_layers(request)
         _require_requested_project_open(request, "save applied source maps")
         substance_painter.project.save()
-        _mark_request_success(request)
+        receipt_written = _mark_request_success(request, complete_phase=True)
+        if 'workstation_phase' in request and not receipt_written:
+            raise RuntimeError('Painter source maps saved, but their exact success receipt was not written')
         substance_painter.ui.switch_to_mode(substance_painter.ui.UIMode.Edition)
         _log("Source material / Alpha maps applied and project saved")
         _log_timing(f"apply-maps save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Could not apply source material / Alpha maps: {error}")
         if isinstance(error, _ProjectRequestMismatch):
+            _phase_fail(request, str(error))
             _last_polled_pipeline_hash = None
         else:
             _mark_request_failed(request, str(error))
@@ -2634,6 +2737,10 @@ def _start_single_texture_set_bake(request, texture_set_name):
 
 def _start_bake(request):
     global _processing, _active_request, _active_bake_callback
+    if not _phase_allowed(request):
+        _single_shot_guarded(500, _start_bake, request)
+        return
+    _phase_heartbeat(request)
     try:
         _require_requested_project_open(request, "start mesh-map baking")
         started = time.perf_counter()
@@ -2646,6 +2753,7 @@ def _start_bake(request):
             ],
         }
         _configure_baking(request)
+        _require_requested_project_open(request, "start configured mesh-map baking")
         _log_timing(f"_configure_baking returned after {_elapsed_ms(started):.1f} ms")
         single_texture_set = _single_rebake_texture_set(request)
         if single_texture_set:
@@ -2795,8 +2903,11 @@ def _on_project_ready(_event=None):
 
     started = time.perf_counter()
     request = _load_request()
-    if request is None:
+    if request is None or request.get('status') in {'SUCCESS', 'FAILED'}:
         return
+    if not _phase_allowed(request):
+        return
+    _phase_heartbeat(request)
     request_marker = request.get("request_id") or request.get("pipeline_hash")
     if request_marker == _last_polled_pipeline_hash:
         return
@@ -2866,7 +2977,7 @@ def _on_project_ready(_event=None):
         request.get("strict_bake_settings") or request.get("expected_source_state")
     )
     if not strict_refresh and _request_matches_saved_metadata(metadata, request):
-        _mark_request_success(request)
+        _mark_request_success(request, verified_noop=True)
         _last_polled_pipeline_hash = request_marker
         _log("Existing Painter state already matches the request; startup bake skipped")
         return
