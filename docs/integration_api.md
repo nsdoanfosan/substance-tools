@@ -163,7 +163,9 @@ that slot, and passing these tests is not production recovery evidence.
 
 Synthetic SDK callback tests cover dispatch without start, synchronous callbacks,
 unmatched/ambiguous jobs, duplicate/late events, phase/target/generation changes,
-save uncertainty and explicit reconciliation. They do not validate the SDK's
+save uncertainty and explicit reconciliation. Fixture phase mocks have separate
+names and never replace `unittest.TestCase.fail`; a negative assertion regression
+checks incorrect string/tuple/list/dict comparisons actually raise. They do not validate the SDK's
 native scheduling behavior or diagnose an already hung production process.
 
 # Explicit source-map revisions

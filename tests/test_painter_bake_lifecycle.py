@@ -46,7 +46,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.helper = self.plugin._workstation_helper()
         for name in ('can_execute', 'heartbeat', 'complete', 'fail'):
             patch = mock.patch.object(self.helper, name, return_value=True)
-            setattr(self, name, patch.start())
+            setattr(self, 'phase_' + name + '_mock', patch.start())
             self.addCleanup(patch.stop)
         self.plugin._strip_texture_set_prefixes = mock.Mock(return_value=[])
         self.plugin._configure_baking = mock.Mock()
@@ -108,7 +108,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertTrue(self.plugin._processing)
         self.assertIs(self.plugin._active_request, self.request)
         self.sdk.project.save.assert_not_called()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_dispatch_without_start_keeps_pending_without_replay(self):
         lifecycle = self.launch()
@@ -120,7 +120,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.receipt()['bake_lifecycle']['diagnostic'], 'native_start_unacknowledged')
         self.assert_pending()
         self.sdk.baking.bake_selected_textures_async.assert_called_once()
-        self.fail.assert_not_called()
+        self.phase_fail_mock.assert_not_called()
 
     def test_matching_start_progress_end_then_deferred_save_and_exact_success(self):
         lifecycle = self.launch()
@@ -141,7 +141,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.receipt()['status'], 'SUCCESS')
         self.assertEqual(self.receipt()['native_completion_kind'], 'saved')
         self.assertEqual(self.receipt()['bake_lifecycle']['state'], 'saved')
-        self.complete.assert_called_once_with(self.request)
+        self.phase_complete_mock.assert_called_once_with(self.request)
         self.assertFalse(self.plugin._processing)
         self.assertIsNone(self.plugin._active_bake_lifecycle)
         self.assertFalse(any(self.dispatcher.listeners.values()))
@@ -192,7 +192,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
                 self.request['request_id'] = 'synthetic-1'
                 self.request['spp'] = str(self.spp)
                 self.request['workstation_phase'] = {'phase_id': 'synthetic-phase'}
-                self.can_execute.return_value = True
+                self.phase_can_execute_mock.return_value = True
                 self.sdk.project.file_path.return_value = str(self.spp)
                 self.path.write_text(json.dumps(self.request), encoding='utf-8')
                 lifecycle = self.launch()
@@ -203,7 +203,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
                 elif change == 'spp': self.request['spp'] = str(self.spp) + '.other'
                 elif change == 'phase': self.request['workstation_phase']['phase_id'] = 'other'
                 elif change == 'owner': self.plugin._active_request = dict(self.request)
-                elif change == 'denied': self.can_execute.return_value = False
+                elif change == 'denied': self.phase_can_execute_mock.return_value = False
                 elif change == 'project': self.sdk.project.file_path.return_value = str(self.spp) + '.other'
                 self.emit_progress(1)
                 self.emit_end()
@@ -211,7 +211,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
                 self.drain_save()
                 self.assertEqual(self.path.read_bytes(), before)
                 self.sdk.project.save.assert_not_called()
-                self.complete.assert_not_called()
+                self.phase_complete_mock.assert_not_called()
         self.plugin._active_request = self.request
 
     def test_delayed_save_rejects_changed_phase(self):
@@ -221,7 +221,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.request['workstation_phase']['phase_id'] = 'other'
         self.drain_save()
         self.sdk.project.save.assert_not_called()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_save_exception_preserves_ownership_and_does_not_retry(self):
         lifecycle = self.launch()
@@ -234,8 +234,8 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.receipt()['status'], 'PENDING')
         self.assertTrue(lifecycle.snapshot()['recovery_required'])
         self.assertTrue(self.plugin._processing)
-        self.complete.assert_not_called()
-        self.fail.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
+        self.phase_fail_mock.assert_not_called()
 
     def test_dirty_project_after_save_cannot_report_success(self):
         self.launch()
@@ -245,7 +245,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.drain_save()
         self.assertEqual(self.receipt()['status'], 'PENDING')
         self.assertTrue(self.plugin._processing)
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_success_receipt_failure_keeps_processing_and_does_not_save_again(self):
         self.launch()
@@ -257,7 +257,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.receipt()['status'], 'PENDING')
         self.assertTrue(self.plugin._processing)
         self.sdk.project.save.assert_called_once()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_owner_reconciliation_requires_external_stop_and_durable_failure(self):
         lifecycle = self.launch()
@@ -277,7 +277,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertFalse(any(self.dispatcher.listeners.values()))
         self.sdk.project.save.assert_not_called()
         self.sdk.baking.bake_selected_textures_async.assert_called_once()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_save_wait_timeout_and_closed_callbacks(self):
         lifecycle = self.launch()
@@ -322,7 +322,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertFalse(self.plugin._processing)
         self.assertFalse(any(self.dispatcher.listeners.values()))
         self.sdk.project.save.assert_not_called()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_replaced_durable_phase_is_not_overwritten_or_completed(self):
         self.launch()
@@ -336,7 +336,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertTrue(self.plugin._processing)
         self.sdk.project.save.assert_not_called()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_plugin_close_invalidates_queued_save_and_late_sdk_events(self):
         lifecycle = self.launch()
@@ -351,7 +351,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertFalse(any(self.dispatcher.listeners.values()))
         self.sdk.project.save.assert_not_called()
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_foreign_start_after_end_blocks_deferred_save(self):
         lifecycle = self.launch()
@@ -377,7 +377,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertTrue(self.plugin._processing)
         self.assertTrue(lifecycle.snapshot()['recovery_required'])
         self.assertEqual(lifecycle.snapshot()['diagnostic'], 'another_native_bake_started')
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_foreign_start_during_source_layers_blocks_native_save(self):
         self.launch()
@@ -402,7 +402,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertEqual(self.receipt()['status'], 'PENDING')
         self.assertTrue(self.plugin._processing)
         self.assertTrue(lifecycle.snapshot()['recovery_required'])
-        self.complete.assert_not_called()
+        self.phase_complete_mock.assert_not_called()
 
     def test_rebound_failed_receipt_cannot_confirm_old_recovery(self):
         lifecycle = self.launch()
@@ -420,7 +420,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertIs(self.plugin._active_request, self.request)
         self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
         self.assertEqual(self.receipt()['workstation_phase'], {'phase_id': 'new-phase'})
-        self.fail.assert_not_called()
+        self.phase_fail_mock.assert_not_called()
 
     def test_terminal_reread_rejects_identity_replacement_after_successful_write(self):
         for field in ('request_id', 'action', 'spp', 'workstation_phase'):
@@ -444,7 +444,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
                         'synthetic-1', external_stop_confirmed=True))
                 self.assertTrue(self.plugin._processing)
                 self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
-                self.fail.assert_not_called()
+                self.phase_fail_mock.assert_not_called()
 
     def test_terminal_reread_cannot_clear_replaced_active_execution(self):
         lifecycle = self.launch()
@@ -462,7 +462,7 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.assertTrue(self.plugin._processing)
         self.assertIs(self.plugin._active_request, replacement)
         self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
-        self.fail.assert_not_called()
+        self.phase_fail_mock.assert_not_called()
 
     def test_busy_retry_exhaustion_holds_without_calling_native_save(self):
         lifecycle = self.launch()
@@ -510,6 +510,25 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.timers[0][1]()
         self.sdk.project.save.assert_called_once()
         self.assertEqual(self.receipt()['status'], 'SUCCESS')
+
+    def test_fixture_preserves_unittest_failure_assertions(self):
+        # Raise directly in the negative branch: a mocked TestCase.fail must
+        # not be able to conceal the failure of this regression test itself.
+        if self.fail.__func__ is not unittest.TestCase.fail:
+            raise AssertionError('The fixture replaced unittest.TestCase.fail')
+        for method in dir(unittest.TestCase):
+            if isinstance(getattr(self, method, None), mock.Mock):
+                raise AssertionError('Fixture mock shadows TestCase.' + method)
+        for actual, expected in (('wrong milestone', 'expected milestone'),
+                                 (('wrong',), ('expected',)),
+                                 (['wrong'], ['expected']),
+                                 ({'state': 'wrong'}, {'state': 'expected'})):
+            try:
+                self.assertEqual(actual, expected)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError('Invalid equality comparison did not fail')
 
 
 if __name__ == '__main__':
