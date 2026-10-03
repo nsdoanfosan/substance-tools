@@ -56,6 +56,8 @@ _project_ready_idle_generation = None
 # generation and become inert as soon as the plugin is closed or reloaded.
 _plugin_generation = globals().get("_plugin_generation", 0)
 _active_bake_callback = globals().get("_active_bake_callback", None)
+_active_bake_lifecycle = globals().get("_active_bake_lifecycle", None)
+_bake_lifecycle_connections = globals().get("_bake_lifecycle_connections", [])
 _last_polled_pipeline_hash = None
 _last_export_request_id = None
 _export_processing = False
@@ -2516,6 +2518,9 @@ def _save_successful_request():
     if request is None:
         _processing = False
         return
+    lifecycle = _active_bake_lifecycle
+    if lifecycle is not None and not lifecycle.valid():
+        return
     try:
         if substance_painter.project.is_busy():
             if _schedule_successful_save_retry(request, "Painter is busy"):
@@ -2568,6 +2573,13 @@ def _save_successful_request():
                 )
             substance_painter.project.save_as(requested_path)
         saved = True
+        if lifecycle is not None:
+            _require_requested_project_open(request, "verify the saved bake")
+            if (substance_painter.project.is_busy()
+                    or substance_painter.project.needs_saving()):
+                raise RuntimeError("Native save returned without a clean, idle project")
+            if not lifecycle.saved():
+                raise RuntimeError("The saved bake no longer matches its active execution")
         if not _mark_request_success(request, complete_phase=True):
             raise RuntimeError(
                 "Painter project saved, but the durable request receipt could not be updated"
@@ -2577,6 +2589,11 @@ def _save_successful_request():
         _log_timing(f"post-bake layer update/save took {_elapsed_ms(started):.1f} ms")
     except Exception as error:
         _log(f"Could not save the successful bake state: {error}")
+        if lifecycle is not None:
+            # Keep the exact request/claim until the owner verifies external stop.
+            # A save exception or receipt failure must not automatically save again.
+            lifecycle.uncertain('native_save_or_receipt_uncertain')
+            return
         if isinstance(error, _WorkstationRequestDenied):
             _phase_fail(request, str(error))
         elif _schedule_successful_save_retry(request, str(error)):
@@ -2592,6 +2609,7 @@ def _save_successful_request():
         _log(f"Project was saved, but could not return to Painting mode: {error}")
     _active_request = None
     _processing = False
+    _close_bake_lifecycle()
 
 
 def _save_reimported_request():
@@ -2698,6 +2716,127 @@ def _save_applied_maps_request():
     _processing = False
 
 
+def _bake_execution_identity(request):
+    return (_plugin_generation, _request_marker(request), request.get('action'),
+            _normalized_path(request.get('spp', '')),
+            json.dumps(request.get('workstation_phase'), sort_keys=True))
+
+
+def _close_bake_lifecycle():
+    global _active_bake_lifecycle, _bake_lifecycle_connections
+    if _active_bake_lifecycle is not None:
+        _active_bake_lifecycle.close()
+        _active_bake_lifecycle = None
+    for kind, callback in _bake_lifecycle_connections:
+        try:
+            substance_painter.event.DISPATCHER.disconnect(kind, callback)
+        except Exception:
+            pass
+    _bake_lifecycle_connections = []
+
+
+def _bake_lifecycle_receipt(request, snapshot):
+    if snapshot['state'] == 'started':
+        request['_bake_started_perf'] = time.perf_counter()
+        _log('Native mesh-map bake start acknowledged for the dispatched job')
+    request['bake_lifecycle'] = snapshot
+    saved = _request_result_payload(request)
+    written = False
+    try:
+        for path in _matching_request_paths(request):
+            written = _workstation_helper().write_receipt(path, request, saved) or written
+    except Exception as error:
+        _log(f'Could not persist bake lifecycle: {error}')
+    if not written:
+        _log('Bake lifecycle receipt was not written; ownership remains pending')
+    if snapshot.get('diagnostic'):
+        _log(f"Bake recovery required: {snapshot['diagnostic']}; no automatic replay")
+
+
+def bake_lifecycle_status():
+    """Read-only diagnosis, including a save blocked before the Qt timer can run."""
+    if _active_bake_lifecycle is None:
+        return None
+    return _active_bake_lifecycle.snapshot()
+
+
+def acknowledge_native_bake_stopped(request_id, *, external_stop_confirmed=False):
+    """Explicit owner reconciliation; never bake, save, cancel a job or release scopes.
+
+    The owner must first establish that the external operation stopped. A missing
+    event, project.is_busy()==False or a timeout alone is not that evidence.
+    A new native attempt requires a separate admitted request after reconciliation.
+    """
+    global _processing, _active_request, _active_bake_callback
+    request = _active_request
+    lifecycle = _active_bake_lifecycle
+    if (not external_stop_confirmed or request is None or lifecycle is None
+            or request_id != _request_marker(request) or not lifecycle.valid()
+            or not lifecycle.check_timeout()['recovery_required']):
+        return False
+    message = 'Owner confirmed external bake/save stopped; explicit recovery required'
+    _mark_request_failed(request, message)
+    try:
+        paths = _matching_request_paths(request)
+        if not paths or any(json.loads(path.read_text(encoding='utf-8-sig')).get('status') != 'FAILED'
+                            for path in paths):
+            return False  # A failed receipt write cannot reopen the processing slot.
+    except (OSError, ValueError):
+        return False
+    _close_bake_lifecycle()
+    _active_bake_callback = None
+    _active_request = None
+    _processing = False
+    return True
+
+
+def _install_bake_lifecycle(request):
+    global _active_bake_lifecycle, _active_bake_callback
+    from .bake_lifecycle import BakeLifecycle
+    _close_bake_lifecycle()
+    identity = _bake_execution_identity(request)
+
+    def current():
+        if (not _started or _active_request is not request
+                or _bake_execution_identity(request) != identity):
+            return False
+        try:
+            _require_requested_project_open(request, 'observe native baking')
+            # The loader's claimed durable copy may have been replaced while
+            # native work was running. Admission alone cannot authorize saving
+            # on behalf of that newer request/target/phase.
+            if request.get('_request_path'):
+                candidate = json.loads(Path(request['_request_path']).read_text(encoding='utf-8-sig'))
+                if _bake_execution_identity(candidate) != identity:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    lifecycle = BakeLifecycle(
+        current=current,
+        changed=lambda snapshot: _bake_lifecycle_receipt(request, snapshot),
+        ended=_guard_async(_on_baking_ended, request),
+    )
+    _active_bake_lifecycle = lifecycle
+    for kind, callback in (
+        (substance_painter.event.BakingProcessAboutToStart, lifecycle.started),
+        (substance_painter.event.BakingProcessProgress, lifecycle.progress),
+        (substance_painter.event.BakingProcessEnded, lifecycle.ended),
+    ):
+        substance_painter.event.DISPATCHER.connect_strong(kind, callback)
+        _bake_lifecycle_connections.append((kind, callback))
+    _active_bake_callback = lifecycle.ended
+
+    def diagnose():
+        if _active_bake_lifecycle is lifecycle and lifecycle.valid():
+            lifecycle.check_timeout()
+            _single_shot_guarded(1000, diagnose, request)
+
+    _single_shot_guarded(1000, diagnose, request)
+    return lifecycle
+
+
 def _on_baking_ended(event):
     global _processing, _active_request, _active_bake_callback
     callback = _active_bake_callback
@@ -2714,7 +2853,18 @@ def _on_baking_ended(event):
         )
     if event.status == substance_painter.baking.BakingStatus.Success:
         request = _active_request
-        _execute_when_not_busy_guarded(_save_successful_request, request)
+        lifecycle = _active_bake_lifecycle
+        if lifecycle is not None:
+            if not lifecycle.saving():
+                return
+            # Leave the native event stack before asking Painter to save. This
+            # does not establish a cause for any already-running app's save stall.
+            def save_after_event():
+                if _active_bake_lifecycle is lifecycle and lifecycle.valid():
+                    _execute_when_not_busy_guarded(_save_successful_request, request)
+            _single_shot_guarded(0, save_after_event, request)
+        else:
+            _execute_when_not_busy_guarded(_save_successful_request, request)
     else:
         message = f"Baking did not complete successfully: {event.status}"
         _log(message)
@@ -2722,6 +2872,7 @@ def _on_baking_ended(event):
             _mark_request_failed(_active_request, message)
         _active_request = None
         _processing = False
+        _close_bake_lifecycle()
 
 
 def _single_rebake_texture_set(request):
@@ -2775,16 +2926,13 @@ def _start_bake(request):
             return
 
         bake_call_started = time.perf_counter()
-        _active_bake_callback = _guard_async(_on_baking_ended, request)
-        substance_painter.event.DISPATCHER.connect_strong(
-            substance_painter.event.BakingProcessEnded,
-            _active_bake_callback,
-        )
-        substance_painter.baking.bake_selected_textures_async()
-        request["_bake_started_perf"] = time.perf_counter()
+        lifecycle = _install_bake_lifecycle(request)
+        stop_source = substance_painter.baking.bake_selected_textures_async()
+        lifecycle.bind(stop_source)
         _log_timing(f"bake_selected_textures_async call took {_elapsed_ms(bake_call_started):.1f} ms")
-        _log("Automatic mesh-map baking started")
+        _log("Automatic mesh-map bake dispatched; native acknowledgement tracked separately")
     except Exception as error:
+        _close_bake_lifecycle()
         if _active_bake_callback is not None:
             try:
                 substance_painter.event.DISPATCHER.disconnect(
@@ -3141,6 +3289,7 @@ def start_plugin():
     global _active_bake_callback
     if _started:
         return
+    _close_bake_lifecycle()
     if _active_bake_callback is not None:
         try:
             substance_painter.event.DISPATCHER.disconnect(
@@ -3189,6 +3338,7 @@ def close_plugin():
     # Invalidate every captured callback before disconnecting event sources.
     _started = False
     _plugin_generation += 1
+    _close_bake_lifecycle()
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.ProjectEditionEntered,
         _on_project_ready,
