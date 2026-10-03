@@ -1,5 +1,7 @@
 # Blender Pipeline Integration APIs
 
+Painter editing can use 1024px Texture Sets while exporting a separate production size. `dispatch_painter_export_apply(..., export_resolution=4096)` and the existing operator's hidden `export_resolution` argument publish that size in the original native request. Zero defaults to Blender's configured baking/output resolution. The Painter plugin sets export `sizeLog2` explicitly and leaves working Texture Set sizes unchanged. Already-published requests without the field preserve their existing defaults. Native export still requires its own admitted heavy phase and the original request/receipt identity.
+
 The workflow uses direct, provider-owned, versioned APIs. There is no central
 runtime registry: each consumer imports the enabled provider, asks for an exact
 major version, and stores that provider's receipt.

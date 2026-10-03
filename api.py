@@ -122,13 +122,14 @@ def dispatch_painter_bake(*, workstation_phase_id, texture_sets=None, context=No
       'workstation_phase_id': workstation_phase_id, 'texture_sets_queued': count})
 
 
-def dispatch_painter_export_apply(*, workstation_phase_id, workstation_apply_phase_id):
+def dispatch_painter_export_apply(*, workstation_phase_id, workstation_apply_phase_id, export_resolution=0):
   """Continue the existing export/apply flow with separately admitted apps."""
   if not workstation_phase_id or not workstation_apply_phase_id:
     raise ValueError('Painter and Blender apply phases are both required')
   result = bpy.ops.st.export_painter_textures_and_apply('EXEC_DEFAULT',
       workstation_phase_id=workstation_phase_id,
-      workstation_apply_phase_id=workstation_apply_phase_id)
+      workstation_apply_phase_id=workstation_apply_phase_id,
+      export_resolution=export_resolution)
   return _receipt('dispatch_painter_export_apply', {'dispatch_only': True,
       'workstation_phase_id': workstation_phase_id,
       'workstation_apply_phase_id': workstation_apply_phase_id,
