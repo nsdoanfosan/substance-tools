@@ -822,8 +822,10 @@ def _mark_request_failed(request, message):
         _log(f"Could not mark request failed: {error}")
 
 
-def _mark_request_success(request, *, complete_phase=False, verified_noop=False):
+def _mark_request_success(request, *, complete_phase=False, verified_noop=False, completion_guard=None):
     try:
+        if completion_guard is not None and not completion_guard():
+            return False
         request_paths = _matching_request_paths(request)
         if not request_paths:
             return False
@@ -839,9 +841,13 @@ def _mark_request_success(request, *, complete_phase=False, verified_noop=False)
                 saved['workstation_completion_requires_owner'] = True
         saved_any = False
         for request_path in request_paths:
+            if completion_guard is not None and not completion_guard():
+                return False
             if _workstation_helper().write_receipt(request_path, request, saved):
                 saved_any = True
         if not saved_any:
+            return False
+        if completion_guard is not None and not completion_guard():
             return False
         if complete_phase:
             _phase_complete(request)
@@ -2519,14 +2525,20 @@ def _save_successful_request():
         _processing = False
         return
     lifecycle = _active_bake_lifecycle
-    if lifecycle is not None and not lifecycle.valid():
+    if lifecycle is not None and not lifecycle.can_save():
         return
     try:
         if substance_painter.project.is_busy():
             if _schedule_successful_save_retry(request, "Painter is busy"):
                 return
+            if lifecycle is not None:
+                lifecycle.uncertain('native_save_busy_wait_exhausted')
+                return
     except Exception as error:
         _log(f"Could not query Painter busy state before save: {error}")
+        if lifecycle is not None:
+            lifecycle.uncertain('native_save_busy_state_unverified')
+            return
 
     saved = False
     started = time.perf_counter()
@@ -2551,6 +2563,8 @@ def _save_successful_request():
                 metadata.set(key, request[key])
 
         _require_requested_project_open(request, "save the successful bake")
+        if lifecycle is not None and not lifecycle.can_save():
+            raise RuntimeError("Native bake ownership became uncertain before save")
         project_path = substance_painter.project.file_path()
         requested_path = request["spp"]
         if project_path and (
@@ -2580,7 +2594,9 @@ def _save_successful_request():
                 raise RuntimeError("Native save returned without a clean, idle project")
             if not lifecycle.saved():
                 raise RuntimeError("The saved bake no longer matches its active execution")
-        if not _mark_request_success(request, complete_phase=True):
+        completion_options = ({'completion_guard': lifecycle.can_complete}
+                              if lifecycle is not None else {})
+        if not _mark_request_success(request, complete_phase=True, **completion_options):
             raise RuntimeError(
                 "Painter project saved, but the durable request receipt could not be updated"
             )
@@ -2592,7 +2608,12 @@ def _save_successful_request():
         if lifecycle is not None:
             # Keep the exact request/claim until the owner verifies external stop.
             # A save exception or receipt failure must not automatically save again.
-            lifecycle.uncertain('native_save_or_receipt_uncertain')
+            if not lifecycle.recovery_required:
+                lifecycle.uncertain('native_save_or_receipt_uncertain')
+            if lifecycle.valid():
+                # An event during receipt publication may have invalidated a
+                # just-written SUCCESS. Persist the owned held state, not success.
+                _bake_lifecycle_receipt(request, lifecycle.snapshot())
             return
         if isinstance(error, _WorkstationRequestDenied):
             _phase_fail(request, str(error))
@@ -2775,18 +2796,37 @@ def acknowledge_native_bake_stopped(request_id, *, external_stop_confirmed=False
             or not lifecycle.check_timeout()['recovery_required']):
         return False
     message = 'Owner confirmed external bake/save stopped; explicit recovery required'
-    _mark_request_failed(request, message)
+    identity = _bake_execution_identity(request)
     try:
         paths = _matching_request_paths(request)
-        if not paths or any(json.loads(path.read_text(encoding='utf-8-sig')).get('status') != 'FAILED'
-                            for path in paths):
-            return False  # A failed receipt write cannot reopen the processing slot.
-    except (OSError, ValueError):
+        if not paths:
+            return False
+        saved = _request_result_payload(request)
+        saved.update(status='FAILED', failure=message)
+        for path in paths:
+            if not _workstation_helper().write_receipt(path, request, saved):
+                return False
+        # A terminal marker from a rebound phase/target is not stop proof for
+        # this immutable execution. Require successful writes and exact rereads.
+        for path in paths:
+            terminal = json.loads(path.read_text(encoding='utf-8-sig'))
+            if (_bake_execution_identity(terminal) != identity
+                    or terminal.get('status') != 'FAILED'
+                    or terminal.get('failure') != message):
+                return False
+        if (_active_request is not request or _active_bake_lifecycle is not lifecycle
+                or _bake_execution_identity(request) != identity or not lifecycle.valid()):
+            return False
+    except Exception as error:
+        _log(f'Could not verify owned bake recovery receipt: {error}')
         return False
     _close_bake_lifecycle()
     _active_bake_callback = None
     _active_request = None
     _processing = False
+    # Only now notify phase recovery. This leaves global pending failure
+    # propagation to its separate owner; it does not release workstation scopes.
+    _phase_fail(request, message)
     return True
 
 
@@ -2860,7 +2900,7 @@ def _on_baking_ended(event):
             # Leave the native event stack before asking Painter to save. This
             # does not establish a cause for any already-running app's save stall.
             def save_after_event():
-                if _active_bake_lifecycle is lifecycle and lifecycle.valid():
+                if _active_bake_lifecycle is lifecycle and lifecycle.can_save():
                     _execute_when_not_busy_guarded(_save_successful_request, request)
             _single_shot_guarded(0, save_after_event, request)
         else:

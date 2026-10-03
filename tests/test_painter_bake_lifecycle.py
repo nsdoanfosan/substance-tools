@@ -353,6 +353,164 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.sdk.project.save.assert_not_called()
         self.complete.assert_not_called()
 
+    def test_foreign_start_after_end_blocks_deferred_save(self):
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_end()
+        self.emit_start(object())
+        self.drain_save()
+        self.assert_pending()
+        self.assertTrue(lifecycle.snapshot()['recovery_required'])
+
+    def test_foreign_start_during_native_save_blocks_completion(self):
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_end()
+        def save():
+            self.emit_start(object())
+            self.spp.write_bytes(b'synthetic save completed after foreign start')
+        self.sdk.project.save.side_effect = save
+        self.drain_save()
+        self.sdk.project.save.assert_called_once()
+        self.assertEqual(self.spp.read_bytes(), b'synthetic save completed after foreign start')
+        self.assertEqual(self.receipt()['status'], 'PENDING')
+        self.assertTrue(self.plugin._processing)
+        self.assertTrue(lifecycle.snapshot()['recovery_required'])
+        self.assertEqual(lifecycle.snapshot()['diagnostic'], 'another_native_bake_started')
+        self.complete.assert_not_called()
+
+    def test_foreign_start_during_source_layers_blocks_native_save(self):
+        self.launch()
+        self.emit_start()
+        self.emit_end()
+        self.plugin._apply_source_material_layers.side_effect = lambda request: self.emit_start(object())
+        self.drain_save()
+        self.assert_pending()
+
+    def test_foreign_start_during_success_publication_blocks_completion(self):
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_end()
+        real_write = self.helper.write_receipt
+        def write_with_foreign_start(path, request, receipt):
+            if receipt.get('status') == 'SUCCESS':
+                self.emit_start(object())
+            return real_write(path, request, receipt)
+        with mock.patch.object(self.helper, 'write_receipt', side_effect=write_with_foreign_start):
+            self.drain_save()
+        self.sdk.project.save.assert_called_once()
+        self.assertEqual(self.receipt()['status'], 'PENDING')
+        self.assertTrue(self.plugin._processing)
+        self.assertTrue(lifecycle.snapshot()['recovery_required'])
+        self.complete.assert_not_called()
+
+    def test_rebound_failed_receipt_cannot_confirm_old_recovery(self):
+        lifecycle = self.launch()
+        self.now = 31
+        lifecycle.check_timeout()
+        real_write = self.helper.write_receipt
+        replacement = dict(self.request, workstation_phase={'phase_id': 'new-phase'}, status='FAILED')
+        def replace_before_guarded_write(path, request, receipt):
+            self.path.write_text(json.dumps(replacement), encoding='utf-8')
+            return real_write(path, request, receipt)
+        with mock.patch.object(self.helper, 'write_receipt', side_effect=replace_before_guarded_write):
+            self.assertFalse(self.plugin.acknowledge_native_bake_stopped(
+                'synthetic-1', external_stop_confirmed=True))
+        self.assertTrue(self.plugin._processing)
+        self.assertIs(self.plugin._active_request, self.request)
+        self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
+        self.assertEqual(self.receipt()['workstation_phase'], {'phase_id': 'new-phase'})
+        self.fail.assert_not_called()
+
+    def test_terminal_reread_rejects_identity_replacement_after_successful_write(self):
+        for field in ('request_id', 'action', 'spp', 'workstation_phase'):
+            with self.subTest(field=field):
+                self.plugin._close_bake_lifecycle()
+                self.plugin._active_request = self.request
+                self.path.write_text(json.dumps(self.request), encoding='utf-8')
+                lifecycle = self.launch()
+                self.now = 31
+                lifecycle.check_timeout()
+                real_write = self.helper.write_receipt
+                def replace_after_write(path, request, receipt):
+                    written = real_write(path, request, receipt)
+                    replaced = self.receipt()
+                    replaced[field] = ({'phase_id': 'replacement-phase'}
+                                       if field == 'workstation_phase' else 'replacement')
+                    self.path.write_text(json.dumps(replaced), encoding='utf-8')
+                    return written
+                with mock.patch.object(self.helper, 'write_receipt', side_effect=replace_after_write):
+                    self.assertFalse(self.plugin.acknowledge_native_bake_stopped(
+                        'synthetic-1', external_stop_confirmed=True))
+                self.assertTrue(self.plugin._processing)
+                self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
+                self.fail.assert_not_called()
+
+    def test_terminal_reread_cannot_clear_replaced_active_execution(self):
+        lifecycle = self.launch()
+        self.now = 31
+        lifecycle.check_timeout()
+        real_write = self.helper.write_receipt
+        replacement = dict(self.request)
+        def replace_active_after_write(path, request, receipt):
+            written = real_write(path, request, receipt)
+            self.plugin._active_request = replacement
+            return written
+        with mock.patch.object(self.helper, 'write_receipt', side_effect=replace_active_after_write):
+            self.assertFalse(self.plugin.acknowledge_native_bake_stopped(
+                'synthetic-1', external_stop_confirmed=True))
+        self.assertTrue(self.plugin._processing)
+        self.assertIs(self.plugin._active_request, replacement)
+        self.assertIs(self.plugin._active_bake_lifecycle, lifecycle)
+        self.fail.assert_not_called()
+
+    def test_busy_retry_exhaustion_holds_without_calling_native_save(self):
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_end()
+        self.request['_save_retry_count'] = 120
+        self.sdk.project.is_busy.return_value = True
+        self.drain_save()
+        self.assert_pending()
+        self.assertTrue(lifecycle.snapshot()['recovery_required'])
+
+    def test_unverifiable_busy_state_holds_without_native_save(self):
+        self.launch()
+        self.emit_start()
+        self.emit_end()
+        self.sdk.project.is_busy.side_effect = RuntimeError('busy query unavailable')
+        self.drain_save()
+        self.assert_pending()
+        self.assertEqual(self.receipt()['bake_lifecycle']['diagnostic'],
+                         'native_save_busy_state_unverified')
+
+    def test_busy_wait_retries_remain_guarded_then_hold_at_limit(self):
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_end()
+        self.sdk.project.is_busy.return_value = True
+        self.request['_save_retry_count'] = 119
+        self.drain_save()
+        self.assertEqual(self.request['_save_retry_count'], 120)
+        self.assert_pending()
+        self.assertFalse(lifecycle.snapshot()['recovery_required'])
+        callbacks = [callback for delay, callback in self.timers if delay == 1000]
+        for callback in callbacks:
+            callback()
+        self.assert_pending()
+        self.assertEqual(lifecycle.snapshot()['diagnostic'], 'native_save_busy_wait_exhausted')
+
+    def test_single_set_keeps_legacy_javascript_dispatch_and_save(self):
+        self.request['rebake_texture_sets'] = ['Wood']
+        self.sdk.js.evaluate = mock.Mock()
+        self.assertIsNone(self.launch())
+        self.sdk.js.evaluate.assert_called_once_with('alg.baking.bake("Wood")')
+        self.sdk.baking.bake_selected_textures_async.assert_not_called()
+        self.assertEqual([delay for delay, _ in self.timers], [3000])
+        self.timers[0][1]()
+        self.sdk.project.save.assert_called_once()
+        self.assertEqual(self.receipt()['status'], 'SUCCESS')
+
 
 if __name__ == '__main__':
     unittest.main()

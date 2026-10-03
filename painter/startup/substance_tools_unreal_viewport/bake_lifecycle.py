@@ -71,7 +71,7 @@ class BakeLifecycle:
         # AboutToStart is the only SDK bake event carrying the job identity.
         # Retaining this handle is ownership, not a claim about GC causing failure.
         if event.stop_source != self.stop_source:
-            if self.state in ('started', 'progress'):
+            if self.state in ('started', 'progress', 'ended', 'save_pending', 'saved'):
                 # Progress/end have no SDK job token. Another start makes those
                 # subsequent global events ambiguous, so they cannot permit save.
                 self.state = 'job_conflict'
@@ -121,12 +121,18 @@ class BakeLifecycle:
         return True
 
     def saved(self):
-        if not self.valid() or self.state != 'save_pending':
+        if not self.can_save():
             return False
         self.state = 'saved'
         self.last_event_at = self.clock()
         self.emit()
-        return True
+        return self.valid() and self.state == 'saved' and not self.recovery_required
+
+    def can_save(self):
+        return self.valid() and self.state == 'save_pending' and not self.recovery_required
+
+    def can_complete(self):
+        return self.valid() and self.state == 'saved' and not self.recovery_required
 
     def uncertain(self, reason):
         if self.valid():
@@ -135,7 +141,7 @@ class BakeLifecycle:
             self.emit()
 
     def check_timeout(self):
-        if not self.valid():
+        if not self.valid() or self.recovery_required:
             return self.snapshot()
         age = self.clock() - self.last_event_at
         problem = None
