@@ -1152,7 +1152,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
               {'ERROR'},
               'Checked bake plan is stale (' + '; '.join(stale_reasons)
               + '). Nothing was exported or sent to Painter; use Bake Selected '
-              + 'or Bake All to rebuild from the current Baking meshes.',
+              + 'or Bake All, which work from the current Baking meshes.',
             )
             return {'CANCELLED'}
           texture_sets = planned_texture_sets

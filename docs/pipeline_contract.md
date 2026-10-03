@@ -252,8 +252,9 @@ must not silently recalculate a different plan.
 `.blend` files may share. Before any export or Painter request, an ordinary
 `Update Painter` rejects the plan unless its `blend_file`, `spp` (when
 recorded), Texture Sets, `settings_hash`, per-Texture-Set Low hashes and High
-hashes all match the current scene. The error names the mismatch; rebuild with
-`Bake Selected` or `Bake All`. Meshy requests keep their own Texture Set guard
+hashes all match the current scene. The error names the mismatch; bake with
+`Bake Selected` or `Bake All`, which hash the current meshes and do not use the
+plan file. Meshy requests keep their own Texture Set guard
 and package-file hashes.
 
 Important behavior:
