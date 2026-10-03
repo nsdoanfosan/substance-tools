@@ -617,6 +617,14 @@ def _export_textures_with_preset(request, export_list, preset):
             }
         }],
     }
+    # Work at 1K while exporting the explicitly requested production size. Old
+    # already-published requests keep their existing document/preset defaults.
+    if "export_resolution" in request:
+        resolution = request["export_resolution"]
+        if (isinstance(resolution, bool) or not isinstance(resolution, int) or
+                resolution < 32 or resolution > 16384 or resolution & (resolution - 1)):
+            raise ValueError("Export resolution must be a power of two from 32 to 16384")
+        config["exportParameters"][0]["parameters"]["sizeLog2"] = resolution.bit_length() - 1
     if isinstance(preset, dict):
         preset_name = str(preset.get("name") or request.get("preset") or "SubstanceToolsExport")
         config["defaultExportPreset"] = preset_name

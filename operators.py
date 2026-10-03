@@ -2153,6 +2153,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
   bl_options = {'REGISTER', 'UNDO'}
   workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
   workstation_apply_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
+  export_resolution: bpy.props.IntProperty(default=0, min=0, max=16384, options={'HIDDEN', 'SKIP_SAVE'})
 
   _timer = None
   _request_id = ''
@@ -2229,6 +2230,10 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       return {'CANCELLED'}
     props = context.scene.substance_tools_baking
     preset_name = painter_export_preset_name(props.painter_export_preset)
+    self._export_resolution = int(getattr(self, 'export_resolution', 0) or props.resolution)
+    if self._export_resolution < 32 or self._export_resolution > 16384 or self._export_resolution & (self._export_resolution - 1):
+      self.report({'ERROR'}, 'Export resolution must be a power of two from 32 to 16384')
+      return {'CANCELLED'}
     try:
       preset_path = ensure_painter_export_preset(preset_name)
     except Exception as error:
@@ -2250,6 +2255,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
       return {'CANCELLED'}
     export_request = {
       'request_id': self._request_id,
+      'export_resolution': self._export_resolution,
       'spp': str(paths['spp'].resolve()),
       'texture_dir': str(paths['texture_dir'].resolve()),
       'preset': preset_name,
@@ -2439,7 +2445,7 @@ class ExportPainterTexturesAndApplyOperator(bpy.types.Operator):
         export_receipt = validate_meshy_painter_export_group(
           apply_result,
           low_objects,
-          expected_resolution=int(context.scene.substance_tools_baking.resolution),
+          expected_resolution=getattr(self, '_export_resolution', int(context.scene.substance_tools_baking.resolution)),
           canonical_texture_sets=source_contract['canonical_texture_sets'],
           required_roles_by_texture_set=source_contract[
             'canonical_output_roles'

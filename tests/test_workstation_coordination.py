@@ -560,7 +560,8 @@ def load_operator_class(name, workstation):
             self.reports.append((kind, message))
     bpy = types.SimpleNamespace(types=types.SimpleNamespace(Operator=Operator),
                                 props=types.SimpleNamespace(StringProperty=lambda **kwargs: None,
-                                                            EnumProperty=lambda **kwargs: None),
+                                                            EnumProperty=lambda **kwargs: None,
+                                                            IntProperty=lambda **kwargs: None),
                                 data=types.SimpleNamespace(filepath='C:/work/asset.blend'))
     namespace = dict(bpy=bpy, workstation=workstation, Path=Path, time=time, json=json,
                      __name__='substance_apply_guard_test.operators', __package__='substance_apply_guard_test')
