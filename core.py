@@ -3906,6 +3906,54 @@ def load_bake_plan(paths, context):
     return {}
 
 
+def _same_path(left, right):
+  if not left or not right:
+    return False
+  return os.path.normcase(os.path.normpath(str(left))) == os.path.normcase(
+    os.path.normpath(str(right))
+  )
+
+
+def bake_plan_stale_reasons(
+  plan,
+  *,
+  blend_file,
+  spp,
+  texture_sets,
+  settings_hash,
+  low_hashes=None,
+  high_hashes=None,
+):
+  """Explain why a checked bake plan does not describe the current target.
+
+  The plan file lives in the shared texture folder, so another .blend (or an
+  older state of this one) may have written it. An empty list means the plan
+  matches the current project, Texture Sets, settings and checked inputs.
+  ``low_hashes``/``high_hashes`` are compared only when given.
+  """
+  reasons = []
+  if not _same_path(plan.get('blend_file'), blend_file):
+    reasons.append(
+      f"written by {plan.get('blend_file') or 'an unknown .blend'}"
+    )
+  if plan.get('spp') and not _same_path(plan.get('spp'), spp):
+    reasons.append(f"targets {plan.get('spp')}")
+  planned = sorted(set(plan.get('texture_sets') or ()))
+  current = sorted(set(texture_sets))
+  if planned != current:
+    reasons.append(
+      'Texture Sets ' + (', '.join(planned) or 'none')
+      + ' differ from current ' + (', '.join(current) or 'none')
+    )
+  if plan.get('settings_hash') != settings_hash:
+    reasons.append('bake settings changed')
+  if low_hashes is not None and dict(plan.get('low_hashes') or {}) != dict(low_hashes):
+    reasons.append('Low meshes changed')
+  if high_hashes is not None and dict(plan.get('high_hashes') or {}) != dict(high_hashes):
+    reasons.append('High meshes changed')
+  return reasons
+
+
 def export_content_hash(source_objects, strip_material_prefix=False, id_source='NONE'):
   """Hash the deterministic contents exported to Painter, not FBX file bytes."""
   temporary_collection = bpy.data.collections.new('__SubstanceToolsHash')
