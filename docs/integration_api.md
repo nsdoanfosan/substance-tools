@@ -106,6 +106,68 @@ are adapters; the Codex skill chooses checkpoints and performs visual QA.
 - Tests never save user preferences.
 - Cross-add-on smoke tests validate service/version rejection, transactional
   rollback, `<base>_low` plus Empty `<base>`, and actual Send2UE asset naming.
+
+## Native multi-set bake lifecycle
+
+The Painter startup plugin tracks `bake_selected_textures_async` separately from
+the native bake. Returning from that call records `dispatched`, not `started`.
+The returned StopSource stays owned by the execution; the matching
+`BakingProcessAboutToStart.stop_source` acknowledges its native start. This does
+not establish that garbage collection caused a missing start signal.
+
+The additive `bake_lifecycle` field in matching request receipts records start,
+progress, end, and save milestones. Updates are bounded to state changes and
+10% progress increments. Each observer checks plugin generation, active request
+object/ID, target SPP, immutable phase metadata, and current admission. SDK
+progress/end events carry no job identity, so an additional foreign start after
+acknowledgment makes completion ambiguous and blocks automatic saving. This
+guard lasts through native end, queued save, and durable success publication.
+If a foreign start arrives inside an already invoked native save, its written
+file is retained but SUCCESS/completion is withheld with ownership held.
+
+Timeouts diagnose `native_start_unacknowledged` after 30 seconds,
+`native_progress_stalled` after 600 seconds without changed progress,
+`native_end_unacknowledged` after 90 seconds at progress 1 without an end event,
+and `native_save_unacknowledged` after 120 seconds awaiting save. These are
+uncertain states, not native failure/success. They retain the exact request and
+ownership; they never replay the bake, click UI, cancel a job, save again, or
+release workstation scopes. A late matching native signal may resume that same
+execution. `bake_lifecycle_status()` exposes the current milestone and ages for
+inspection; Qt diagnostics cannot run while Painter's main thread is blocked.
+
+Native successful end defers saving to a subsequent Qt turn. SUCCESS requires
+the requested project to save, report clean/idle, and publish an owned durable
+success receipt. Before-save and before-completion guards recheck that the native
+job is still unambiguous. Exhausting busy-save waits or failing to verify busy
+state holds the multi-set execution without invoking native save. Save or receipt
+uncertainty keeps the processing slot and
+requires owner recovery. Deferral avoids nested save in the event handler; it
+does not prove the cause of an existing app hang. Single-set JavaScript baking
+keeps its existing behavior in this change.
+
+After independently verifying the external operation has stopped, the owner
+may call `acknowledge_native_bake_stopped(request_id,
+external_stop_confirmed=True)`. This requires a matching active execution and
+recovery diagnosis, persists FAILED in its owned durable copies, and only then
+clears that execution's observers/processing slot. Each write must succeed, and
+terminal rereads must match immutable ID/action/SPP/phase plus the exact failure
+reason. The current execution is rechecked immediately before clearing it;
+replacement or write failure keeps it held and does not notify phase failure.
+A timeout, missing event, or
+`project.is_busy() == False` alone is not stop evidence. This API neither deletes
+the pending ticket nor releases workstation scopes nor initiates another attempt;
+any new attempt needs a separately admitted request. A receipt-write failure
+keeps the execution held for inspection. Global pending-ticket failure propagation
+is a separate issue (#15/PR16), unchanged here; this API does not repair or replay
+that slot, and passing these tests is not production recovery evidence.
+
+Synthetic SDK callback tests cover dispatch without start, synchronous callbacks,
+unmatched/ambiguous jobs, duplicate/late events, phase/target/generation changes,
+save uncertainty and explicit reconciliation. Fixture phase mocks have separate
+names and never replace `unittest.TestCase.fail`; a negative assertion regression
+checks incorrect string/tuple/list/dict comparisons actually raise. They do not validate the SDK's
+native scheduling behavior or diagnose an already hung production process.
+
 # Explicit source-map revisions
 
 `get_painter_transfer_api(1)['revise_source_maps'](reason=..., revision_id=..., resolution=...)`
