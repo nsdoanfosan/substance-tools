@@ -1115,6 +1115,46 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
               'Checked bake plan Texture Sets differ from Meshy state IDs'
             )
         else:
+          # The plan file is shared by every .blend using this texture folder;
+          # trust its change flags only when it describes the current inputs.
+          current_low_hashes = {
+            texture_set: fast_content_hash(
+              objects,
+              strip_material_prefix=True,
+              id_source=props.id_source if not high_objects else 'NONE',
+              normalize_solidify_plus_fill_rim=hide_solidify_rim,
+            )
+            for texture_set, objects in low_objects_by_texture_set(low_objects).items()
+          }
+          current_high_hashes = {}
+          if high_objects:
+            for entry in high_entries_by_texture_set(
+              low_objects,
+              high_objects,
+              paths['high_dir'],
+              paths['asset'],
+            ):
+              current_high_hashes[entry['texture_set']] = fast_content_hash(
+                entry['objects'],
+                id_source=props.id_source,
+              )
+          stale_reasons = bake_plan_stale_reasons(
+            plan,
+            blend_file=Path(bpy.data.filepath).resolve(),
+            spp=paths['spp'].resolve(),
+            texture_sets=texture_sets,
+            settings_hash=settings_hash,
+            low_hashes=current_low_hashes,
+            high_hashes=current_high_hashes,
+          )
+          if stale_reasons:
+            self.report(
+              {'ERROR'},
+              'Checked bake plan is stale (' + '; '.join(stale_reasons)
+              + '). Nothing was exported or sent to Painter; use Bake Selected '
+              + 'or Bake All, which work from the current Baking meshes.',
+            )
+            return {'CANCELLED'}
           texture_sets = planned_texture_sets
       else:
         low_hashes = {}
@@ -1365,6 +1405,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       preview = {
         'version': 1,
         'blend_file': str(Path(bpy.data.filepath).resolve()),
+        'spp': str(paths['spp'].resolve()),
         'low_hash': low_hash,
         'low_hashes': low_hashes,
         'low_changed': False,
@@ -1495,6 +1536,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
     clean_plan = {
       'version': 1,
       'blend_file': str(Path(bpy.data.filepath).resolve()),
+      'spp': str(paths['spp'].resolve()),
       'texture_sets': texture_sets,
       'low_hash': low_hash,
       'low_hashes': low_hashes,

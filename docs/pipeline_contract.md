@@ -248,6 +248,15 @@ present): explicit `created_at` / `updated_at` timestamps and `PENDING` /
 `Check Bake Plan` is the source of truth for `Update Painter`. `Update Painter`
 must not silently recalculate a different plan.
 
+`.substance_tools_bake_plan.json` lives in the texture folder, which several
+`.blend` files may share. Before any export or Painter request, an ordinary
+`Update Painter` rejects the plan unless its `blend_file`, `spp` (when
+recorded), Texture Sets, `settings_hash`, per-Texture-Set Low hashes and High
+hashes all match the current scene. The error names the mismatch; bake with
+`Bake Selected` or `Bake All`, which hash the current meshes and do not use the
+plan file. Meshy requests keep their own Texture Set guard
+and package-file hashes.
+
 Important behavior:
 
 - High-to-Low Texture Sets:
