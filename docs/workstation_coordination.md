@@ -70,10 +70,65 @@ no-op evidence; it must not leave a heavy reservation active merely because the
 native receipt says SUCCESS. A saved callback records `native_completion_kind:
 saved` and clears the owner-reconciliation flag. Painter export releases only its parent phase.
 Blender releases the apply phase only after transactional canonical application
-succeeds. A failure, timeout or uncertain launch retains a recovery reservation
+**and an exact native Blend save** succeed. Applying textures in memory does not
+produce `Native saved receipt`. A failure, timeout or uncertain launch retains a recovery reservation
 and the native request/receipt. Verify that the native work stopped or completed
 before owner recovery; cancel that old bound phase and enqueue a distinct phase
 for a new native attempt.
+
+## Blender apply: persistence before completion
+
+Coordinated apply first writes a small, atomic journal under
+`~/.substance-tools/workstation-apply/<phase hash>.json`, protected by the existing
+cross-process publication lock. It contains the original parent phase, exact
+native request/target/execution ticket, export receipt, and application result;
+no owner token or production-file copy is written. The original goal and resume
+checkpoint remain in Workstation Queue and are never replaced.
+
+- `applying`: written **before** native application. A crash/failure here is
+  uncertain and requires owner reconciliation, never automatic re-export/apply.
+- `applied_awaiting_save`: canonical files/material application succeeded. A
+  per-request nonce is placed in the affected scene, but the Blender phase and
+  its scope remain held. Operator `FINISHED` means the modal ended, not that the
+  coordinated phase completed.
+- `saved`: a paired Blender `save_pre`/`save_post` for the exact original target
+  saw the same scene nonce and a changed, nonempty on-disk file. Evidence includes
+  path, file size, nanosecond modification/creation stamps and event time. Only
+  this evidence can call `complete_handoff` for that exact execution binding.
+- `completed`: queue accepted the saved receipt. Retries are no-ops. If the queue
+  was unavailable, a timer/repeated dispatch can retry **receipt delivery only**,
+  provided the saved file fingerprint still matches. It never runs native work.
+
+The integration never calls a save operator, checks out a file, overwrites
+unrelated dirty data, changes user preferences, or adds a backup copy. The owner
+must first follow the existing save authorization and Perforce recovery-point
+rules, then explicitly save the original Blend through the normal workflow.
+Blender's save handlers observe that save; they do not grant permission to save.
+Manual export/apply without phase IDs retains its previous behavior.
+
+`save_post_fail` drops the in-flight evidence and retains recovery ownership.
+Canceling a save dialog before any native event leaves the result awaiting save.
+Save As to another path, a changed request/ticket, loading another file, or a late
+callback cannot release the original reservation. A disk/journal error retains
+the checkpoint and never manufactures a saved receipt. The handler contract is
+documented in [Blender's Application Handlers API](https://docs.blender.org/api/current/bpy.app.handlers.html).
+
+After reload/retry, an existing journal is inspected before any Painter dispatch
+or scene validation. If the unsaved changes were lost on reload (scene marker
+absent), **stop for owner recovery**: saving the old file cannot prove that apply
+survived. Keep the original journal/export evidence, inspect the saved file and
+original goal, and use the existing explicit recovery/cancel/new-phase procedure
+only after the old native operation is known to have stopped. Do not delete the
+journal or mint another request simply to retry. A saved receipt whose file was
+subsequently replaced also requires owner reconciliation. No background process
+reopens a Blend, repeats apply, or weakens queue admission.
+
+The 45-second timer renews only a matching, loaded awaiting-save execution, or
+retries already verified receipt delivery. Unloading the target leaves its
+reservation to the normal queue recovery rules. Receipt tests execute the actual
+operator modal/core transaction against fake native state; an optional second
+run uses the real bridge and disposable SQLite databases. They never import a
+production addon, operate a running app, or read/write the production queue DB.
 
 The addon loads `pipeline_bridge.py` from
 `~/Documents/GitHub/workstation-queue`, or `WORKSTATION_QUEUE_REPO` when set.
