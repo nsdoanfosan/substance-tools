@@ -174,6 +174,15 @@
     }
   },
   "unreal_handoff_sidecar": {
+    "gemstone_material_layer": {
+      "material_name_token": "Gemstone",
+      "master": "/Game/Materials/Gemstone/M_Gemstone_Layered_Substrate",
+      "parent": "/Game/Materials/Gemstone/Layers/ML_Gemstone_Crystal",
+      "mi_folder": "/Game/Materials/Gemstone/MI",
+      "instance_folder": "/Game/Materials/Gemstone/MYI",
+      "appearance_owner": "Unreal",
+      "behavior": "A delimited Gemstone token selects the crystal layer per material slot. Do not export Painter/Blender appearance maps; existing MI/MYI controls are reused unchanged."
+    },
     "producer": "ue_unique_export_names_addon",
     "consumers": [
       "BlenderTools send2ue material_pipeline extension"
