@@ -807,17 +807,48 @@ def _request_result_payload(request):
     return saved
 
 
+def _write_pending_failure_receipt(request, saved):
+    """Record a failure in the shared pending slot only for this exact ticket.
+
+    The slot is not among the asset request copies, so without this a claimed
+    request stays non-terminal and blocks every later handoff. write_receipt
+    rechecks the request ID and phase binding under the publication lock, so a
+    newer ticket is never replaced. A missing, unreadable or unwritable slot is
+    left as it is for explicit owner recovery.
+    """
+    path = _pending_request_path()
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as error:
+        _log(f"Failed request left the pending slot for recovery: {error}")
+        return False
+    if (
+        not isinstance(pending, dict)
+        or _request_marker(pending) != _request_marker(request)
+        or _normalized_path(pending.get("spp", "")) != _normalized_path(request.get("spp", ""))
+    ):
+        return False
+    try:
+        if _workstation_helper().write_receipt(path, request, saved):
+            return True
+    except Exception as error:
+        _log(f"Failed request left the pending slot for recovery: {error}")
+        return False
+    _log("Failed request left the pending slot for recovery: its binding changed")
+    return False
+
+
 def _mark_request_failed(request, message):
     _phase_fail(request, message)
     try:
-        request_paths = _matching_request_paths(request)
-        if not request_paths:
-            return
         saved = _request_result_payload(request)
         saved["status"] = "FAILED"
         saved["failure"] = message
-        for request_path in request_paths:
+        for request_path in _matching_request_paths(request):
             _workstation_helper().write_receipt(request_path, request, saved)
+        _write_pending_failure_receipt(request, saved)
     except Exception as error:
         _log(f"Could not mark request failed: {error}")
 
@@ -1118,13 +1149,6 @@ def _create_pending_project():
         _log(f"Could not create project from Unreal Engine template: {error}")
         if 'workstation_phase' in request:
             _mark_request_failed(request, str(error))
-            saved = _request_result_payload(request)
-            saved['status'] = 'FAILED'
-            saved['failure'] = str(error)
-            try:
-                _workstation_helper().write_receipt(_pending_request_path(), request, saved)
-            except Exception as receipt_error:
-                _log(f'Failed native CREATE was preserved for recovery: {receipt_error}')
 
 
 def _poll_requests():
