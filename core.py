@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+from contextlib import contextmanager
 from array import array
 from collections import defaultdict
 from pathlib import Path
@@ -80,11 +81,11 @@ def collection_role(collection):
 
 
 def find_baking_role_child(root, role_name):
+  """Read a role child, including legacy names, without writing during UI draw."""
   if root is None:
     return None
   for child in root.children:
     if collection_role(child) == role_name:
-      child[COLLECTION_ROLE_PROPERTY] = role_name
       return child
   return None
 
@@ -92,6 +93,8 @@ def find_baking_role_child(root, role_name):
 def ensure_baking_role_child(root, role_name):
   child = find_baking_role_child(root, role_name)
   if child is not None:
+    if child.get(COLLECTION_ROLE_PROPERTY) != role_name:
+      child[COLLECTION_ROLE_PROPERTY] = role_name
     return child
 
   existing = bpy.data.collections.get(role_name)
@@ -723,16 +726,14 @@ def low_as_high_texture_set_names(low_objects, high_objects):
     match_base(obj.name, 'high').lower()
     for obj in high_objects
   }
-  return sorted({
-    stripped_material_name(slot.material.name)
-    for obj in low_objects
-    for slot in obj.material_slots
-    if slot.material
-    if (
-      match_base(obj.name, 'low').lower() not in high_bases
-      or is_back_texture_set(stripped_material_name(slot.material.name))
+  # LowAsHigh is a whole-Texture-Set switch in Painter. One unpaired button
+  # must not discard the real high of an ornament sharing its material.
+  return sorted(
+    name for name, objects in low_objects_by_texture_set(low_objects).items()
+    if is_back_texture_set(name) or not any(
+      match_base(obj.name, 'low').lower() in high_bases for obj in objects
     )
-  })
+  )
 
 
 def low_objects_by_texture_set(low_objects):
@@ -754,12 +755,13 @@ def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
   high_by_base = defaultdict(list)
   for obj in high_objects:
     high_by_base[match_base(obj.name, 'high').lower()].append(obj)
-  entries = defaultdict(lambda: {'objects': [], 'bases': set()})
+  entries = defaultdict(lambda: {'objects': [], 'bases': set(), 'fallbacks': set()})
   for low in low_objects:
     base = match_base(low.name, 'low').lower()
     matching_highs = high_by_base.get(base, ())
-    if not matching_highs:
-      continue
+    fallback = not matching_highs
+    if fallback:
+      matching_highs = (low,)
     for slot in low.material_slots:
       if not slot.material:
         continue
@@ -767,19 +769,28 @@ def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
       for high in matching_highs:
         if high not in entries[texture_set]['objects']:
           entries[texture_set]['objects'].append(high)
+        if fallback:
+          entries[texture_set]['fallbacks'].add(high)
       entries[texture_set]['bases'].add(base)
 
   result = []
   for texture_set in sorted(entries):
     objects = sorted(entries[texture_set]['objects'], key=lambda obj: obj.name_full)
-    fbxs = [
-      high_dir / f"{fbx_filename_from_object_name(obj.name)}.fbx"
+    export_names = [
+      re.sub(r'(?i)([_. -])low(?=$|[_. -]|\d)', r'\1high', obj.name, count=1)
+      if obj in entries[texture_set]['fallbacks'] else re.sub(r'(_high)\.\d+$', r'\1', obj.name)
       for obj in objects
+    ]
+    fbxs = [
+      high_dir / f"{fbx_filename_from_object_name(name)}.fbx"
+      for name in export_names
     ]
     result.append({
       'texture_set': texture_set,
       'bases': sorted(entries[texture_set]['bases']),
       'objects': objects,
+      'export_names': export_names,
+      'fallback_objects': entries[texture_set]['fallbacks'],
       'fbx': fbxs[0] if len(fbxs) == 1 else None,
       'fbxs': fbxs,
     })
@@ -924,7 +935,9 @@ def matching_low_objects(alpha_object, low_objects):
 def alpha_target_material_items(alpha_object, _context):
   if alpha_object is None:
     return [('AUTO', 'Auto', 'Use the only or same-named Low material')]
-  _, low_collection, _, _ = ensure_baking_collections()
+  # Enum item callbacks also run in Blender's read-only drawing context.
+  root = bpy.data.collections.get(baking_root_name())
+  low_collection = find_baking_role_child(root, LOW_COLLECTION)
   low_objects = painter_collection_meshes(low_collection) if low_collection else []
   materials = []
   seen = set()
@@ -2838,55 +2851,14 @@ def duplicate_for_export(
   id_source='NONE',
   solidify_plus_fill_rim=None,
 ):
-  depsgraph = bpy.context.evaluated_depsgraph_get()
-  duplicates = []
-  temporary_materials = []
-  renamed_materials = []
-  material_copies = {}
-  rim_restore = []
-  try:
-    if solidify_plus_fill_rim is not None:
-      rim_restore = set_solidify_plus_fill_rim(source_objects, solidify_plus_fill_rim)
-      depsgraph = bpy.context.evaluated_depsgraph_get()
-    for source in source_objects:
-      evaluated = source.evaluated_get(depsgraph)
-      mesh = bpy.data.meshes.new_from_object(
-        evaluated,
-        preserve_all_data_layers=True,
-        depsgraph=depsgraph,
-      )
-      mesh.name = source.data.name
-      duplicate = bpy.data.objects.new(source.name, mesh)
-      duplicate.matrix_world = source.matrix_world.copy()
-      collection.objects.link(duplicate)
+  with export_evaluation_visibility(source_objects):
+    return _duplicate_visible_for_export(
+      source_objects, collection,
+      strip_material_prefix=strip_material_prefix,
+      id_source=id_source,
+      solidify_plus_fill_rim=solidify_plus_fill_rim,
+    )
 
-      if strip_material_prefix:
-        for index, material in enumerate(list(mesh.materials)):
-          if material is None:
-            continue
-          if not material.name.startswith(MATERIAL_PREFIX):
-            continue
-          copied = material_copies.get(material)
-          if copied is None:
-            target_name = stripped_material_name(material.name)
-            blocker = bpy.data.materials.get(target_name)
-            if blocker is not None and blocker is not material:
-              original_name = blocker.name
-              blocker.name = f'__SubstanceToolsBackup_{blocker.name}'
-              renamed_materials.append((blocker, original_name))
-            copied = material.copy()
-            copied.name = target_name
-            material_copies[material] = copied
-            temporary_materials.append(copied)
-          mesh.materials[index] = copied
-
-      if id_source == 'FACE_SETS':
-        add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
-        add_high_id_colors(mesh, source.name)
-      duplicates.append(duplicate)
-  finally:
-    restore_solidify_plus_fill_rim(rim_restore)
-  return duplicates, temporary_materials, renamed_materials
 
 
 def export_objects_to_fbx(
@@ -2895,6 +2867,7 @@ def export_objects_to_fbx(
   strip_material_prefix=False,
   id_source='NONE',
   solidify_plus_fill_rim=None,
+  export_names=None,
 ):
   filepath.parent.mkdir(parents=True, exist_ok=True)
   temporary_collection = bpy.data.collections.new('__SubstanceToolsExport')
@@ -2904,6 +2877,7 @@ def export_objects_to_fbx(
   renamed_materials = []
   previous_selection = list(bpy.context.selected_objects)
   previous_active = bpy.context.view_layer.objects.active
+  renamed_sources = []
   try:
     duplicates, temporary_materials, renamed_materials = duplicate_for_export(
       source_objects,
@@ -2912,6 +2886,26 @@ def export_objects_to_fbx(
       id_source=id_source,
       solidify_plus_fill_rim=solidify_plus_fill_rim,
     )
+    # Evaluated copies initially receive Blender's .001 suffix because the
+    # originals still own their names. Painter's High/Low matching needs the
+    # exact source names, including the terminal _high / _low suffixes.
+    names = export_names if export_names is not None else [o.name for o in source_objects]
+    if len(names) != len(duplicates):
+      raise RuntimeError('FBX export name count differs from object count')
+    for source, duplicate, export_name in zip(source_objects, duplicates, names):
+      original_name = source.name
+      source.name = f'__SubstanceToolsExportSource_{original_name}'
+      renamed_sources.append((source, original_name))
+      # A fitted bake reference can share geometry with a frozen High whose
+      # global ID still owns the normalized export name. Preserve both IDs.
+      blocker = bpy.data.objects.get(export_name)
+      if blocker is not None and blocker != duplicate:
+        blocker_name = blocker.name
+        blocker.name = f'__SubstanceToolsExportBlocker_{blocker_name}'
+        renamed_sources.append((blocker, blocker_name))
+      duplicate.name = export_name
+      if duplicate.name != export_name:
+        raise RuntimeError(f'Cannot preserve FBX object name: {export_name}')
     bpy.ops.object.select_all(action='DESELECT')
     for duplicate in duplicates:
       duplicate.select_set(True)
@@ -2940,6 +2934,8 @@ def export_objects_to_fbx(
       bpy.data.objects.remove(duplicate, do_unlink=True)
       if mesh and mesh.users == 0:
         bpy.data.meshes.remove(mesh)
+    for source, original_name in renamed_sources:
+      source.name = original_name
     for material in temporary_materials:
       if material.users == 0:
         bpy.data.materials.remove(material)
@@ -2951,6 +2947,7 @@ def export_objects_to_fbx(
         obj.select_set(True)
     if previous_active and previous_active.name in bpy.context.view_layer.objects:
       bpy.context.view_layer.objects.active = previous_active
+
 
 
 def bake_high_base_color_to_low(
@@ -3144,6 +3141,7 @@ def _painter_color_socket(material, principled):
 
 def _make_emission_material(material, channel, temporary_materials):
   copied = material.copy()
+  temporary_materials.append(copied)
   copied.use_nodes = True
   node_tree = copied.node_tree
   principled = next(
@@ -3158,22 +3156,33 @@ def _make_emission_material(material, channel, temporary_materials):
     raise RuntimeError(
       f"Alpha material needs Principled BSDF and Material Output: {material.name}"
     )
+  if channel == 'NORMAL':
+    # Let Cycles transform the shader Normal into the Low tangent basis.
+    # Copying normal RGB through emission breaks rotated/mirrored decal UVs.
+    alpha = principled.inputs.get('Alpha')
+    for link in list(alpha.links):
+      node_tree.links.remove(link)
+    alpha.default_value = 1.0
+    node_tree.links.new(principled.outputs['BSDF'], output.inputs['Surface'])
+    return copied
   if channel == 'COLOR':
     source = _painter_color_socket(copied, principled) or principled.inputs.get('Base Color')
   else:
     source = principled.inputs.get('Alpha')
   emission = node_tree.nodes.new('ShaderNodeEmission')
   emission.name = f'__SubstanceToolsAlpha{channel}'
-  if source is not None and source.is_linked:
+  if channel == 'NORMAL_ALPHA' and not material_has_normal_texture(material):
+    emission.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+  elif source is not None and source.is_linked:
     node_tree.links.new(source.links[0].from_socket, emission.inputs['Color'])
-  elif channel == 'ALPHA' and source is not None:
+  elif channel in {'ALPHA', 'NORMAL_ALPHA'} and source is not None:
     value = float(source.default_value)
     emission.inputs['Color'].default_value = (value, value, value, 1.0)
   elif source is not None:
     emission.inputs['Color'].default_value = tuple(source.default_value)
   node_tree.links.new(emission.outputs['Emission'], output.inputs['Surface'])
-  temporary_materials.append(copied)
   return copied
+
 
 
 def _prepare_alpha_source_duplicates(
@@ -3273,10 +3282,14 @@ def _bake_alpha_pass(
       low_duplicate.select_set(True)
       bpy.context.view_layer.objects.active = low_duplicate
       bpy.context.scene.render.bake.margin = margin
-      bpy.ops.object.bake(
-        type='EMIT',
-        use_selected_to_active=True,
-      )
+      if channel == 'NORMAL':
+        bpy.ops.object.bake(
+          type='NORMAL', normal_space='TANGENT',
+          normal_r='POS_X', normal_g='NEG_Y', normal_b='POS_Z',
+          use_selected_to_active=True,
+        )
+      else:
+        bpy.ops.object.bake(type='EMIT', use_selected_to_active=True)
   finally:
     for duplicate in source_duplicates + low_duplicates:
       mesh = duplicate.data
@@ -3285,8 +3298,11 @@ def _bake_alpha_pass(
         bpy.data.meshes.remove(mesh)
 
 
-def _copy_mask_to_alpha(color_image, mask_image):
+
+def _copy_mask_to_alpha(color_image, mask_image, clear_uncovered_rgb=False):
   pixel_count = len(color_image.pixels)
+  if pixel_count != len(mask_image.pixels):
+    raise ValueError('Alpha coverage and color images must have identical pixel counts')
   chunk_size = 1024 * 1024
   for offset in range(0, pixel_count, chunk_size):
     end = min(pixel_count, offset + chunk_size)
@@ -3295,8 +3311,11 @@ def _copy_mask_to_alpha(color_image, mask_image):
     first_alpha = (4 - (offset % 4) + 3) % 4
     for index in range(first_alpha, len(color_chunk), 4):
       color_chunk[index] = mask_chunk[index - 3]
+      if clear_uncovered_rgb and color_chunk[index] <= 0.5:
+        color_chunk[index - 3:index] = [0.0, 0.0, 0.0]
     color_image.pixels[offset:end] = color_chunk
   color_image.update()
+
 
 
 def _fill_image(image, color):
@@ -3318,6 +3337,8 @@ def bake_alpha_details_to_low(
   resolution,
   cage_extrusion,
   max_ray_distance,
+  *,
+  id_only=False,
 ):
   if not alpha_objects:
     return {}
@@ -3348,40 +3369,67 @@ def bake_alpha_details_to_low(
     'margin': bake.margin,
     'cage_extrusion': bake.cage_extrusion,
     'max_ray_distance': bake.max_ray_distance,
+    'use_cage': bake.use_cage,
+    'cage_object': bake.cage_object,
+    'normal_space': bake.normal_space,
+    'normal_r': bake.normal_r,
+    'normal_g': bake.normal_g,
+    'normal_b': bake.normal_b,
   }
   try:
     bpy.context.scene.render.engine = 'CYCLES'
     bake.use_selected_to_active = True
     bake.use_clear = False
+    bake.use_cage = False
+    bake.cage_object = None
     bake.cage_extrusion = max(0.0, float(cage_extrusion))
     bake.max_ray_distance = max(0.0, float(max_ray_distance))
     for texture_set, entries in entries_by_texture_set.items():
-      image_name = alpha_color_bake_name(texture_set)
+      # ID bands can need more texels without raising the normal/color bake size.
+      bake_resolution = int(resolution)
+      if id_only:
+        overrides = [int(entry[0].get('substance_tools_alpha_id_resolution', resolution))
+                     for entry in entries]
+        if any(value not in {256, 512, 1024, 2048, 4096, 8192} for value in overrides):
+          raise ValueError('ID resolution override must be a supported power-of-two size')
+        bake_resolution = max([bake_resolution] + overrides)
+      bake.cage_extrusion = min(
+        [max(0.0, float(cage_extrusion))] +
+        [max(0.0, float(entry[0].get('substance_tools_alpha_cage_extrusion', cage_extrusion)))
+         for entry in entries] if id_only else [max(0.0, float(cage_extrusion))])
+      bake.max_ray_distance = min(
+        [max(0.0, float(max_ray_distance))] +
+        [max(0.0, float(entry[0].get('substance_tools_alpha_max_ray_distance', max_ray_distance)))
+         for entry in entries] if id_only else [max(0.0, float(max_ray_distance))])
+      image_name = (f'T_{clean_name(texture_set)}_ID_alpha' if id_only
+                    else alpha_color_bake_name(texture_set))
       image_path = texture_dir / f'{image_name}.png'
       color_image = bpy.data.images.get(image_name)
       if color_image is None:
         color_image = bpy.data.images.new(
           image_name,
-          width=resolution,
-          height=resolution,
+          width=bake_resolution,
+          height=bake_resolution,
           alpha=True,
           float_buffer=False,
         )
-      elif list(color_image.size) != [resolution, resolution]:
-        color_image.scale(resolution, resolution)
       color_image.generated_color = (0.0, 0.0, 0.0, 0.0)
       color_image.alpha_mode = 'STRAIGHT'
       color_image.filepath_raw = str(image_path)
       color_image.file_format = 'PNG'
+      # Assigning a file path can reload its previous on-disk size.
+      if list(color_image.size) != [bake_resolution, bake_resolution]:
+        color_image.scale(bake_resolution, bake_resolution)
       _fill_image(color_image, (0.0, 0.0, 0.0, 0.0))
 
       mask_image = bpy.data.images.new(
         f'__SubstanceToolsAlphaMask_{clean_name(texture_set)}',
-        width=resolution,
-        height=resolution,
+        width=bake_resolution,
+        height=bake_resolution,
         alpha=False,
         float_buffer=False,
       )
+      mask_image.colorspace_settings.name = 'Non-Color'
       mask_image.generated_color = (0.0, 0.0, 0.0, 1.0)
       temporary_images.append(mask_image)
       _fill_image(mask_image, (0.0, 0.0, 0.0, 1.0))
@@ -3392,7 +3440,7 @@ def bake_alpha_details_to_low(
         'COLOR',
         temporary_collection,
         temporary_materials,
-        max(8, min(64, resolution // 128)),
+        max(8, min(64, bake_resolution // 128)),
       )
       _bake_alpha_pass(
         entries,
@@ -3402,10 +3450,48 @@ def bake_alpha_details_to_low(
         temporary_materials,
         0,
       )
-      _copy_mask_to_alpha(color_image, mask_image)
+      # Color Selection reads RGB: transparent bake padding must not become ID.
+      _copy_mask_to_alpha(color_image, mask_image, clear_uncovered_rgb=id_only)
+      normal_path = texture_dir / f'{alpha_normal_bake_name(texture_set)}.png'
+      normal_entries = [
+        entry for entry in entries
+        if not id_only and any(material_has_normal_texture(m) for m in entry[0].data.materials)
+      ]
+      if normal_entries:
+        normal_image = bpy.data.images.new(
+          f'__SubstanceToolsAlphaNormal_{clean_name(texture_set)}',
+          width=bake_resolution, height=bake_resolution, alpha=True,
+        )
+        temporary_images.append(normal_image)
+        normal_image.colorspace_settings.name = 'Non-Color'
+        normal_image.alpha_mode = 'STRAIGHT'
+        normal_image.filepath_raw = str(normal_path)
+        normal_image.file_format = 'PNG'
+        _fill_image(normal_image, (0.5, 0.5, 1.0, 0.0))
+        _bake_alpha_pass(
+          normal_entries, normal_image, 'NORMAL', temporary_collection,
+          temporary_materials, max(8, min(64, bake_resolution // 128)),
+        )
+        _fill_image(mask_image, (0.0, 0.0, 0.0, 1.0))
+        _bake_alpha_pass(
+          normal_entries, mask_image, 'NORMAL_ALPHA', temporary_collection,
+          temporary_materials, 0,
+        )
+        _copy_mask_to_alpha(normal_image, mask_image)
+        # Explicit grayscale coverage avoids interpreting normal RGB as the
+        # Painter mask when importing a companion RGBA resource.
+        mask_image.filepath_raw = str(texture_dir / f'T_{clean_name(texture_set)}_NormalMask_alpha.png')
+        mask_image.file_format = 'PNG'
+        mask_image.save()
+        normal_image.save()
+        if not normal_path.is_file():
+          raise RuntimeError(f'Alpha normal bake was not written: {normal_path}')
       color_image.save()
       if not image_path.is_file():
         raise RuntimeError(f'Alpha detail bake was not written: {image_path}')
+      if not id_only and not normal_entries and normal_path.is_file():
+        # Retire the managed companion after a successful color-only rebake.
+        normal_path.unlink()
       result[texture_set] = str(image_path.resolve())
     return result
   finally:
@@ -3425,6 +3511,7 @@ def bake_alpha_details_to_low(
         obj.select_set(True)
     if previous_active and previous_active.name in bpy.context.view_layer.objects:
       bpy.context.view_layer.objects.active = previous_active
+
 
 
 def file_hash(path):
@@ -3987,6 +4074,11 @@ def export_content_hash(source_objects, strip_material_prefix=False, id_source='
 
 
 def match_base(name, suffix):
+  # Painter strips the suffix keyword and trailing part labels (_high_1,
+  # _low_s, etc.). Keep the legacy terminal form as a compatibility fallback.
+  keyword = re.search(rf'(?i)[_. -]{re.escape(suffix)}(?=$|[_. -]|\d)', name)
+  if keyword:
+    return name[:keyword.start()]
   return re.sub(
     rf'(?i)(?:[_. -]?{suffix})(?:[_. -]?\d+)?$',
     '',
@@ -4150,3 +4242,174 @@ def create_material_for_object(obj):
   material.node_tree.links.new(principled_bsdf.outputs['BSDF'], material_output.inputs['Surface'])
   if len(obj.data.materials) > 0:
     obj.data.materials[0] = material
+
+
+def alpha_normal_bake_name(texture_set):
+  return f'T_{clean_name(texture_set)}_Normal_alpha'
+
+
+def alpha_normal_map_plan(alpha_color_maps, texture_dir):
+  """Pair optional normals only with existing detail color targets."""
+  return {
+    texture_set: str(path.resolve())
+    for texture_set in alpha_color_maps
+    if (path := Path(texture_dir) / f'{alpha_normal_bake_name(texture_set)}.png').is_file()
+  }
+
+
+def retire_id_only_detail_maps(texture_dir, color_result, id_result):
+  """After both bakes succeed, retire managed details that now contribute only ID."""
+  texture_dir = Path(texture_dir)
+  manifest = texture_dir / '.substance_tools_alpha_retired.json'
+  retired = set(read_json(manifest, []))
+  retired.update(set(id_result) - set(color_result))
+  retired.difference_update(color_result)
+  for name in set(id_result) - set(color_result):
+    for filename in (f'{alpha_color_bake_name(name)}.png',
+                     f'{alpha_normal_bake_name(name)}.png',
+                     f'T_{clean_name(name)}_NormalMask_alpha.png'):
+      (texture_dir / filename).unlink(missing_ok=True)
+  if retired or manifest.exists():
+    write_json(manifest, sorted(retired))
+  return sorted(retired)
+
+
+def material_has_normal_texture(material):
+  """Detect an image-backed Normal Map connected to Principled Normal.
+
+  An unused image or procedural/height-only bump does not opt a decal in.
+  """
+  if material is None or not material.use_nodes or material.node_tree is None:
+    return False
+  def contains_normal_map(socket, visited):
+    if socket is None:
+      return False
+    for link in socket.links:
+      node = link.from_node
+      if node in visited:
+        continue
+      visited.add(node)
+      if node.type == 'NORMAL_MAP' and socket_contains_image_texture(node.inputs.get('Color')):
+        return True
+      if any(contains_normal_map(s, visited) for s in node.inputs):
+        return True
+    return False
+  return any(
+    contains_normal_map(node.inputs.get('Normal'), set())
+    for node in material.node_tree.nodes if node.type == 'BSDF_PRINCIPLED'
+  )
+
+
+@contextmanager
+def export_evaluation_visibility(source_objects):
+  """Evaluate hidden bake sources, then restore their authoring visibility."""
+  view_layer = bpy.context.view_layer
+  owners = {collection for obj in source_objects for collection in obj.users_collection}
+  layer_state = []
+  needed_layers = set()
+  collection_state = {}
+  object_state = []
+
+  def reveal(layer):
+    layer_state.append((layer, layer.exclude, layer.hide_viewport))
+    needed = layer.collection in owners
+    for child in layer.children:
+      needed = reveal(child) or needed
+    if needed:
+      needed_layers.add(layer)
+      collection_state.setdefault(layer.collection, layer.collection.hide_viewport)
+    return needed
+
+  try:
+    reveal(view_layer.layer_collection)
+    for layer, excluded, hidden in layer_state:
+      if layer in needed_layers:
+        if layer.exclude:
+          layer.exclude = False
+        if layer.hide_viewport:
+          layer.hide_viewport = False
+        if layer.collection.hide_viewport:
+          layer.collection.hide_viewport = False
+    view_layer.update()
+    for obj in source_objects:
+      if obj.name in view_layer.objects:
+        object_state.append((obj, obj.hide_viewport, obj.hide_get()))
+        obj.hide_viewport = False
+        obj.hide_set(False)
+    view_layer.update()
+    yield
+  finally:
+    for obj, disabled, hidden in reversed(object_state):
+      obj.hide_set(hidden)
+      obj.hide_viewport = disabled
+    for collection, disabled in collection_state.items():
+      collection.hide_viewport = disabled
+    # Exclusion can cascade to children, so restore parents before children.
+    for layer, excluded, hidden in layer_state:
+      if layer.hide_viewport != hidden:
+        layer.hide_viewport = hidden
+      if layer.exclude != excluded:
+        layer.exclude = excluded
+    view_layer.update()
+
+
+def _duplicate_visible_for_export(
+  source_objects,
+  collection,
+  strip_material_prefix=False,
+  id_source='NONE',
+  solidify_plus_fill_rim=None,
+):
+  depsgraph = bpy.context.evaluated_depsgraph_get()
+  duplicates = []
+  temporary_materials = []
+  renamed_materials = []
+  material_copies = {}
+  rim_restore = []
+  try:
+    if solidify_plus_fill_rim is not None:
+      rim_restore = set_solidify_plus_fill_rim(source_objects, solidify_plus_fill_rim)
+      depsgraph = bpy.context.evaluated_depsgraph_get()
+    for source in source_objects:
+      evaluated = source.evaluated_get(depsgraph)
+      mesh = bpy.data.meshes.new_from_object(
+        evaluated,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+      )
+      if not mesh.vertices or not mesh.polygons:
+        bpy.data.meshes.remove(mesh)
+        raise RuntimeError(f'Evaluated bake export mesh is empty: {source.name}')
+      mesh.name = source.data.name
+      duplicate = bpy.data.objects.new(source.name, mesh)
+      duplicate.matrix_world = source.matrix_world.copy()
+      collection.objects.link(duplicate)
+
+      if strip_material_prefix:
+        for index, material in enumerate(list(mesh.materials)):
+          if material is None:
+            continue
+          if not material.name.startswith(MATERIAL_PREFIX):
+            continue
+          copied = material_copies.get(material)
+          if copied is None:
+            target_name = stripped_material_name(material.name)
+            blocker = bpy.data.materials.get(target_name)
+            if blocker is not None and blocker is not material:
+              original_name = blocker.name
+              blocker.name = f'__SubstanceToolsBackup_{blocker.name}'
+              renamed_materials.append((blocker, original_name))
+            copied = material.copy()
+            copied.name = target_name
+            material_copies[material] = copied
+            temporary_materials.append(copied)
+          mesh.materials[index] = copied
+
+      if id_source == 'FACE_SETS':
+        if source.type == 'MESH':
+          add_high_id_colors(source.data, source.name, attribute_name='ST_FaceSet_ID')
+        add_high_id_colors(mesh, source.name)
+      duplicates.append(duplicate)
+  finally:
+    restore_solidify_plus_fill_rim(rim_restore)
+  return duplicates, temporary_materials, renamed_materials

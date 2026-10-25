@@ -121,7 +121,8 @@ class StaleOrdinaryBakePlanTests(unittest.TestCase):
 
     bpy = types.SimpleNamespace(
       types=types.SimpleNamespace(Operator=Operator),
-      props=types.SimpleNamespace(StringProperty=lambda **kw: None, EnumProperty=lambda **kw: None),
+      props=types.SimpleNamespace(StringProperty=lambda **kw: None, EnumProperty=lambda **kw: None,
+                                 BoolProperty=lambda **kw: None),
       data=types.SimpleNamespace(filepath=str(project.blend)),
     )
     scene = Scene()
@@ -171,6 +172,7 @@ class StaleOrdinaryBakePlanTests(unittest.TestCase):
       painter_source_map_plan=lambda sets, directory: self.source_maps,
       painter_source_normal_mesh_map_plan=lambda sets, directory: {},
       alpha_color_bake_name=lambda texture_set: texture_set + '_alpha',
+      alpha_normal_map_plan=lambda maps, directory: {},
       hash_existing_back_normal_sources=lambda maps: {},
       hash_nested_existing_paths=lambda maps: json.loads(json.dumps(maps)),
       __name__='substance_stale_plan_test.operators', __package__='substance_stale_plan_test',
@@ -180,6 +182,7 @@ class StaleOrdinaryBakePlanTests(unittest.TestCase):
     operator = namespace['ExportBakingToSubstancePainterOperator']()
     operator.action = 'UPDATE'
     operator.workstation_phase_id = 'phase-ribbon'
+    operator.manual_bake_start = False
     result = operator.execute(context)
     return result, reports, native
 

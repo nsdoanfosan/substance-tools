@@ -560,6 +560,7 @@ def load_operator_class(name, workstation):
             self.reports.append((kind, message))
     bpy = types.SimpleNamespace(types=types.SimpleNamespace(Operator=Operator),
                                 props=types.SimpleNamespace(StringProperty=lambda **kwargs: None,
+                                                            BoolProperty=lambda **kwargs: None,
                                                             EnumProperty=lambda **kwargs: None,
                                                             IntProperty=lambda **kwargs: None),
                                 data=types.SimpleNamespace(filepath='C:/work/asset.blend'))
