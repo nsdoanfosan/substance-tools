@@ -2412,40 +2412,53 @@ def _audit_expected_source_state(expected):
     }
 
 
-def _apply_alpha_color_layers(request):
-    alpha_color_maps = request.get("alpha_color_maps", {})
-    alpha_mask_maps = request.get("alpha_mask_maps", {})
-    if not alpha_color_maps:
+def _apply_alpha_detail_channel(request, normal=False):
+    alpha_color_maps = request.get("alpha_normal_maps" if normal else "alpha_color_maps", {})
+    alpha_mask_maps = request.get("alpha_normal_mask_maps" if normal else "alpha_mask_maps", {})
+    layer_name = "Blender Alpha Normals" if normal else "Blender Alpha Details"
+    mask_name = "Blender Alpha Normal Mask" if normal else "Blender Alpha Mask"
+    channel = (substance_painter.textureset.ChannelType.Normal if normal
+               else substance_painter.textureset.ChannelType.BaseColor)
+    if not alpha_color_maps and not normal:
         return
-
-    # Validate the whole mask plan before importing resources or changing layers.
-    for texture_set_name, image_path in alpha_color_maps.items():
-        if image_path and Path(image_path).is_file():
-            mask_path = alpha_mask_maps.get(texture_set_name, image_path)
-            if not Path(mask_path).is_file():
-                raise RuntimeError(f"Explicit Alpha mask was not found: {mask_path}")
 
     applied = 0
     for texture_set in substance_painter.textureset.all_texture_sets():
         texture_set_name = texture_set.name
-        image_path = alpha_color_maps.get(texture_set_name)
-        if not image_path or not Path(image_path).is_file():
+        selected_alpha_sets = request.get('managed_alpha_texture_sets')
+        if selected_alpha_sets is not None and texture_set_name not in selected_alpha_sets:
             continue
+        image_path = alpha_color_maps.get(texture_set_name)
+        if normal and not image_path:
+            # An explicit empty companion plan disables only our managed
+            # normal layer after a Normal connection was removed and rebaked.
+            for stack in texture_set.all_stacks():
+                for node in substance_painter.layerstack.get_root_layer_nodes(stack):
+                    if (isinstance(node, substance_painter.layerstack.FillLayerNode)
+                            and node.get_name() == layer_name):
+                        node.active_channels = set()
+            continue
+        if not image_path or not Path(image_path).is_file():
+            if normal:
+                raise RuntimeError(f"Alpha Normal map was not found: {image_path}")
+            continue
+        mask_path = alpha_mask_maps.get(texture_set_name, image_path)
+        if not Path(mask_path).is_file():
+            raise RuntimeError(f"Explicit Alpha mask was not found: {mask_path}")
         color_resource = substance_painter.resource.import_project_resource(
             image_path,
             substance_painter.resource.Usage.TEXTURE,
-            name=f"{texture_set_name}_BlenderAlphaColor",
+            name=f"{texture_set_name}_BlenderAlpha{'Normal' if normal else 'Color'}",
             group="Substance Tools",
         )
         mask_resource = substance_painter.resource.import_project_resource(
-            alpha_mask_maps.get(texture_set_name, image_path),
+            mask_path,
             substance_painter.resource.Usage.ALPHA,
-            name=f"{texture_set_name}_BlenderAlphaMask",
+            name=f"{texture_set_name}_BlenderAlpha{'NormalMask' if normal else 'Mask'}",
             group="Substance Tools",
         )
         for stack in texture_set.all_stacks():
             root_nodes = substance_painter.layerstack.get_root_layer_nodes(stack)
-            layer_name = "Blender Alpha Details"
             fill_layer = next(
                 (
                     node
@@ -2462,14 +2475,21 @@ def _apply_alpha_color_layers(request):
                     )
                 )
                 fill_layer.set_name(layer_name)
-            fill_layer.active_channels = {
-                substance_painter.textureset.ChannelType.BaseColor
-            }
+            if normal and not stack.has_channel(channel):
+                stack.add_channel(channel, substance_painter.textureset.ChannelFormat.RGB16)
+            fill_layer.active_channels = {channel}
+            if normal:
+                fill_layer.set_visible(True)
+                fill_layer.set_opacity(1.0, channel)
+                fill_layer.set_blending_mode(
+                    substance_painter.layerstack.BlendingMode.NormalMapDetail,
+                    channel,
+                )
             fill_layer.set_projection_mode(
                 substance_painter.layerstack.ProjectionMode.UV
             )
             fill_layer.set_source(
-                substance_painter.textureset.ChannelType.BaseColor,
+                channel,
                 color_resource.identifier(),
             )
             if not fill_layer.has_mask():
@@ -2484,7 +2504,7 @@ def _apply_alpha_color_layers(request):
                         effect,
                         substance_painter.layerstack.FillEffectNode,
                     )
-                    and effect.get_name() == "Blender Alpha Mask"
+                    and effect.get_name() == mask_name
                 ),
                 None,
             )
@@ -2495,13 +2515,36 @@ def _apply_alpha_color_layers(request):
                         substance_painter.layerstack.NodeStack.Mask,
                     )
                 )
-                mask_fill.set_name("Blender Alpha Mask")
+                mask_fill.set_name(mask_name)
             mask_fill.set_source(None, mask_resource.identifier())
             mask_fill.set_projection_mode(
                 substance_painter.layerstack.ProjectionMode.UV
             )
             applied += 1
-    _log(f"Applied Blender Alpha Details to {applied} Painter Fill Layer(s)")
+    _log(f"Applied {layer_name} to {applied} Painter Fill Layer(s)")
+
+def _apply_alpha_color_layers(request):
+    # Legacy callers keep color-only behavior. New callers send the companion
+    # field even when empty so a successful removal retires the managed layer.
+    if "alpha_normal_maps" in request:
+        for name, path in request["alpha_normal_maps"].items():
+            if name not in request.get("alpha_color_maps", {}) or not Path(path).is_file():
+                raise RuntimeError(f"Unpaired or missing Alpha Normal for {name}: {path}")
+    for maps_key, masks_key in (('alpha_color_maps', 'alpha_mask_maps'),
+                                ('alpha_normal_maps', 'alpha_normal_mask_maps')):
+        for name, path in request.get(maps_key, {}).items():
+            mask_path = request.get(masks_key, {}).get(name, path)
+            if not Path(mask_path).is_file():
+                raise RuntimeError(f'Explicit Alpha mask was not found: {mask_path}')
+            if not Path(path).is_file():
+                raise RuntimeError(f'Alpha map was not found: {path}')
+    _apply_alpha_detail_channel(request)
+    if "alpha_normal_maps" in request:
+        _apply_alpha_detail_channel(request, normal=True)
+    if request.get('alpha_id_selections'):
+        from .alpha_id import apply_id_selections
+        request['alpha_id_receipts'] = apply_id_selections(request)
+
 
 
 def _schedule_successful_save_retry(request, reason, delay_ms=1000, max_retries=120):
@@ -2960,13 +3003,18 @@ def _start_bake(request):
         _configure_baking(request)
         _require_requested_project_open(request, "start configured mesh-map baking")
         _log_timing(f"_configure_baking returned after {_elapsed_ms(started):.1f} ms")
-        single_texture_set = _single_rebake_texture_set(request)
+        manual_start = bool(request.get("manual_bake_start") or request.get("settings", {}).get("manual_bake_start"))
+        single_texture_set = None if manual_start else _single_rebake_texture_set(request)
         if single_texture_set:
             _start_single_texture_set_bake(request, single_texture_set)
             return
 
         bake_call_started = time.perf_counter()
         lifecycle = _install_bake_lifecycle(request)
+        if manual_start:
+            lifecycle.await_manual_start()
+            _log("Bake configured; waiting for the explicit native UI bake start")
+            return
         stop_source = substance_painter.baking.bake_selected_textures_async()
         lifecycle.bind(stop_source)
         _log_timing(f"bake_selected_textures_async call took {_elapsed_ms(bake_call_started):.1f} ms")
@@ -3243,6 +3291,8 @@ def _on_project_ready(_event=None):
     needs_bake = needs_bake or source_normal_changed
     base_color_changed = bool(request.get("base_color_changed"))
     alpha_color_changed = bool(request.get("alpha_color_changed"))
+    alpha_normal_changed = bool(request.get("alpha_normal_changed"))
+    alpha_id_changed = bool(request.get("alpha_id_changed"))
     _log_timing(
         "change decision "
         f"low_changed={low_changed}, high_changed={high_changed}, "
@@ -3269,6 +3319,8 @@ def _on_project_ready(_event=None):
         and not needs_bake
         and not base_color_changed
         and not alpha_color_changed
+        and not alpha_normal_changed
+        and not alpha_id_changed
         and not source_material_changed
         and not source_normal_changed
     ):

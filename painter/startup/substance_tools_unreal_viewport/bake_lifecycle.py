@@ -65,9 +65,26 @@ class BakeLifecycle:
             return False
         return True
 
+    def await_manual_start(self):
+        """Observe the next explicit UI bake while retaining request/phase guards."""
+        if not self.valid():
+            self.close()
+            return
+        self.dispatching = False
+        self.state = 'awaiting_manual_start'
+        self.emit()
+        pending, self.pending = self.pending, []
+        for kind, event in pending:
+            getattr(self, kind)(event)
+
     def started(self, event):
         if not self.accept('started', event):
             return
+        if self.state == 'awaiting_manual_start':
+            if event.stop_source is None:
+                return
+            self.stop_source = event.stop_source
+            self.state = 'dispatched'
         # AboutToStart is the only SDK bake event carrying the job identity.
         # Retaining this handle is ownership, not a claim about GC causing failure.
         if event.stop_source != self.stop_source:

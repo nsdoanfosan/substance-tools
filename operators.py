@@ -933,6 +933,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
   bl_label = 'Send Baking Meshes to Substance Painter'
   bl_options = {'REGISTER'}
   workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
+  manual_bake_start: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
   action: bpy.props.EnumProperty(
     name='Action',
@@ -1064,7 +1065,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'painter_low_hide_solidify_rim': hide_solidify_rim,
       'low_as_high_texture_sets': low_as_high_texture_sets,
       'back_normal_mesh_maps': (
-        {} if meshy_source_contract else back_normal_mesh_map_plan(
+        {} if meshy_source_contract or context.scene.get('substance_tools_bake_back_normals') else back_normal_mesh_map_plan(
           texture_sets,
           paths['texture_dir'],
         )
@@ -1086,6 +1087,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
 
     try:
       previous_request = read_json(paths['texture_dir'] / PAINTER_REQUEST, {})
+      if previous_request.get('status') in {'FAILED', 'ERROR', 'CANCELLED'}:
+        previous_request = {}
       previous_low_hashes = previous_request.get('low_hashes', {})
       previous_high_hashes = previous_request.get('high_hashes', {})
       plan = load_bake_plan(paths, context)
@@ -1313,6 +1316,21 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
           / f'{alpha_color_bake_name(texture_set)}.png'
         ).is_file()
       }
+      alpha_normal_maps = alpha_normal_map_plan(alpha_color_maps, paths['texture_dir'])
+      alpha_normal_mask_maps = {
+        name: str((paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').resolve())
+        for name in alpha_normal_maps
+        if (paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').is_file()
+      }
+      alpha_id_selections = json.loads(context.scene.get('substance_tools_id_selections', '[]'))
+      if not isinstance(alpha_id_selections, list):
+        raise ValueError('Source ID selections must be a list')
+      for binding in alpha_id_selections:
+        path = paths['texture_dir'] / f'T_{clean_name(binding["texture_set_name"])}_ID_alpha.png'
+        if not path.is_file():
+          raise RuntimeError(f'Bake Alpha Details before updating source ID masks: {path}')
+        binding['texture_path'] = str(path.resolve())
+        binding['expected_sha256'] = file_hash(path)
     except Exception as error:
       self.report({'ERROR'}, f'Export or Base Color bake failed: {error}')
       traceback.print_exc()
@@ -1376,6 +1394,13 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       texture_set: file_hash(Path(image_path))
       for texture_set, image_path in alpha_color_maps.items()
     }
+    alpha_normal_hashes = hash_nested_existing_paths(alpha_normal_maps)
+    alpha_normal_mask_hashes = hash_nested_existing_paths(alpha_normal_mask_maps)
+    alpha_normal_changed = (
+      alpha_normal_hashes != previous_request.get('alpha_normal_hashes', {})
+      or alpha_normal_mask_hashes != previous_request.get('alpha_normal_mask_hashes', {})
+    )
+    alpha_id_changed = alpha_id_selections != previous_request.get('alpha_id_selections', [])
     alpha_color_hash = hashlib.sha256(
       json.dumps(alpha_color_hashes, sort_keys=True).encode('utf-8')
     ).hexdigest()
@@ -1399,6 +1424,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       and not source_normal_mesh_changed
       and not meshy_contract_changed
       and not alpha_color_changed
+      and not alpha_normal_changed
+      and not alpha_id_changed
       and not back_normal_changed
     )
     if no_painter_work_needed:
@@ -1468,7 +1495,10 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
           f"{settings_hash}:{base_color_hash}:{alpha_color_hash}:"
           f"{json.dumps(source_material_hashes, sort_keys=True)}:"
           f"{json.dumps(source_normal_mesh_hashes, sort_keys=True)}:"
-          f"{json.dumps(back_normal_hashes, sort_keys=True)}"
+          f"{json.dumps(back_normal_hashes, sort_keys=True)}:"
+          f"{json.dumps(alpha_normal_hashes, sort_keys=True)}:"
+          f"{json.dumps(alpha_normal_mask_hashes, sort_keys=True)}:"
+          f"{json.dumps(alpha_id_selections, sort_keys=True)}"
         ).encode('utf-8')
       ).hexdigest(),
       'spp_existed': spp_existed,
@@ -1484,6 +1514,14 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'alpha_color_maps': alpha_color_maps,
       'alpha_color_hashes': alpha_color_hashes,
       'alpha_color_changed': alpha_color_changed,
+      'alpha_normal_maps': alpha_normal_maps,
+      'alpha_normal_mask_maps': alpha_normal_mask_maps,
+      'alpha_normal_hashes': alpha_normal_hashes,
+      'alpha_normal_mask_hashes': alpha_normal_mask_hashes,
+      'alpha_normal_changed': alpha_normal_changed,
+      'alpha_id_selections': alpha_id_selections,
+      'alpha_id_changed': alpha_id_changed,
+      'manual_bake_start': bool(self.manual_bake_start),
       'back_normal_hashes': back_normal_hashes,
       'back_normal_changed': back_normal_changed,
       'settings': settings,
@@ -1733,7 +1771,7 @@ def send_painter_bake_request(context, selected=None, *, workstation_phase_id=''
     'painter_low_hide_solidify_rim': hide_solidify_rim,
     'low_as_high_texture_sets': low_as_high_texture_set_names(low_objects, high_objects),
     'back_normal_mesh_maps': (
-      {} if meshy_source_contract else back_normal_mesh_map_plan(
+      {} if meshy_source_contract or context.scene.get('substance_tools_bake_back_normals') else back_normal_mesh_map_plan(
         all_texture_sets,
         paths['texture_dir'],
       )
@@ -2046,11 +2084,17 @@ class BakeAlphaDetailsToLowOperator(bpy.types.Operator):
     try:
       result = bake_alpha_details_to_low(
         low_objects,
-        alpha_objects,
+        [obj for obj in alpha_objects if not obj.get('substance_tools_alpha_id_only')],
         paths['texture_dir'],
         int(props.resolution),
         props.alpha_cage_extrusion,
         props.alpha_max_ray_distance,
+      )
+      bake_alpha_details_to_low(
+        low_objects,
+        [obj for obj in alpha_objects if obj.get('substance_tools_alpha_id_only')],
+        paths['texture_dir'], int(props.resolution),
+        props.alpha_cage_extrusion, props.alpha_max_ray_distance, id_only=True,
       )
     except Exception as error:
       self.report({'ERROR'}, f'Alpha detail bake failed: {error}')
@@ -2146,6 +2190,12 @@ class SendPainterMapsOperator(bpy.types.Operator):
       for texture_set in texture_sets
       if (paths['texture_dir'] / f'{alpha_color_bake_name(texture_set)}.png').is_file()
     }
+    alpha_normal_maps = alpha_normal_map_plan(alpha_color_maps, paths['texture_dir'])
+    alpha_normal_mask_maps = {
+      name: str((paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').resolve())
+      for name in alpha_normal_maps
+      if (paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').is_file()
+    }
     if not source_material_maps and not alpha_color_maps:
       self.report({'INFO'}, 'No baked source material / Alpha maps found to send')
       return {'CANCELLED'}
@@ -2167,6 +2217,9 @@ class SendPainterMapsOperator(bpy.types.Operator):
         source_normal_mesh_maps
       ),
       'alpha_color_maps': alpha_color_maps,
+      'alpha_normal_maps': alpha_normal_maps,
+      'alpha_normal_mask_maps': alpha_normal_mask_maps,
+      'alpha_normal_hashes': hash_nested_existing_paths(alpha_normal_maps),
     }
     request_paths = (
       paths['texture_dir'] / PAINTER_REQUEST,

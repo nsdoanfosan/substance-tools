@@ -122,6 +122,32 @@ class PainterBakeLifecycleTests(unittest.TestCase):
         self.sdk.baking.bake_selected_textures_async.assert_called_once()
         self.phase_fail_mock.assert_not_called()
 
+    def test_manual_start_observes_native_identity_without_sdk_dispatch(self):
+        self.request['manual_bake_start'] = True
+        lifecycle = self.launch()
+        self.assertEqual(lifecycle.state, 'awaiting_manual_start')
+        self.sdk.baking.bake_selected_textures_async.assert_not_called()
+        self.emit_end()
+        self.now = 100
+        lifecycle.check_timeout()
+        self.assert_pending()
+        self.assertFalse(lifecycle.recovery_required)
+        self.emit_start()
+        self.assertIs(lifecycle.stop_source, self.handle)
+        self.emit_end()
+        self.drain_save()
+        self.assertEqual(self.receipt()['status'], 'SUCCESS')
+
+    def test_manual_second_native_job_cannot_authorize_save(self):
+        self.request['manual_bake_start'] = True
+        lifecycle = self.launch()
+        self.emit_start()
+        self.emit_start(object())
+        self.emit_end()
+        self.drain_save()
+        self.assertEqual(lifecycle.state, 'job_conflict')
+        self.assert_pending()
+
     def test_matching_start_progress_end_then_deferred_save_and_exact_success(self):
         lifecycle = self.launch()
         self.emit_start(object())
