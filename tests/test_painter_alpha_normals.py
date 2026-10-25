@@ -117,6 +117,14 @@ class AlphaNormalLayerTests(unittest.TestCase):
         self.plugin._apply_alpha_color_layers({'alpha_color_maps':{}})
         self.assertEqual(old.active_channels,{'normal'})
 
+    def test_retired_id_only_set_disables_only_managed_detail_layers(self):
+        for name in ('Blender Alpha Details','Blender Alpha Normals','Existing Smart Material'):
+            node=self.Fill();node.name=name;node.active_channels={'normal','base_color'};self.roots.append(node)
+        self.plugin._apply_alpha_color_layers({'alpha_color_maps':{},'alpha_normal_maps':{},
+                                             'retired_alpha_texture_sets':['Shirt']})
+        self.assertEqual([node.active_channels for node in self.roots],
+                         [set(),set(),{'normal','base_color'}])
+
     def test_normal_only_update_applies_without_mesh_reload_or_bake(self):
         p=self.plugin
         request={'request_id':'alpha-normal-change','action':'UPDATE',

@@ -1574,6 +1574,37 @@ def _source_plan_digest(plan):
     return digest.hexdigest()
 
 
+def _authored_id_map_to_preserve(texture_set):
+    """Keep the ID palette that existing color-selection masks were authored against."""
+    getter = getattr(texture_set, "get_mesh_map_resource", None)
+    if not callable(getter):
+        return None
+    resource = getter(
+        substance_painter.textureset.MeshMapUsage.ID
+    )
+    if resource is None:
+        return None
+    layerstack = substance_painter.layerstack
+    pending = [
+        node
+        for stack in texture_set.all_stacks()
+        for node in layerstack.get_root_layer_nodes(stack)
+    ]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, layerstack.ColorSelectionEffectNode):
+            selected = node.get_parameters().id_mask
+            if (selected is not None and selected.context == resource.context
+                    and selected.name == resource.name):
+                return resource
+        if isinstance(node, layerstack.LayerNode):
+            pending.extend(node.mask_effects())
+            pending.extend(node.content_effects())
+        if isinstance(node, layerstack.GroupLayerNode):
+            pending.extend(node.sub_layers())
+    return None
+
+
 def _configure_baking(request):
     configure_started = time.perf_counter()
     settings = request["settings"]
@@ -1699,6 +1730,16 @@ def _configure_baking(request):
         ]
         use_low_as_high = use_low_as_high or not bool(texture_high_urls)
         texture_set_enabled_maps = list(enabled_maps)
+        preserved_id = _authored_id_map_to_preserve(texture_set)
+        if preserved_id is not None:
+            if strict_settings:
+                raise RuntimeError(
+                    f"Texture Set '{texture_set_name}' has authored ID selection masks; "
+                    "strict ID rebaking requires an explicit migration of those masks"
+                )
+            texture_set_enabled_maps = [usage for usage in texture_set_enabled_maps
+                                        if usage != substance_painter.textureset.MeshMapUsage.ID]
+            _log(f"Texture Set '{texture_set_name}': preserve authored ID map and color source")
         if normal_assigned:
             normal_usage = substance_painter.textureset.MeshMapUsage.Normal
             texture_set_enabled_maps = [
@@ -1770,7 +1811,7 @@ def _configure_baking(request):
             id_source_value = _enum_value_containing(
                 id_source_property, "material", "color"
             )
-        if id_source_value is not None:
+        if id_source_value is not None and preserved_id is None:
             changes[id_source_property] = id_source_value
 
         unresolved = []
@@ -2419,7 +2460,8 @@ def _apply_alpha_detail_channel(request, normal=False):
     mask_name = "Blender Alpha Normal Mask" if normal else "Blender Alpha Mask"
     channel = (substance_painter.textureset.ChannelType.Normal if normal
                else substance_painter.textureset.ChannelType.BaseColor)
-    if not alpha_color_maps and not normal:
+    retired_sets = set(request.get('retired_alpha_texture_sets', []))
+    if not alpha_color_maps and not normal and not retired_sets:
         return
 
     applied = 0
@@ -2429,7 +2471,7 @@ def _apply_alpha_detail_channel(request, normal=False):
         if selected_alpha_sets is not None and texture_set_name not in selected_alpha_sets:
             continue
         image_path = alpha_color_maps.get(texture_set_name)
-        if normal and not image_path:
+        if (normal or texture_set_name in retired_sets) and not image_path:
             # An explicit empty companion plan disables only our managed
             # normal layer after a Normal connection was removed and rebaked.
             for stack in texture_set.all_stacks():
@@ -3293,6 +3335,7 @@ def _on_project_ready(_event=None):
     alpha_color_changed = bool(request.get("alpha_color_changed"))
     alpha_normal_changed = bool(request.get("alpha_normal_changed"))
     alpha_id_changed = bool(request.get("alpha_id_changed"))
+    alpha_retired_changed = bool(request.get("alpha_retired_changed"))
     _log_timing(
         "change decision "
         f"low_changed={low_changed}, high_changed={high_changed}, "
@@ -3321,6 +3364,7 @@ def _on_project_ready(_event=None):
         and not alpha_color_changed
         and not alpha_normal_changed
         and not alpha_id_changed
+        and not alpha_retired_changed
         and not source_material_changed
         and not source_normal_changed
     ):

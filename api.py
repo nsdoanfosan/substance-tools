@@ -33,6 +33,8 @@ __all__ = (
   'dispatch_painter_request',
   'dispatch_painter_bake',
   'dispatch_painter_export_apply',
+  'resume_painter_export_apply',
+  'complete_painter_export_apply',
 )
 
 
@@ -76,6 +78,8 @@ def get_painter_transfer_api(version=PAINTER_TRANSFER_API_VERSION):
     'dispatch_painter_request': dispatch_painter_request,
     'dispatch_painter_bake': dispatch_painter_bake,
     'dispatch_painter_export_apply': dispatch_painter_export_apply,
+    'resume_painter_export_apply': resume_painter_export_apply,
+    'complete_painter_export_apply': complete_painter_export_apply,
   }
 
 
@@ -227,3 +231,13 @@ def adopt_retopology_pair(
       export_sync.setdefault('synced', 'error' not in export_sync)
   adoption['ue_unique_export_sync'] = export_sync
   return _receipt('adopt_retopology_pair', adoption)
+
+
+def resume_painter_export_apply(**kwargs):
+  from .resume_export_apply import resume_existing_export_apply
+  return _receipt('resume_painter_export_apply', resume_existing_export_apply(**kwargs))
+
+
+def complete_painter_export_apply(**kwargs):
+  from .resume_export_apply import complete_existing_export_apply
+  return _receipt('complete_painter_export_apply', complete_existing_export_apply(**kwargs))

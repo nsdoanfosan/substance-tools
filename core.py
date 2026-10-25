@@ -81,11 +81,11 @@ def collection_role(collection):
 
 
 def find_baking_role_child(root, role_name):
+  """Read a role child, including legacy names, without writing during UI draw."""
   if root is None:
     return None
   for child in root.children:
     if collection_role(child) == role_name:
-      child[COLLECTION_ROLE_PROPERTY] = role_name
       return child
   return None
 
@@ -93,6 +93,8 @@ def find_baking_role_child(root, role_name):
 def ensure_baking_role_child(root, role_name):
   child = find_baking_role_child(root, role_name)
   if child is not None:
+    if child.get(COLLECTION_ROLE_PROPERTY) != role_name:
+      child[COLLECTION_ROLE_PROPERTY] = role_name
     return child
 
   existing = bpy.data.collections.get(role_name)
@@ -724,16 +726,14 @@ def low_as_high_texture_set_names(low_objects, high_objects):
     match_base(obj.name, 'high').lower()
     for obj in high_objects
   }
-  return sorted({
-    stripped_material_name(slot.material.name)
-    for obj in low_objects
-    for slot in obj.material_slots
-    if slot.material
-    if (
-      match_base(obj.name, 'low').lower() not in high_bases
-      or is_back_texture_set(stripped_material_name(slot.material.name))
+  # LowAsHigh is a whole-Texture-Set switch in Painter. One unpaired button
+  # must not discard the real high of an ornament sharing its material.
+  return sorted(
+    name for name, objects in low_objects_by_texture_set(low_objects).items()
+    if is_back_texture_set(name) or not any(
+      match_base(obj.name, 'low').lower() in high_bases for obj in objects
     )
-  })
+  )
 
 
 def low_objects_by_texture_set(low_objects):
@@ -755,12 +755,13 @@ def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
   high_by_base = defaultdict(list)
   for obj in high_objects:
     high_by_base[match_base(obj.name, 'high').lower()].append(obj)
-  entries = defaultdict(lambda: {'objects': [], 'bases': set()})
+  entries = defaultdict(lambda: {'objects': [], 'bases': set(), 'fallbacks': set()})
   for low in low_objects:
     base = match_base(low.name, 'low').lower()
     matching_highs = high_by_base.get(base, ())
-    if not matching_highs:
-      continue
+    fallback = not matching_highs
+    if fallback:
+      matching_highs = (low,)
     for slot in low.material_slots:
       if not slot.material:
         continue
@@ -768,19 +769,28 @@ def high_entries_by_texture_set(low_objects, high_objects, high_dir, asset):
       for high in matching_highs:
         if high not in entries[texture_set]['objects']:
           entries[texture_set]['objects'].append(high)
+        if fallback:
+          entries[texture_set]['fallbacks'].add(high)
       entries[texture_set]['bases'].add(base)
 
   result = []
   for texture_set in sorted(entries):
     objects = sorted(entries[texture_set]['objects'], key=lambda obj: obj.name_full)
-    fbxs = [
-      high_dir / f"{fbx_filename_from_object_name(obj.name)}.fbx"
+    export_names = [
+      re.sub(r'(?i)([_. -])low(?=$|[_. -]|\d)', r'\1high', obj.name, count=1)
+      if obj in entries[texture_set]['fallbacks'] else re.sub(r'(_high)\.\d+$', r'\1', obj.name)
       for obj in objects
+    ]
+    fbxs = [
+      high_dir / f"{fbx_filename_from_object_name(name)}.fbx"
+      for name in export_names
     ]
     result.append({
       'texture_set': texture_set,
       'bases': sorted(entries[texture_set]['bases']),
       'objects': objects,
+      'export_names': export_names,
+      'fallback_objects': entries[texture_set]['fallbacks'],
       'fbx': fbxs[0] if len(fbxs) == 1 else None,
       'fbxs': fbxs,
     })
@@ -925,7 +935,9 @@ def matching_low_objects(alpha_object, low_objects):
 def alpha_target_material_items(alpha_object, _context):
   if alpha_object is None:
     return [('AUTO', 'Auto', 'Use the only or same-named Low material')]
-  _, low_collection, _, _ = ensure_baking_collections()
+  # Enum item callbacks also run in Blender's read-only drawing context.
+  root = bpy.data.collections.get(baking_root_name())
+  low_collection = find_baking_role_child(root, LOW_COLLECTION)
   low_objects = painter_collection_meshes(low_collection) if low_collection else []
   materials = []
   seen = set()
@@ -4062,6 +4074,11 @@ def export_content_hash(source_objects, strip_material_prefix=False, id_source='
 
 
 def match_base(name, suffix):
+  # Painter strips the suffix keyword and trailing part labels (_high_1,
+  # _low_s, etc.). Keep the legacy terminal form as a compatibility fallback.
+  keyword = re.search(rf'(?i)[_. -]{re.escape(suffix)}(?=$|[_. -]|\d)', name)
+  if keyword:
+    return name[:keyword.start()]
   return re.sub(
     rf'(?i)(?:[_. -]?{suffix})(?:[_. -]?\d+)?$',
     '',
@@ -4238,6 +4255,23 @@ def alpha_normal_map_plan(alpha_color_maps, texture_dir):
     for texture_set in alpha_color_maps
     if (path := Path(texture_dir) / f'{alpha_normal_bake_name(texture_set)}.png').is_file()
   }
+
+
+def retire_id_only_detail_maps(texture_dir, color_result, id_result):
+  """After both bakes succeed, retire managed details that now contribute only ID."""
+  texture_dir = Path(texture_dir)
+  manifest = texture_dir / '.substance_tools_alpha_retired.json'
+  retired = set(read_json(manifest, []))
+  retired.update(set(id_result) - set(color_result))
+  retired.difference_update(color_result)
+  for name in set(id_result) - set(color_result):
+    for filename in (f'{alpha_color_bake_name(name)}.png',
+                     f'{alpha_normal_bake_name(name)}.png',
+                     f'T_{clean_name(name)}_NormalMask_alpha.png'):
+      (texture_dir / filename).unlink(missing_ok=True)
+  if retired or manifest.exists():
+    write_json(manifest, sorted(retired))
+  return sorted(retired)
 
 
 def material_has_normal_texture(material):

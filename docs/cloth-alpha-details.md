@@ -14,6 +14,9 @@ properties `substance_tools_alpha_id_resolution`,
 `substance_tools_alpha_cage_extrusion`, and
 `substance_tools_alpha_max_ray_distance` bound the projection for narrow bands.
 Uncovered ID RGB is cleared so padding cannot select unrelated fabric.
+After both bakes succeed, a Texture Set that loses its last regular detail source
+retires its managed color/normal files. Update disables only the two managed
+detail layers for that set, preserving existing Smart Materials and paint.
 
 The scene JSON property `substance_tools_id_selections` can bind those source IDs
 to inspected existing Painter layers. Each entry specifies `texture_set_name`,

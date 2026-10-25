@@ -1259,12 +1259,14 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
             if not fbx.is_file()
           ]
           if changed or missing_fbxs:
-            for obj, fbx in zip(entry['objects'], entry['fbxs']):
+            export_names = entry.get('export_names', [obj.name for obj in entry['objects']])
+            for obj, fbx, export_name in zip(entry['objects'], entry['fbxs'], export_names):
               if changed or not fbx.is_file():
                 export_objects_to_fbx(
                   [obj],
                   fbx,
                   id_source=props.id_source,
+                  export_names=[export_name],
                 )
             if texture_set not in changed_high_texture_sets:
               changed_high_texture_sets.append(texture_set)
@@ -1317,6 +1319,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
         ).is_file()
       }
       alpha_normal_maps = alpha_normal_map_plan(alpha_color_maps, paths['texture_dir'])
+      retired_alpha_texture_sets = read_json(paths['texture_dir'] / '.substance_tools_alpha_retired.json', [])
       alpha_normal_mask_maps = {
         name: str((paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').resolve())
         for name in alpha_normal_maps
@@ -1401,6 +1404,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       or alpha_normal_mask_hashes != previous_request.get('alpha_normal_mask_hashes', {})
     )
     alpha_id_changed = alpha_id_selections != previous_request.get('alpha_id_selections', [])
+    alpha_retired_changed = retired_alpha_texture_sets != previous_request.get('retired_alpha_texture_sets', [])
     alpha_color_hash = hashlib.sha256(
       json.dumps(alpha_color_hashes, sort_keys=True).encode('utf-8')
     ).hexdigest()
@@ -1426,6 +1430,7 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       and not alpha_color_changed
       and not alpha_normal_changed
       and not alpha_id_changed
+      and not alpha_retired_changed
       and not back_normal_changed
     )
     if no_painter_work_needed:
@@ -1498,7 +1503,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
           f"{json.dumps(back_normal_hashes, sort_keys=True)}:"
           f"{json.dumps(alpha_normal_hashes, sort_keys=True)}:"
           f"{json.dumps(alpha_normal_mask_hashes, sort_keys=True)}:"
-          f"{json.dumps(alpha_id_selections, sort_keys=True)}"
+          f"{json.dumps(alpha_id_selections, sort_keys=True)}:"
+          f"{json.dumps(retired_alpha_texture_sets, sort_keys=True)}"
         ).encode('utf-8')
       ).hexdigest(),
       'spp_existed': spp_existed,
@@ -1521,6 +1527,8 @@ class ExportBakingToSubstancePainterOperator(bpy.types.Operator):
       'alpha_normal_changed': alpha_normal_changed,
       'alpha_id_selections': alpha_id_selections,
       'alpha_id_changed': alpha_id_changed,
+      'retired_alpha_texture_sets': retired_alpha_texture_sets,
+      'alpha_retired_changed': alpha_retired_changed,
       'manual_bake_start': bool(self.manual_bake_start),
       'back_normal_hashes': back_normal_hashes,
       'back_normal_changed': back_normal_changed,
@@ -1825,7 +1833,7 @@ def send_painter_bake_request(context, selected=None, *, workstation_phase_id=''
     ):
       if entry['texture_set'] not in bake_set:
         continue
-      for obj, fbx in zip(entry['objects'], entry['fbxs']):
+      for obj, fbx, export_name in zip(entry['objects'], entry['fbxs'], entry.get('export_names', [obj.name for obj in entry['objects']])):
         export_objects_to_fbx([obj], fbx, id_source=props.id_source)
       resolved_fbxs = [str(fbx.resolve()) for fbx in entry['fbxs']]
       high_entries.append({
@@ -2090,12 +2098,13 @@ class BakeAlphaDetailsToLowOperator(bpy.types.Operator):
         props.alpha_cage_extrusion,
         props.alpha_max_ray_distance,
       )
-      bake_alpha_details_to_low(
+      id_result = bake_alpha_details_to_low(
         low_objects,
         [obj for obj in alpha_objects if obj.get('substance_tools_alpha_id_only')],
         paths['texture_dir'], int(props.resolution),
         props.alpha_cage_extrusion, props.alpha_max_ray_distance, id_only=True,
       )
+      retire_id_only_detail_maps(paths['texture_dir'], result, id_result)
     except Exception as error:
       self.report({'ERROR'}, f'Alpha detail bake failed: {error}')
       traceback.print_exc()
@@ -2191,6 +2200,7 @@ class SendPainterMapsOperator(bpy.types.Operator):
       if (paths['texture_dir'] / f'{alpha_color_bake_name(texture_set)}.png').is_file()
     }
     alpha_normal_maps = alpha_normal_map_plan(alpha_color_maps, paths['texture_dir'])
+    retired_alpha_texture_sets = read_json(paths['texture_dir'] / '.substance_tools_alpha_retired.json', [])
     alpha_normal_mask_maps = {
       name: str((paths['texture_dir'] / f'T_{clean_name(name)}_NormalMask_alpha.png').resolve())
       for name in alpha_normal_maps
@@ -2220,6 +2230,7 @@ class SendPainterMapsOperator(bpy.types.Operator):
       'alpha_normal_maps': alpha_normal_maps,
       'alpha_normal_mask_maps': alpha_normal_mask_maps,
       'alpha_normal_hashes': hash_nested_existing_paths(alpha_normal_maps),
+      'retired_alpha_texture_sets': retired_alpha_texture_sets,
     }
     request_paths = (
       paths['texture_dir'] / PAINTER_REQUEST,
