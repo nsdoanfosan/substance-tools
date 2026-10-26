@@ -22,3 +22,30 @@ complete = _helper.complete
 fail = _helper.fail
 start_followup = _helper.start_followup
 APPLY_PIPELINE = _helper.APPLY_PIPELINE
+
+
+def _apply_journal():
+    from .blender_apply_completion import journal
+    return journal(_helper)
+
+
+def resume_apply(parent_phase_id, phase_id, filepath):
+    return _apply_journal().resume(parent_phase_id, phase_id, filepath)
+
+
+def begin_apply(request, scene, export_result):
+    return _apply_journal().begin(request, scene, export_result)
+
+
+def applied_awaiting_save(request, scene, receipt):
+    return _apply_journal().applied(request, scene, receipt)
+
+
+def register_apply_receipts():
+    from .blender_apply_completion import register
+    register(_helper)
+
+
+def unregister_apply_receipts():
+    from .blender_apply_completion import unregister
+    unregister()

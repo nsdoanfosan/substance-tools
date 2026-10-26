@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 
 from . import api
+from . import workstation_coordination
 
 from .core import (
   alpha_target_material_items,
@@ -117,9 +118,11 @@ def register():
   bpy.app.handlers.depsgraph_update_post.append(sync_exclusive_baking_roles_on_depsgraph)
   if not bpy.app.timers.is_registered(ensure_baking_collections_deferred):
     bpy.app.timers.register(ensure_baking_collections_deferred, first_interval=0.0)
+  workstation_coordination.register_apply_receipts()
 
 
 def unregister():
+  workstation_coordination.unregister_apply_receipts()
   if bpy.app.timers.is_registered(ensure_baking_collections_deferred):
     bpy.app.timers.unregister(ensure_baking_collections_deferred)
   remove_handler_by_name(
