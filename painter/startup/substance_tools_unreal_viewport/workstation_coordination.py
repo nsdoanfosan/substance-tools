@@ -293,6 +293,10 @@ def complete(request):
         metadata = _metadata(request)
         if metadata is None:
             return True
+        if metadata['pipeline'] == APPLY_PIPELINE:
+            # In-memory apply is not a saved Blend. Only the Blender journal's
+            # paired native save callbacks may deliver this saved receipt.
+            return False
         completed = bool(_bridge().complete_handoff(metadata, metadata['request_id'], metadata['target']))
         if completed:
             _heartbeat_attempts.pop((metadata['phase_id'], metadata['request_id']), None)
