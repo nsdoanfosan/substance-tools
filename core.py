@@ -4302,13 +4302,14 @@ def material_has_normal_texture(material):
 
 @contextmanager
 def export_evaluation_visibility(source_objects):
-  """Evaluate hidden bake sources, then restore their authoring visibility."""
+  """Reveal bake sources and suppress viewport previews while evaluating exports."""
   view_layer = bpy.context.view_layer
   owners = {collection for obj in source_objects for collection in obj.users_collection}
   layer_state = []
   needed_layers = set()
   collection_state = {}
   object_state = []
+  disabled_previews = []
 
   def reveal(layer):
     layer_state.append((layer, layer.exclude, layer.hide_viewport))
@@ -4336,9 +4337,24 @@ def export_evaluation_visibility(source_objects):
         object_state.append((obj, obj.hide_viewport, obj.hide_get()))
         obj.hide_viewport = False
         obj.hide_set(False)
+        for modifier in obj.modifiers:
+          if modifier.type != 'NODES' or not modifier.show_viewport:
+            continue
+          group = modifier.node_group
+          is_preview = modifier.name == 'Unreal Height Preview' or (
+            group is not None and (
+              group.get('send2ue_preview_only', False)
+              or group.name.startswith('Unreal Height Displacement Preview')
+            )
+          )
+          if is_preview:
+            modifier.show_viewport = False
+            disabled_previews.append(modifier)
     view_layer.update()
     yield
   finally:
+    for modifier in reversed(disabled_previews):
+      modifier.show_viewport = True
     for obj, disabled, hidden in reversed(object_state):
       obj.hide_set(hidden)
       obj.hide_viewport = disabled
